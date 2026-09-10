@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Edge0 Android",
+      "hasCanvas": false,
+      "bodyTextLen": 734,
+      "bodyTextHash": "0631f0fa063c9d26a50220c598f98e1dc3212a46d2a66a5ad2bf1724121598f3",
+      "bodyTextPrefix": "Edge0 on Android — a 35B language model with tools and a 4 GB wo",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Edge0 Android",
+      "hasCanvas": false,
+      "bodyTextLen": 397,
+      "bodyTextHash": "6e59d19aa02a16b292e576611eed5a22a11ac5e05c37ad640b1a8397d2bdfd1f",
+      "bodyTextPrefix": "Edge0 on Android — a 35B language model with tools and a 4 GB wo",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

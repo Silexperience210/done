@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #070708;
+  --color-surface: #111114;
+  --color-elevated: #18181c;
+  --color-fg: #ececef;
+  --color-muted: #8b8b93;
+  --color-subtle: #63636c;
+  --color-primary: #d8dce4;
+  --color-primary-fg: #0b0b0d;
+  --color-border: #26262c;
+  --color-ok: #8fbf9a;
+  --color-hot: #e2b48a;
+  --color-phone: #0c0c0e;
+  --color-screen: #09090b;
+  --color-bubble: #2c2c30;
+  --color-stat: #c8ccd4;
+  --font-sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-android: "Roboto", "Noto Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-phone: 48px;
+  --radius-screen: 38px;
+  --aspect-phone: 9 / 19.5;
+  --height-phone: min(39rem, calc(100dvh - 6rem));
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100%;
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+@keyframes token-caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes think-sweep {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+.think-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-muted) 0%,
+    var(--color-fg) 45%,
+    var(--color-muted) 90%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: think-sweep 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

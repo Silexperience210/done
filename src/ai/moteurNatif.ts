@@ -61,12 +61,16 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
   },
   {
     id: "coder3b",
-    nom: "Qwen3-Coder-30B-A3B-Instruct (UD-TQ1_0, 1 bit)",
+    nom: "Qwen3-Coder-30B-A3B-Instruct (UD-IQ1_S, 1 bit)",
     court: "30B-A3B 1 bit",
-    fichier: "Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf",
-    tailleGo: 8.0,
+    // Nom EXACT du fichier dans le dépôt unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+    // (vérifié sur l'API du Hub). UD-IQ1_S remplace UD-TQ1_0 : à taille voisine
+    // (8,9 Go contre 8,0), il est calibré par matrice d'importance, donc
+    // sensiblement plus juste à budget de bits comparable.
+    fichier: "Qwen3-Coder-30B-A3B-Instruct-UD-IQ1_S.gguf",
+    tailleGo: 8.9,
     lectureGoParJeton: 1.3,
-    note: "Le pari : 30B de connaissances, 3B activés, donc peu d'octets lus par jeton — plus rapide qu'un dense 8B malgré quatre fois plus de poids. Huit Go sur douze, limite haute. La fiabilité des appels d'outils à 1 bit reste à prouver.",
+    note: "Le pari : 30B de connaissances, 3B activés, donc peu d'octets lus par jeton — plus rapide qu'un dense 8B malgré quatre fois plus de poids. 8,9 Go sur douze, limite haute. La fiabilité des appels d'outils à 1 bit reste à prouver.",
   },
 ];
 
@@ -82,6 +86,15 @@ export type PluginLlama = {
     callback?: (data: { token?: string }) => void,
   ) => Promise<{ text?: string; timings?: { predicted_per_second?: number } }>;
   releaseAllLlama?: () => Promise<void>;
+  /**
+   * Sauve l'état du prompt/du cache KV dans un fichier. C'est la méthode du
+   * contexte llama.cpp (`contexte.saveSession(filepath, {tokenSize})`) — vérifiée
+   * dans dist/esm/index.js. Optionnelle : une version du plugin qui ne l'a pas
+   * laisse le moteur fonctionner sans cache.
+   */
+  saveSession?: (filepath: string) => Promise<unknown>;
+  /** Recharge l'état précédemment sauvé (`contexte.loadSession(filepath)`). */
+  loadSession?: (filepath: string) => Promise<unknown>;
 };
 
 export type OptionsNatif = {
@@ -99,6 +112,30 @@ export type OptionsNatif = {
   nbCoeurs?: () => number;
   /** Couches déportées sur le GPU. Élevé par défaut : c'est le gain de vitesse. */
   couchesGpu?: number;
+  /**
+   * Taille du contexte en jetons. 4096 par défaut : un agent reçoit des
+   * résultats d'outils (code, erreurs, HTML) en plus du prompt système, et 2048
+   * débordait. Configurable pour un appareil à court de RAM.
+   */
+  nCtx?: number;
+  /**
+   * Jetons traités par lot de pré-remplissage. Plus grand = GPU mieux rempli au
+   * pré-remplissage (le « prompt processing », le vrai coût du premier pas).
+   * Monté à 512 contre 256 avant ; c'est un compromis mémoire/rapidité.
+   */
+  nBatch?: number;
+  /**
+   * Micro-lot logique à l'intérieur d'un lot (doit rester ≤ nBatch côté
+   * llama.cpp). Aligné sur nBatch pour un seul micro-lot : le GPU travaille en
+   * une passe plutôt que découpé.
+   */
+  nUbatch?: number;
+  /**
+   * Chemin d'un fichier où mettre en cache l'état du prompt (« cached prompt &
+   * completion state »). ABSENT PAR DÉFAUT : le cache n'est activé que si
+   * l'appelant fournit un chemin réellement inscriptible sur l'appareil.
+   */
+  cheminCache?: string;
 };
 
 function gabaritQwen(system: string, history: { role: string; content: string }[]): string {
@@ -119,6 +156,11 @@ export type MoteurNatif = Moteur & {
   derniereVitesse: () => number | null;
   /** Chemin du modèle actuellement chargé. */
   modeleCharge: () => string | null;
+  /**
+   * Vrai si le cache d'état du prompt est ACTIF et a déjà été sauvé au moins
+   * une fois. Faux tant qu'aucun `cheminCache` n'est fourni.
+   */
+  cacheSauve: () => boolean;
 };
 
 /**
@@ -129,6 +171,12 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   let contexte: unknown = null;
   let charge: LocalModelId | null = null;
   let dernierTokParSeconde: number | null = null;
+  // État du cache de prompt : remis à faux à chaque chargement de modèle (le
+  // fichier de session ne vaut que pour le contexte qui l'a produit).
+  let cacheSauve = false;
+  // Passe à vrai si le cache a échoué une fois (méthode absente, fichier non
+  // inscriptible…) : on n'essaie plus, plutôt que de retenter à chaque pas.
+  let cacheIndisponible = false;
 
   return {
     nom: "natif",
@@ -136,6 +184,8 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
     pret: () => contexte !== null,
 
     derniereVitesse: () => dernierTokParSeconde,
+
+    cacheSauve: () => cacheSauve,
 
     modeleCharge: () => (contexte === null ? null : opts.cheminModele(modeleGguf(charge ?? "coder15"))),
 
@@ -166,8 +216,16 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         // l'appli et veut le nom de fichier seul ; `is_model_asset` le lui
         // indique. Absent, on passe un chemin, comportement d'origine.
         ...(opts.asset ? { is_model_asset: true } : {}),
-        n_ctx: 2048,
-        n_batch: 256,
+        // 4096 jetons : la boucle d'agent réinjecte le prompt système, la
+        // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
+        // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
+        n_ctx: opts.nCtx ?? 4096,
+        // Lots de pré-remplissage : n_batch = jetons traités par passe,
+        // n_ubatch = micro-lot logique (≤ n_batch). 512/512 garde le GPU
+        // correctement rempli pendant le « prompt processing » sans découper en
+        // petits lots — c'est ce qui accélère le premier pas sur GPU.
+        n_batch: opts.nBatch ?? 512,
+        n_ubatch: opts.nUbatch ?? 512,
         n_threads: coeurs,
         // Tout déporter sur le GPU est le seul réglage qui change vraiment
         // l'ordre de grandeur de la vitesse.
@@ -175,6 +233,8 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         use_mlock: false,
       });
       charge = id;
+      // Nouveau contexte : le cache de prompt de l'ancien modèle ne vaut plus.
+      cacheSauve = false;
       onProgres?.({ phase: "pret", pct: 100, fichier: "", ecouleMs: Date.now() - debut });
     },
 
@@ -183,6 +243,26 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       const plugin = await opts.chargerPlugin();
       const prompt = gabaritQwen(options.system, options.history);
       let flux = "";
+
+      // MISE EN CACHE DE L'ÉTAT DU PROMPT.
+      // Le prompt système est identique à chaque pas de l'agent ; sans cache,
+      // llama.cpp le reprojette entièrement à chaque appel. On sauve donc l'état
+      // du contexte UNE FOIS (après la première génération, quand le prompt
+      // système est établi et présent dans le cache KV), puis on le recharge
+      // avant les pas suivants : llama.cpp réutilise le préfixe commun au lieu
+      // de le recalculer. Entièrement optionnel — sans `cheminCache`, ou si le
+      // plugin n'expose pas ces méthodes, rien ne change. Un échec de cache est
+      // avalé : il ne doit jamais faire échouer une génération.
+      const cachePossible = typeof opts.cheminCache === "string" && opts.cheminCache.length > 0;
+      if (cachePossible && !cacheIndisponible && cacheSauve && typeof plugin.loadSession === "function") {
+        try {
+          await plugin.loadSession(opts.cheminCache as string);
+        } catch {
+          /* fichier absent ou illisible : on régénère depuis zéro, et on
+             n'insiste plus — pas de cache plutôt qu'un échec à chaque pas */
+          cacheIndisponible = true;
+        }
+      }
 
       const resultat = await plugin.completion(
         {
@@ -194,6 +274,12 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           // S'arrêter à la balise de fin évite de générer 256 jetons pour rien :
           // sur un téléphone, c'est du temps réel gagné.
           stop: ["<|im_end|>", "<|im_start|>"],
+          // Contraintes de sortie structurée. `json_schema` (chaîne) est
+          // converti en grammaire par llama.cpp ; `grammar` (GBNF) est utilisé
+          // directement et prime si les deux sont fournis. Absents, le moteur
+          // se comporte exactement comme avant.
+          ...(options.jsonSchema ? { json_schema: options.jsonSchema } : {}),
+          ...(options.grammar ? { grammar: options.grammar } : {}),
         },
         (data) => {
           if (typeof data?.token === "string") {
@@ -202,6 +288,18 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           }
         },
       );
+
+      // Le prompt est maintenant dans le cache KV : on sauve l'état pour que le
+      // prochain pas puisse le recharger. Une seule fois par contexte chargé.
+      if (cachePossible && !cacheIndisponible && !cacheSauve && typeof plugin.saveSession === "function") {
+        try {
+          await plugin.saveSession(opts.cheminCache as string);
+          cacheSauve = true;
+        } catch {
+          /* pas de cache : on continue sans, la correction reste intacte */
+          cacheIndisponible = true;
+        }
+      }
 
       // llama.cpp rend la vitesse qu'il a MESURÉE : on la remonte telle quelle,
       // au lieu de l'estimer à partir d'une longueur de texte.
@@ -229,8 +327,13 @@ type PluginLlamaBrut = {
   releaseAllLlama?: () => Promise<void>;
 };
 
-/** Le contexte rendu par `initLlama` : c'est LUI qui porte `completion`. */
-type ContextePlugin = { completion?: PluginLlama["completion"] };
+/** Le contexte rendu par `initLlama` : c'est LUI qui porte `completion`,
+ * ainsi que `saveSession`/`loadSession` (état du prompt). */
+type ContextePlugin = {
+  completion?: PluginLlama["completion"];
+  saveSession?: (filepath: string, options?: { tokenSize: number }) => Promise<unknown>;
+  loadSession?: (filepath: string) => Promise<unknown>;
+};
 
 /**
  * Fabrique PRÊTE À L'EMPLOI, pour le vrai plugin Capacitor.
@@ -254,6 +357,13 @@ export async function moteurNatifParDefaut(
    */
   cheminModele: (m: ModeleGguf) => string,
   asset?: boolean,
+  /**
+   * Chemin du fichier de cache de l'état du prompt. Laissé indéfini, le cache
+   * est DÉSACTIVÉ : c'est le défaut, tant qu'aucun chemin réellement
+   * inscriptible n'est fourni par l'appelant (l'appli n'a pas, à ce niveau, de
+   * moyen d'obtenir un tel chemin sans le plugin Filesystem).
+   */
+  cheminCache?: string,
 ): Promise<MoteurNatif> {
   // Import dynamique : jamais résolu tant que cette branche n'est pas exécutée.
   // C'est précisément ce qui garde le build navigateur intact.
@@ -276,9 +386,26 @@ export async function moteurNatifParDefaut(
       }
       return c.completion(params, cb);
     },
+    // Méthodes de session : elles vivent aussi sur le contexte (vérifié dans
+    // dist/esm/index.js). On ne les expose que si le contexte les a, sinon
+    // `creerMoteurNatif` se contente de fonctionner sans cache.
+    saveSession: async (filepath) => {
+      const c = contexte;
+      if (!c || typeof c.saveSession !== "function") {
+        throw new Error("le contexte llama.cpp n'expose pas saveSession");
+      }
+      return c.saveSession(filepath);
+    },
+    loadSession: async (filepath) => {
+      const c = contexte;
+      if (!c || typeof c.loadSession !== "function") {
+        throw new Error("le contexte llama.cpp n'expose pas loadSession");
+      }
+      return c.loadSession(filepath);
+    },
   };
   const libere = mod.releaseAllLlama?.bind(mod);
   if (libere) adaptateur.releaseAllLlama = () => libere();
 
-  return creerMoteurNatif({ cheminModele, asset, chargerPlugin: async () => adaptateur });
+  return creerMoteurNatif({ cheminModele, asset, cheminCache, chargerPlugin: async () => adaptateur });
 }

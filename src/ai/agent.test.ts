@@ -11,9 +11,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   analyserAppel,
+  analyserSortie,
   boucleAgent,
+  contraintesHarnais,
   ecrireMemoire,
+  GRAMMAIRE_SORTIE,
   OUTILS,
+  SCHEMA_SORTIE,
+  type Contraintes,
   type Outil,
 } from "./agent.ts";
 
@@ -157,4 +162,140 @@ test("chaque outil déclaré a un nom unique et une description", () => {
   const noms = OUTILS.map((o) => o.nom);
   assert.equal(new Set(noms).size, noms.length);
   for (const o of OUTILS) assert.ok(o.description.length > 10, `${o.nom} décrit`);
+});
+
+test("analyse le nouveau protocole {action,nom,args}", () => {
+  const out = analyserAppel('{"action":"outil","nom":"run_js","args":{"code":"1+1"}}');
+  assert.deepEqual(out, { nom: "run_js", args: { code: "1+1" } });
+});
+
+test("l'ancien format ```tool reste accepté (rétrocompatibilité)", () => {
+  const out = analyserAppel('```tool\n{"name":"remember","args":{"note":"ok"}}\n```');
+  assert.deepEqual(out, { nom: "remember", args: { note: "ok" } });
+});
+
+test("un outil inconnu du nouveau protocole n'est jamais analysé", () => {
+  assert.equal(analyserAppel('{"action":"outil","nom":"shell","args":{"cmd":"rm -rf /"}}'), null);
+});
+
+test("analyserSortie distingue outil, réponse et illisible", () => {
+  assert.deepEqual(analyserSortie('{"action":"reponse","texte":"salut"}'), {
+    type: "reponse",
+    texte: "salut",
+  });
+  const o = analyserSortie('{"action":"outil","nom":"remember","args":{"note":"x"}}');
+  assert.equal(o.type, "outil");
+  // outil inconnu : illisible, surtout pas une réponse finale ni un outil exécuté
+  assert.equal(analyserSortie('{"action":"outil","nom":"shell","args":{}}').type, "illisible");
+  // réponse en texte simple
+  assert.deepEqual(analyserSortie("  bonjour  "), { type: "reponse", texte: "bonjour" });
+  // tentative d'appel ratée
+  assert.equal(analyserSortie("je vais le faire\n```tool\n{oups").type, "illisible");
+});
+
+test("l'accolade dans une chaîne ne casse pas l'extraction", () => {
+  const out = analyserAppel('{"action":"outil","nom":"run_js","args":{"code":"JSON.stringify({a:1})"}}');
+  assert.deepEqual(out, { nom: "run_js", args: { code: "JSON.stringify({a:1})" } });
+});
+
+test("la contrainte par défaut est un schéma JSON valide du protocole", () => {
+  const c = contraintesHarnais();
+  assert.ok(c?.jsonSchema, "un schéma est fourni");
+  const schema = JSON.parse(c.jsonSchema as string) as {
+    properties: { action: { enum: string[] } };
+    required: string[];
+  };
+  assert.deepEqual(schema.properties.action.enum, ["outil", "reponse"]);
+  assert.deepEqual(schema.required, ["action"]);
+  // équivalent à la constante exportée
+  assert.deepEqual(JSON.parse(c.jsonSchema as string), SCHEMA_SORTIE);
+});
+
+test("le mode grammaire fournit la GBNF, le mode aucune ne contraint rien", () => {
+  assert.ok(contraintesHarnais("grammaire")?.grammar?.includes("root ::="));
+  assert.equal(contraintesHarnais("aucune"), undefined);
+});
+
+test("la grammaire GBNF décrit bien le protocole", () => {
+  assert.ok(GRAMMAIRE_SORTIE.includes("root ::= objet"));
+  assert.ok(GRAMMAIRE_SORTIE.includes('\\"outil\\"') || GRAMMAIRE_SORTIE.includes('"outil"'));
+  assert.ok(GRAMMAIRE_SORTIE.includes("reponse"));
+  for (const nom of ["run_js", "write_app", "remember", "done"]) {
+    assert.ok(GRAMMAIRE_SORTIE.includes(nom), `${nom} dans la grammaire`);
+  }
+});
+
+test("la boucle transmet la contrainte de sortie au moteur", async () => {
+  let vue: Contraintes | undefined;
+  const r = await boucleAgent({
+    question: "q",
+    system: "s",
+    generate: async (_p, _t, c) => {
+      vue = c;
+      return '{"action":"reponse","texte":"ok"}';
+    },
+    executer: async () => "x",
+  });
+  assert.ok(vue?.jsonSchema, "un schéma est transmis");
+  assert.equal(r.reponse, "ok");
+});
+
+test("le mode grammaire transmet la GBNF à la place du schéma", async () => {
+  let vue: Contraintes | undefined;
+  await boucleAgent({
+    question: "q",
+    system: "s",
+    modeContrainte: "grammaire",
+    generate: async (_p, _t, c) => {
+      vue = c;
+      return "bonjour";
+    },
+    executer: async () => "x",
+  });
+  assert.ok(vue?.grammar?.includes("root"));
+  assert.ok(!vue?.jsonSchema);
+});
+
+test("la boucle exécute un outil du nouveau protocole puis conclut", async () => {
+  const vus: string[] = [];
+  let tour = 0;
+  const r = await boucleAgent({
+    question: "calcule",
+    system: "s",
+    generate: async () => {
+      tour += 1;
+      return tour === 1
+        ? '{"action":"outil","nom":"run_js","args":{"code":"2+2"}}'
+        : '{"action":"reponse","texte":"4"}';
+    },
+    executer: async (o: Outil) => {
+      vus.push(o.nom);
+      return "→ 4";
+    },
+  });
+  assert.deepEqual(vus, ["run_js"]);
+  assert.equal(r.reponse, "4");
+  assert.equal(r.termine, true);
+});
+
+test("un outil inconnu du nouveau protocole est refusé, jamais exécuté", async () => {
+  let executions = 0;
+  let tour = 0;
+  const r = await boucleAgent({
+    question: "q",
+    system: "s",
+    generate: async () => {
+      tour += 1;
+      return tour === 1
+        ? '{"action":"outil","nom":"shell","args":{"cmd":"rm"}}'
+        : '{"action":"reponse","texte":"refusé"}';
+    },
+    executer: async () => {
+      executions += 1;
+      return "x";
+    },
+  });
+  assert.equal(executions, 0, "aucun outil inconnu exécuté");
+  assert.equal(tour, 2, "la boucle a redemandé");
+  assert.equal(r.reponse, "refusé");
 });

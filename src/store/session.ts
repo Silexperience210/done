@@ -404,7 +404,7 @@ export const useSession = create<SessionState>((set, get) => ({
           pending += t;
           if (!raf) raf = requestAnimationFrame(flushTokens);
         },
-        generate: async (prompt, onToken) => {
+        generate: async (prompt, onToken, contraintes) => {
           thinking = "analyse de la demande…";
           patchAssistant(pulse(true));
           let premier = true;
@@ -414,6 +414,11 @@ export const useSession = create<SessionState>((set, get) => ({
             // Court volontairement : sur un téléphone, chaque jeton coûte. Les
             // appels d'outils et les réponses utiles tiennent largement là-dedans.
             maxNewTokens: 160,
+            // Contrainte de sortie structurée : le schéma JSON (converti en
+            // grammaire par llama.cpp) empêche un petit modèle de déverser du
+            // texte à la place d'un appel. Le moteur navigateur l'ignore.
+            jsonSchema: contraintes?.jsonSchema,
+            grammar: contraintes?.grammar,
             onToken: (t) => {
               tokens += 1;
               if (premier) {

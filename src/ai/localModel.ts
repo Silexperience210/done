@@ -246,6 +246,14 @@ export type GenerateOptions = {
   /** Appelé à chaque jeton avec la vitesse instantanée mesurée, en tok/s. */
   onVitesse?: (tokParSeconde: number, jetons: number, msDepuisPremier: number) => void;
   signal?: AbortSignal;
+  /**
+   * Schéma JSON (chaîne) contraignant la sortie vers un JSON valide. Seul le
+   * moteur natif sait l'appliquer (llama.cpp le convertit en grammaire) ; le
+   * moteur navigateur l'ignore et génère comme avant.
+   */
+  jsonSchema?: string;
+  /** Grammaire GBNF de contrainte (natif). Prime sur `jsonSchema` si fournie. */
+  grammar?: string;
 };
 
 /** Secondes sans le moindre jeton avant de considérer que ça ne produit plus. */

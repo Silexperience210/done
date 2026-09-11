@@ -87,6 +87,13 @@ export type PluginLlama = {
 export type OptionsNatif = {
   /** Où trouver le GGUF sur l'appareil. */
   cheminModele: (m: ModeleGguf) => string;
+  /**
+   * Le GGUF est EMBARQUÉ dans les ressources de l'appli (assets Android / bundle
+   * iOS) au lieu d'être posé sur le système de fichiers. Dans ce cas llama.cpp
+   * attend le NOM DE FICHIER SEUL, et c'est `is_model_asset: true` qui le lui
+   * dit. Sans cette option, on garde le comportement d'origine : un chemin.
+   */
+  asset?: boolean;
   /** Charge le plugin (import dynamique en vrai, simulacre dans les tests). */
   chargerPlugin: () => Promise<PluginLlama>;
   nbCoeurs?: () => number;
@@ -104,15 +111,21 @@ function gabaritQwen(system: string, history: { role: string; content: string }[
 }
 
 /**
- * Construit le moteur natif. Tout ce qui touche au matériel est injecté, donc la
- * logique est vérifiable sans téléphone.
+ * Contrat complet d'un moteur natif : le `Moteur` commun, plus ce qui n'a de
+ * sens qu'en natif (vitesse mesurée par llama.cpp, modèle réellement chargé).
  */
-export function creerMoteurNatif(opts: OptionsNatif): Moteur & {
+export type MoteurNatif = Moteur & {
   /** Vitesse MESURÉE par llama.cpp sur le dernier appel (tok/s). */
   derniereVitesse: () => number | null;
   /** Chemin du modèle actuellement chargé. */
   modeleCharge: () => string | null;
-} {
+};
+
+/**
+ * Construit le moteur natif. Tout ce qui touche au matériel est injecté, donc la
+ * logique est vérifiable sans téléphone.
+ */
+export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   let contexte: unknown = null;
   let charge: LocalModelId | null = null;
   let dernierTokParSeconde: number | null = null;
@@ -149,6 +162,10 @@ export function creerMoteurNatif(opts: OptionsNatif): Moteur & {
 
       contexte = await plugin.initLlama({
         model: chemin,
+        // Modèle embarqué : llama.cpp va le chercher dans les ressources de
+        // l'appli et veut le nom de fichier seul ; `is_model_asset` le lui
+        // indique. Absent, on passe un chemin, comportement d'origine.
+        ...(opts.asset ? { is_model_asset: true } : {}),
         n_ctx: 2048,
         n_batch: 256,
         n_threads: coeurs,
@@ -199,4 +216,69 @@ export function creerMoteurNatif(opts: OptionsNatif): Moteur & {
       return texte.trim();
     },
   };
+}
+
+/**
+ * Ce que le plugin llama-cpp-capacitor expose réellement, réduit au strict
+ * nécessaire. On ne dépend PAS de ses propres types : c'est une dépendance
+ * native, absente du build navigateur, et son API évolue. Un contrat minimal
+ * nous garde compilables et lisibles.
+ */
+type PluginLlamaBrut = {
+  initLlama?: (params: Record<string, unknown>) => Promise<unknown>;
+  releaseAllLlama?: () => Promise<void>;
+};
+
+/** Le contexte rendu par `initLlama` : c'est LUI qui porte `completion`. */
+type ContextePlugin = { completion?: PluginLlama["completion"] };
+
+/**
+ * Fabrique PRÊTE À L'EMPLOI, pour le vrai plugin Capacitor.
+ *
+ * Deux points appris à la dure, tous deux encodés ici :
+ *
+ *  1. **L'import doit être DYNAMIQUE et à l'appel.** Le plugin n'existe que dans
+ *     l'APK ; l'importer au chargement du module ferait échouer le build
+ *     navigateur, et ferait résoudre du code natif côté serveur.
+ *  2. **`completion` vit SUR le contexte, pas à plat.** L'API réelle est
+ *     `contexte = await initLlama(...)` puis `contexte.completion(...)`, alors
+ *     que `PluginLlama` (et ses tests) attend `completion` au premier niveau. On
+ *     adapte ICI, une seule fois, au lieu de tordre la logique du moteur : le
+ *     contrat simulable reste exactement celui que testent les tests.
+ */
+export async function moteurNatifParDefaut(
+  /**
+   * Où trouver le GGUF. En mode `asset`, on lui passe le NOM DE FICHIER SEUL
+   * (`modeleGguf(id).fichier`) : le GGUF est embarqué dans les ressources de
+   * l'appli, llama.cpp le résout par son nom.
+   */
+  cheminModele: (m: ModeleGguf) => string,
+  asset?: boolean,
+): Promise<MoteurNatif> {
+  // Import dynamique : jamais résolu tant que cette branche n'est pas exécutée.
+  // C'est précisément ce qui garde le build navigateur intact.
+  const mod = (await import("llama-cpp-capacitor")) as unknown as PluginLlamaBrut;
+
+  let contexte: ContextePlugin | null = null;
+  const adaptateur: PluginLlama = {
+    initLlama: async (params) => {
+      if (typeof mod.initLlama !== "function") {
+        throw new Error("le plugin llama-cpp-capacitor n'expose pas initLlama");
+      }
+      contexte = (await mod.initLlama(params)) as ContextePlugin;
+      return contexte;
+    },
+    completion: (params, cb) => {
+      // Referme sur le contexte chargé : c'est lui qui a la méthode.
+      const c = contexte;
+      if (!c || typeof c.completion !== "function") {
+        throw new Error("aucun contexte llama.cpp chargé : appelle charger() d'abord");
+      }
+      return c.completion(params, cb);
+    },
+  };
+  const libere = mod.releaseAllLlama?.bind(mod);
+  if (libere) adaptateur.releaseAllLlama = () => libere();
+
+  return creerMoteurNatif({ cheminModele, asset, chargerPlugin: async () => adaptateur });
 }

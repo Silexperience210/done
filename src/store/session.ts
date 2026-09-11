@@ -10,24 +10,99 @@ import {
   type ModelId,
   type ToolEvent,
 } from "@/lib/edge0";
+import { capacitesReelles, choisirMoteur } from "@/ai/moteur";
+import type { GenerateOptions, LocalModelId, ProgresChargement } from "@/ai/localModel";
 import { resolveLocalTurn } from "@/lib/local-apps";
 
 /**
- * Moteur local chargé PARESSEUSEMENT, par import dynamique.
+ * Deux moteurs possibles derrière une SEULE interface.
  *
- * Importé statiquement, transformers.js (1,14 Mo) partait dans le bundle de la
- * page ET dans celui de la fonction serveur, avec les 21,5 Mo de WebAssembly
- * d'onnxruntime. En import dynamique, il n'est téléchargé qu'au premier message
- * envoyé — et il n'existe alors aucun chemin serveur pour ce code.
+ * Navigateur : transformers.js (WebGPU/WASM), chargé paresseusement par import
+ * dynamique — statiquement, ses 1,14 Mo et les 21,5 Mo de WebAssembly
+ * d'onnxruntime partaient dans le bundle de page ET dans celui de la fonction
+ * serveur, alors qu'il n'existe aucun chemin serveur pour ce code.
+ *
+ * Natif : llama.cpp via le plugin Capacitor, uniquement dans l'APK. Le plugin
+ * est importé dynamiquement au moment du choix — il ne doit JAMAIS être résolu
+ * par le build navigateur, sinon celui-ci casse.
+ *
+ * Le choix se fait une fois, avec `capacitesReelles()` : natif dans l'appli
+ * empaquetée, WebGPU sinon. Tout le reste de `send` ne connaît que `MoteurActif`
+ * et ignore lequel des deux tourne.
  */
-type Moteur = typeof import("@/ai/localModel");
-let moteur: Moteur | null = null;
-let moteurEnCours: Promise<Moteur> | null = null;
+type ModuleWebgpu = typeof import("@/ai/localModel");
+let webgpu: ModuleWebgpu | null = null;
+let webgpuEnCours: Promise<ModuleWebgpu> | null = null;
 
-function chargerMoteur(): Promise<Moteur> {
+function chargerMoteurWebgpu(): Promise<ModuleWebgpu> {
+  if (webgpu) return Promise.resolve(webgpu);
+  if (!webgpuEnCours) {
+    webgpuEnCours = import("@/ai/localModel")
+      .then((m) => {
+        webgpu = m;
+        return m;
+      })
+      .catch((e) => {
+        webgpuEnCours = null; // on autorise une nouvelle tentative
+        throw e;
+      });
+  }
+  return webgpuEnCours;
+}
+
+/**
+ * Interface COMMUNE aux deux moteurs. Le navigateur expose
+ * `loadModel`/`generate`/`metrics` ; le natif expose `charger`/`generer`/
+ * `derniereVitesse`. On les ramène ici à la même forme, pour que la boucle
+ * d'agent, le streaming jeton par jeton et les pastilles d'outils ne changent
+ * pas d'un moteur à l'autre.
+ */
+type MoteurActif = {
+  nom: "webgpu" | "natif";
+  charger: (id: LocalModelId, onProgres?: (p: ProgresChargement) => void) => Promise<void>;
+  generer: (options: GenerateOptions) => Promise<string>;
+  /** Débit MESURÉ par le moteur, ou null tant qu'il n'a rien mesuré. */
+  tokPerSec: () => number | null;
+  /** Backend réellement utilisé, pour l'afficher sans mentir. */
+  device: () => string;
+};
+
+let moteur: MoteurActif | null = null;
+let moteurEnCours: Promise<MoteurActif> | null = null;
+
+function chargerMoteur(): Promise<MoteurActif> {
   if (moteur) return Promise.resolve(moteur);
   if (!moteurEnCours) {
-    moteurEnCours = import("@/ai/localModel")
+    moteurEnCours = (async (): Promise<MoteurActif> => {
+      if (choisirMoteur(capacitesReelles()) === "natif") {
+        // Import dynamique : le plugin Capacitor/llama.cpp n'existe pas dans un
+        // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
+        // donc le build web reste intact.
+        const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
+        // Le GGUF est embarqué dans les ressources de l'appli : on le désigne
+        // par son NOM DE FICHIER seul, et `asset` fait transmettre
+        // `is_model_asset: true` au plugin.
+        const natif = await moteurNatifParDefaut((m) => m.fichier, true);
+        return {
+          nom: "natif",
+          charger: (id, onProgres) => natif.charger(id, onProgres),
+          generer: (options) => natif.generer(options),
+          tokPerSec: () => natif.derniereVitesse(),
+          device: () => (natif.modeleCharge() ? "llama.cpp (natif)" : "moteur natif"),
+        };
+      }
+      // Navigateur : EXACTEMENT le moteur d'avant, simplement uniformisé.
+      const web = await chargerMoteurWebgpu();
+      return {
+        nom: "webgpu",
+        charger: async (id, onProgres) => {
+          await web.loadModel(id, onProgres);
+        },
+        generer: (options) => web.generate(options),
+        tokPerSec: () => web.metrics().tokPerSec,
+        device: () => web.metrics().device,
+      };
+    })()
       .then((m) => {
         moteur = m;
         return m;
@@ -201,7 +276,7 @@ export const useSession = create<SessionState>((set, get) => ({
     /** Débit et mémoire RÉELS pendant la génération. */
     const pulse = (busy: boolean) => {
       const elapsed = Math.max(0.2, (performance.now() - started) / 1000);
-      const measured = moteur ? moteur.metrics().tokPerSec : null;
+      const measured = moteur ? moteur.tokPerSec() : null;
       if (busy && tokens > 0) {
         const live = tokens / elapsed;
         return {
@@ -260,8 +335,9 @@ export const useSession = create<SessionState>((set, get) => ({
       }
 
       // 2) Le harnais D'AGENT, en local. Aucune requête sortante.
-      //    Le moteur n'est téléchargé qu'ici, au premier message.
-      const { generate, loadModel, metrics } = await chargerMoteur();
+      //    Le moteur (navigateur ou natif) n'est résolu qu'ici, au premier
+      //    message ; `chargerMoteur` choisit une fois pour toute la session.
+      const moteurActif = await chargerMoteur();
       const harnais = await chargerHarnais();
       let pending = "";
       let raf = 0;
@@ -274,10 +350,16 @@ export const useSession = create<SessionState>((set, get) => ({
         patchAssistant(pulse(true));
       };
 
-      // Le premier appel télécharge le modèle (~1 Go) : on le dit à l'écran.
+      // Le premier appel charge le modèle : on le dit à l'écran. En natif il n'y
+      // a rien à télécharger (le GGUF est embarqué), donc on ne parle pas de
+      // téléchargement — ce serait faux.
       if (get().engine !== "pret") {
+        const natif = moteurActif.nom === "natif";
         thinking = `Chargement de ${profile.name}…`;
-        set({ engine: "chargement", engineNote: "téléchargement du modèle" });
+        set({
+          engine: "chargement",
+          engineNote: natif ? "initialisation du moteur natif" : "téléchargement du modèle",
+        });
         patchAssistant({ memoryGb: profile.idleGb });
       }
 
@@ -293,7 +375,7 @@ export const useSession = create<SessionState>((set, get) => ({
       }, 1000);
 
       try {
-        await loadModel(get().model, (p) => {
+        await moteurActif.charger(get().model, (p) => {
           phase = p.phase;
           const sec = Math.round(p.ecouleMs / 1000);
           if (p.phase === "telechargement") {
@@ -326,7 +408,7 @@ export const useSession = create<SessionState>((set, get) => ({
           thinking = "analyse de la demande…";
           patchAssistant(pulse(true));
           let premier = true;
-          return generate({
+          return moteurActif.generer({
             system: prompt,
             history: [{ role: "user", content: text }],
             // Court volontairement : sur un téléphone, chaque jeton coûte. Les
@@ -406,7 +488,7 @@ export const useSession = create<SessionState>((set, get) => ({
         });
       }
 
-      const m = metrics();
+      const vitesse = moteurActif.tokPerSec();
       set((s) => ({
         messages: s.messages.map((msg) =>
           msg.id === assistant.id
@@ -415,9 +497,9 @@ export const useSession = create<SessionState>((set, get) => ({
         ),
         streaming: false,
         memoryGb: restingMemory(s.model, true),
-        tokPerSec: m.tokPerSec ?? 0,
+        tokPerSec: vitesse ?? 0,
         engine: "pret",
-        engineNote: `${m.device}${m.tokPerSec ? ` · ${m.tokPerSec} tok/s mesurés` : ""}`,
+        engineNote: `${moteurActif.device()}${vitesse ? ` · ${vitesse} tok/s mesurés` : ""}`,
       }));
     } catch (e) {
       // Le moteur local a échoué : on le dit, et on retombe sur les apps locales

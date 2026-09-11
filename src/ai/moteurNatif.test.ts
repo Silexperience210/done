@@ -8,7 +8,9 @@
  *  - le déport GPU est demandé explicitement : c'est le seul réglage qui change
  *    l'ordre de grandeur de la vitesse ;
  *  - libérer l'ancien modèle avant d'en charger un autre (sinon la RAM explose
- *    sur un téléphone).
+ *    sur un téléphone) ;
+ *  - le mode « asset » : un GGUF embarqué dans l'appli se désigne par son nom de
+ *    fichier seul, avec `is_model_asset`. Un chemin complet y serait faux.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -47,6 +49,33 @@ test("le déport GPU est demandé et le contexte est dimensionné", async () => 
   assert.equal(init.n_threads, 7, "cœurs moins un");
   assert.ok(String(init.model).endsWith("Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf"));
   assert.equal(m.pret(), true);
+});
+
+test("le mode asset passe is_model_asset et le NOM DE FICHIER seul", async () => {
+  // Un GGUF embarqué dans les ressources de l'appli n'a pas de chemin : llama.cpp
+  // le résout par son nom, à condition de le lui dire avec is_model_asset.
+  const journal: Record<string, unknown>[] = [];
+  const m = creerMoteurNatif({
+    ...base,
+    asset: true,
+    cheminModele: (mod) => mod.fichier,
+    chargerPlugin: pluginFactice(journal),
+  });
+  await m.charger("coder05");
+  assert.equal(journal[0].is_model_asset, true, "le drapeau d'asset est transmis");
+  assert.equal(
+    journal[0].model,
+    "Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+    "le nom de fichier seul, sans dossier",
+  );
+});
+
+test("sans asset, aucun is_model_asset (comportement d'origine préservé)", async () => {
+  const journal: Record<string, unknown>[] = [];
+  const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice(journal) });
+  await m.charger("coder05");
+  assert.ok(!("is_model_asset" in journal[0]), "le drapeau ne doit pas apparaître");
+  assert.ok(String(journal[0].model).startsWith("/data/models/"), "on passe bien un chemin");
 });
 
 test("les jetons arrivent un par un et la vitesse vient de llama.cpp", async () => {

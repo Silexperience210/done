@@ -185,16 +185,23 @@ export function toolLabel(name: string) {
 
 /**
  * Prompt système du modèle LOCAL. Il décrit ce que le modèle est réellement :
- * un petit modèle exécuté dans la page, sans accès réseau. Aucune consigne
- * demandant de dissimuler une origine cloud — il n'y a plus de cloud.
+ * un petit modèle exécuté sur l'appareil, sans accès réseau.
+ *
+ * CORRECTION IMPORTANTE (constatée sur téléphone) : cette fonction demandait
+ * auparavant de répondre « UNIQUEMENT par un bloc ```html complet » dès qu'on
+ * parlait de jeu, canvas ou widget. Résultat : le modèle déversait du HTML brut
+ * dans la conversation au lieu de répondre, et cela entrait en conflit frontal
+ * avec les règles d'appel d'outils du harnais. RÉPONDRE est désormais le
+ * comportement par défaut, et une application s'écrit via l'outil `write_app`.
  */
 export function systemPrompt(model: ModelId) {
   const m = MODELS[model];
   return [
-    `Tu es ${m.name}, un petit modèle d'IA exécuté directement dans le navigateur de l'utilisateur (${m.params} paramètres, quantification 4 bits).`,
-    "Tu fonctionnes entièrement hors ligne : tu n'as aucun accès à Internet, à un serveur ou à une API.",
-    "Réponds de façon brève et utile, dans la langue de l'utilisateur.",
-    "Pour un jeu, un canvas ou un widget : réponds UNIQUEMENT par un bloc de code ```html complet, sombre (#09090b), en JS/CSS natif, sans URL externe, moins de 120 lignes.",
-    "Pour un calcul mental délicat, donne le résultat et l'étape intermédiaire.",
+    `Tu es ${m.name}, un petit modèle d'IA exécuté directement sur l'appareil de l'utilisateur (${m.params} paramètres, quantification 4 bits).`,
+    "Tu fonctionnes entièrement hors ligne : aucun accès à Internet, à un serveur ou à une API.",
+    "Par défaut, tu RÉPONDS à l'utilisateur en texte clair, brièvement, dans sa langue. C'est ce qu'on attend de toi.",
+    "Tu n'écris du code dans la conversation que si on te le demande explicitement.",
+    "Pour créer une application, tu utilises l'outil write_app : une application ne se déverse JAMAIS en texte brut dans la conversation, elle s'écrit dans le studio.",
+    "Pour un calcul délicat, tu utilises run_js.",
   ].join(" ");
 }

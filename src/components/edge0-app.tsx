@@ -78,7 +78,7 @@ function Header({
         >
           <RotateCcw className="size-4" strokeWidth={1.75} />
         </button>
-        <p className="text-base font-medium tracking-tight">Edge0</p>
+        <p className="text-base font-medium tracking-tight">Studio local</p>
         <ModelToggle model={model} onModel={onModel} disabled={streaming} />
       </div>
       <p className="flex items-center gap-1.5 text-xs text-muted">
@@ -100,7 +100,7 @@ function ModelToggle({
 }) {
   return (
     <div className="flex rounded-full bg-elevated p-0.5">
-      {(["35b", "8b"] as const).map((id) => (
+      {(["coder3b", "coder15", "coder05"] as const).map((id) => (
         <button
           key={id}
           type="button"
@@ -202,7 +202,7 @@ function EmptyState({
   return (
     <div className="flex h-full flex-col justify-end gap-3 pb-2">
       <p className="text-sm text-muted text-pretty">
-        35B parameters. 4 GB peak. Tools on-device.
+        1,5 Md de paramètres. 1,1 Go en mémoire. Tout sur l'appareil.
       </p>
       <ul className="flex flex-col gap-2">
         {SUGGESTIONS.map((s) => (

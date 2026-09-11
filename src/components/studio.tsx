@@ -16,7 +16,7 @@ export function StudioPanel() {
         ) : (
           <div className="flex h-full flex-col justify-end p-5">
             <p className="text-sm text-muted text-pretty">
-              Ask Edge0 to write a game or a page. The source lands here so you can
+              Ask the local model to write a game or a page. The source lands here so you can
               read it and run it on-device.
             </p>
           </div>

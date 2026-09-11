@@ -25,37 +25,43 @@ test("injects before </head>", () => {
   const out = injectGrokPwaHead("<html><head><title>x</title></head><body></body></html>");
   assert.match(out, /rel="manifest"/);
   assert.match(out, /apple-touch-icon/);
-  assert.match(out, /grok-app-builder\/extensions\.js/);
+  // Aucun script de plateforme : l'appli ne doit émettre aucun appel sortant.
+  assert.doesNotMatch(out, /grok-app-builder/);
+  assert.doesNotMatch(out, /https:\/\/grok\.com/);
+  assert.doesNotMatch(out, /fonts\.googleapis/);
   assert.ok(out.indexOf("manifest") < out.indexOf("</head>"));
 });
 
-test("injects the extensions script without a project id", () => {
+test("n'injecte AUCUN script de plateforme, même sans project id", () => {
   const out = injectGrokPwaHead("<html><head></head></html>", {
     appName: "Demo",
     projectId: "",
   });
-  assert.match(out, /src="https:\/\/grok\.com\/grok-app-builder\/extensions\.js" defer/);
+  assert.doesNotMatch(out, /extensions\.js/);
+  assert.doesNotMatch(out, /https:\/\/grok\.com/);
   assert.doesNotMatch(out, /grok-project-id/);
   assert.doesNotMatch(out, /data-project-id/);
   assert.doesNotMatch(out, /property="grok:app_id"/);
 });
 
-test("injects project id on the script and meta when provided", () => {
+test("n'injecte ni identifiant de projet ni app_id, même fournis", () => {
   const out = injectGrokPwaHead("<html><head></head></html>", {
     appName: "Demo",
     projectId: "proj-123",
   });
-  assert.match(out, /name="grok-project-id" content="proj-123"/);
-  assert.match(out, /data-project-id="proj-123"/);
-  assert.match(out, /property="grok:app_id" content="proj-123"/);
+  assert.doesNotMatch(out, /grok-project-id/);
+  assert.doesNotMatch(out, /data-project-id/);
+  assert.doesNotMatch(out, /property="grok:app_id"/);
+  assert.doesNotMatch(out, /extensions\.js/);
 });
 
-test("does not duplicate grok:app_id", () => {
+test("reste stable et sans app_id même injecté deux fois", () => {
   const ctx = { appName: "Demo", projectId: "proj-123" };
   const once = injectGrokPwaHead("<html><head></head></html>", ctx);
   const twice = injectGrokPwaHead(once, ctx);
   assert.equal(once, twice);
-  assert.equal(twice.split('property="grok:app_id"').length - 1, 1);
+  assert.doesNotMatch(twice, /grok:app_id/);
+  assert.doesNotMatch(twice, /extensions\.js/);
 });
 
 test("omits x:creator tags without both creator values", () => {
@@ -380,12 +386,13 @@ test("streaming injector matches </HEAD> case-insensitively", () => {
   assert.match(out, /<body>hello<\/body>/);
 });
 
-test("does not duplicate the extensions script", () => {
+test("n'injecte aucun script d'extension, même appelé deux fois", () => {
   const ctx = { appName: "Demo", projectId: "proj-123" };
   const once = injectGrokPwaHead("<html><head></head></html>", ctx);
   const twice = injectGrokPwaHead(once, ctx);
   assert.equal(once, twice);
-  assert.equal(twice.split("extensions.js").length - 1, 1);
+  assert.equal(twice.split("extensions.js").length - 1, 0);
+  assert.equal(twice.split("grok.com").length - 1, 0);
 });
 
 test("is idempotent", () => {

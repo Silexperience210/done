@@ -81,17 +81,12 @@ export function appNameFromHost(hostHeader) {
   );
 }
 
-/** True for Vercel system domains. Envoy rewrites origin Host to these; they SSO-protect `/og.jpg`. */
-function isVercelSystemHost(host) {
-  return (
-    host === "vercel.app" ||
-    host.endsWith(".vercel.app") ||
-    host === "vercel.com" ||
-    host.endsWith(".vercel.com")
-  );
-}
-
-/** Hostname suitable for absolute og:image URLs. Preview guests (X-Forwarded-Host) are allowed. */
+/** Hostname suitable for absolute og:image URLs. Preview guests (X-Forwarded-Host) are allowed.
+ *
+ * Note : l'appli ne connaît plus AUCUN hébergeur (la détection des domaines
+ * `*.vercel.app` a été retirée : elle ne servait qu'à éviter de figer une URL
+ * d'og:image derrière le SSO d'une plateforme, ce qui n'existe plus ici).
+ */
 export function publicAppHost(hostHeader) {
   const host = String(hostHeader ?? "")
     .split(",")[0]
@@ -100,7 +95,6 @@ export function publicAppHost(hostHeader) {
     .toLowerCase();
   if (!host || !/^[a-z0-9.-]+$/.test(host) || !host.includes(".")) return "";
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return "";
-  if (isVercelSystemHost(host)) return "";
   return host;
 }
 
@@ -200,7 +194,20 @@ export function grokPwaHeadTags(appName = DEFAULT_APP_NAME) {
   ];
 }
 
-export const GROK_EXTENSIONS_SCRIPT_SRC = "https://grok.com/grok-app-builder/extensions.js";
+/**
+ * Script d'extension de la plateforme (pastille « Created with Grok »).
+ *
+ * RETIRÉ VOLONTAIREMENT : l'appli doit n'émettre AUCUN appel sortant. Ce script
+ * chargeait https://grok.com/grok-app-builder/extensions.js sur CHAQUE page,
+ * ce qui contredisait l'exigence « 100 % local, aucune sortie réseau possible ».
+ * La fonction et la constante restent exportées (les appelants ne cassent pas)
+ * mais ne produisent plus rien.
+ */
+export const GROK_EXTENSIONS_SCRIPT_SRC = "";
+
+export function grokExtensionsHeadTags() {
+  return [];
+}
 
 export function readGrokProjectId() {
   const fromProcess = typeof process !== "undefined" ? process.env?.VITE_PROJECT_ID : "";
@@ -227,20 +234,7 @@ export function grokXCreatorHeadTags(creator = readXCreator(), creatorId = readX
   ];
 }
 
-/** Platform "Created with Grok" banner — injected into every HTML document. */
-export function grokExtensionsHeadTags(projectId = readGrokProjectId()) {
-  const id = escapeHtml(projectId);
-  const tags = [];
-  if (projectId) {
-    tags.push(`<meta name="grok-project-id" content="${id}">`);
-  }
-  tags.push(
-    `<script src="${GROK_EXTENSIONS_SCRIPT_SRC}"${
-      projectId ? ` data-project-id="${id}"` : ""
-    } defer></script>`,
-  );
-  return tags;
-}
+/** (Ancien injecteur de pastille plateforme — supprimé, voir plus haut.) */
 
 export function readOgSite(cwd = process.cwd()) {
   try {
@@ -447,18 +441,8 @@ export function injectGrokPwaHead(html, ctx = {}) {
     grokOgHeadTags({ host, appName, site, documentTitle, cwd }).join(""),
   );
 
-  if (!next.includes("/grok-app-builder/extensions.js")) {
-    missing.push(...grokExtensionsHeadTags(projectId));
-  } else if (projectId && !next.includes('name="grok-project-id"')) {
-    missing.push(`<meta name="grok-project-id" content="${escapeHtml(projectId)}">`);
-  }
-  if (
-    projectId &&
-    !next.includes('property="grok:app_id"') &&
-    !next.includes("property='grok:app_id'")
-  ) {
-    missing.push(`<meta property="grok:app_id" content="${escapeHtml(projectId)}">`);
-  }
+  // Aucun script de plateforme n'est injecté : l'appli ne doit émettre aucun
+  // appel sortant (voir grokExtensionsHeadTags, désormais vide).
   const creatorTags = grokXCreatorHeadTags(creator, creatorId);
   if (creatorTags.length > 0) {
     const hasCreator =

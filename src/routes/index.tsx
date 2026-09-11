@@ -7,7 +7,7 @@ function Home() {
   return (
     <main>
       <h1 className="sr-only">
-        Edge0 on Android — a 35B language model with tools and a 4 GB working set
+        Qwen2.5-Coder-1.5B qui tourne dans ta page, hors ligne
       </h1>
       <div className="hidden min-h-dvh lg:block">
         <Stage />

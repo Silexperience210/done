@@ -3,3 +3,13 @@ node_modules/
 .github_repo
 .env
 .env.*
+
+# Sortie de build (ne doit pas être versionnée)
+.vercel/output/
+# Sortie auto-hébergée (`node-server`) ET sortie statique pour l'APK (`dist/`).
+# Ce sont des RÉSULTATS de build : 415 Mo sur disque, dont 21 Mo de WASM. Les
+# suivre polluait le dépôt et publiait au passage des fichiers qui n'ont rien à y
+# faire (la feuille de tournée, par exemple).
+.output/
+dist/
+public/tournee.html

@@ -30,14 +30,14 @@ export function localChat(text: string): string {
       ? "L’inférence streamée émet les tokens un par un, dès qu’ils sont calculés, au lieu d’attendre la séquence entière."
       : "Streaming inference emits tokens one by one as they are computed, instead of waiting for the full sequence.";
   }
-  if (/ram|mémoire|memory|4\s*go|4\s*gb|working set/.test(t)) {
+  if (/ram|mémoire|memory|working set|modèle|model|local/.test(t)) {
     return fr
-      ? "Le checkpoint 35B reste sur UFS (~23 Go). Seuls les experts actifs (K=4) montent en RAM — pic autour de 4 Go."
-      : "The 35B checkpoint stays on UFS (~23 GB). Only active experts (K=4) enter RAM — peak around 4 GB.";
+      ? "Tout tient dans la mémoire de l'appareil : environ 0,9 Go pour Qwen2.5-Coder-1.5B en 4 bits (1,0 Go à télécharger une fois). Rien ne part sur le réseau."
+      : "Everything fits in the device's memory: about 0.9 GB for Qwen2.5-Coder-1.5B at 4 bits (1.0 GB downloaded once). Nothing goes over the network.";
   }
   return fr
-    ? "Je tourne en local. Demande ping-pong, snake, des particules ou un calcul — je l’exécute ici, sans code à écrire."
-    : "I run on-device. Ask for ping pong, snake, particles, or a calculation — I’ll run it here, no coding.";
+    ? "Les mini-apps locales (ping-pong, snake, particules, calculs) fonctionnent sans réseau ni modèle. Pour une vraie conversation, le petit modèle local — Qwen2.5-Coder-1.5B, exécuté dans la page — prend le relais."
+    : "Local mini-apps (ping pong, snake, particles, math) run without network or model. For real conversation, the small local model — Qwen2.5-Coder-1.5B, running in the page — takes over.";
 }
 
 export type LocalTurn =

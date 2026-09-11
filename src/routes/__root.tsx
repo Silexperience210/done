@@ -3,7 +3,7 @@ import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
-const APP_NAME = "Edge0 Android";
+const APP_NAME = "Studio local";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "A 35B language model running on Android using only 1–2.5 GB of peak memory. No cloud. No remote server.",
+          "Un petit modèle de langage exécuté dans la page, sans aucune requête sortante. Rien ne quitte l'appareil.",
       },
       { name: "theme-color", content: "#070708" },
     ],
@@ -23,12 +23,9 @@ export const Route = createRootRoute({
       { rel: "stylesheet", href: appCss },
       { rel: "manifest", href: "/__grok/manifest.webmanifest" },
       { rel: "apple-touch-icon", href: "/__grok/icon-180.png" },
-      { rel: "preconnect", href: "https://fonts.googleapis.com" },
-      { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
-      {
-        rel: "stylesheet",
-        href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Roboto:wght@400;500;600&display=swap",
-      },
+      // POLICES GOOGLE RETIRÉES : elles chargeaient fonts.googleapis.com et
+      // fonts.gstatic.com sur chaque page. L'appli doit n'émettre aucun appel
+      // sortant ; on s'appuie sur les polices du système (voir styles.css).
     ],
   }),
   component: () => (

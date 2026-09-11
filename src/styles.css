@@ -16,9 +16,9 @@
   --color-screen: #09090b;
   --color-bubble: #2c2c30;
   --color-stat: #c8ccd4;
-  --font-sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
-  --font-android: "Roboto", "Noto Sans", system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-android: Roboto, "Noto Sans", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   --radius-xs: 4px;
   --radius-sm: 8px;
   --radius-md: 12px;

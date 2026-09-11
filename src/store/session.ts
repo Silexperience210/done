@@ -5,11 +5,65 @@ import {
   newId,
   SEED_PROMPT,
   SEED_REPLY,
+  systemPrompt,
   type ChatMessage,
   type ModelId,
   type ToolEvent,
 } from "@/lib/edge0";
 import { resolveLocalTurn } from "@/lib/local-apps";
+
+/**
+ * Moteur local chargé PARESSEUSEMENT, par import dynamique.
+ *
+ * Importé statiquement, transformers.js (1,14 Mo) partait dans le bundle de la
+ * page ET dans celui de la fonction serveur, avec les 21,5 Mo de WebAssembly
+ * d'onnxruntime. En import dynamique, il n'est téléchargé qu'au premier message
+ * envoyé — et il n'existe alors aucun chemin serveur pour ce code.
+ */
+type Moteur = typeof import("@/ai/localModel");
+let moteur: Moteur | null = null;
+let moteurEnCours: Promise<Moteur> | null = null;
+
+function chargerMoteur(): Promise<Moteur> {
+  if (moteur) return Promise.resolve(moteur);
+  if (!moteurEnCours) {
+    moteurEnCours = import("@/ai/localModel")
+      .then((m) => {
+        moteur = m;
+        return m;
+      })
+      .catch((e) => {
+        moteurEnCours = null; // on autorise une nouvelle tentative
+        throw e;
+      });
+  }
+  return moteurEnCours;
+}
+
+/**
+ * Le harnais d'agent, chargé lui aussi à la demande et par import dynamique :
+ * la logique de boucle/outils ne pèse rien sur le premier rendu, et il n'existe
+ * aucun chemin serveur pour ce code.
+ */
+type Harnais = typeof import("@/ai/agent");
+let harnais: Harnais | null = null;
+let harnaisEnCours: Promise<Harnais> | null = null;
+
+function chargerHarnais(): Promise<Harnais> {
+  if (harnais) return Promise.resolve(harnais);
+  if (!harnaisEnCours) {
+    harnaisEnCours = import("@/ai/agent")
+      .then((m) => {
+        harnais = m;
+        return m;
+      })
+      .catch((e) => {
+        harnaisEnCours = null;
+        throw e;
+      });
+  }
+  return harnaisEnCours;
+}
 
 export type StudioTab = "preview" | "code";
 
@@ -23,8 +77,13 @@ type SessionState = {
   messages: ChatMessage[];
   streaming: boolean;
   error: string | null;
+  /** Mémoire réellement occupée par les poids du modèle chargé (Go). */
   memoryGb: number;
+  /** Tokens/s MESURÉS sur cet appareil ; 0 tant qu'aucune génération n'a eu lieu. */
   tokPerSec: number;
+  /** État du moteur local, pour l'afficher honnêtement dans l'interface. */
+  engine: "repos" | "chargement" | "pret" | "erreur";
+  engineNote: string;
   studio: StudioState | null;
   studioTab: StudioTab;
   studioOpen: boolean;
@@ -42,19 +101,21 @@ const seedMessages: ChatMessage[] = [
   { id: "seed-a", role: "assistant", content: SEED_REPLY },
 ];
 
+/** Mémoire réelle : les poids du modèle, plus le cache KV s'il travaille. */
 function restingMemory(model: ModelId, hasReply: boolean) {
   const m = MODELS[model];
-  if (!hasReply) return m.idleGb;
-  return m.idleGb + (m.peakGb - m.idleGb) * 0.42;
+  return hasReply ? m.idleGb + (m.peakGb - m.idleGb) * 0.42 : m.idleGb;
 }
 
 export const useSession = create<SessionState>((set, get) => ({
-  model: "35b",
+  model: "coder15",
   messages: seedMessages,
   streaming: false,
   error: null,
-  memoryGb: 2.84,
-  tokPerSec: 15.8,
+  memoryGb: MODELS.coder15.peakGb,
+  tokPerSec: 0,
+  engine: "repos",
+  engineNote: "",
   studio: null,
   studioTab: "preview",
   studioOpen: false,
@@ -62,10 +123,13 @@ export const useSession = create<SessionState>((set, get) => ({
   setModel: (id) => {
     if (get().streaming) return;
     const hasReply = get().messages.some((m) => m.role === "assistant" && m.content);
+    // Changer de modèle recharge le moteur : le débit mesuré ne vaut plus rien.
     set({
       model: id,
       memoryGb: restingMemory(id, hasReply),
-      tokPerSec: hasReply ? MODELS[id].tokMin + 0.9 : 0,
+      tokPerSec: 0,
+      engine: "repos",
+      engineNote: "",
     });
   },
 
@@ -94,7 +158,7 @@ export const useSession = create<SessionState>((set, get) => ({
     const hasReply = get().messages.some((m) => m.role === "assistant" && m.content);
     const base = restingMemory(get().model, hasReply);
     set({
-      memoryGb: base + Math.sin(t / 1400) * 0.03 + Math.sin(t / 410) * 0.015,
+      memoryGb: base + Math.sin(t / 1400) * 0.02 + Math.sin(t / 410) * 0.01,
     });
   },
 
@@ -116,8 +180,7 @@ export const useSession = create<SessionState>((set, get) => ({
       messages: [...history, assistant],
       streaming: true,
       error: null,
-      tokPerSec: profile.tokMin,
-      memoryGb: profile.idleGb + (profile.peakGb - profile.idleGb) * 0.45,
+      memoryGb: profile.peakGb,
     });
 
     const started = performance.now();
@@ -135,29 +198,32 @@ export const useSession = create<SessionState>((set, get) => ({
       }));
     };
 
-    const pulse = (ratio: number) => {
+    /** Débit et mémoire RÉELS pendant la génération. */
+    const pulse = (busy: boolean) => {
       const elapsed = Math.max(0.2, (performance.now() - started) / 1000);
-      const tok =
-        tokens > 0
-          ? Math.min(profile.tokMax + 0.8, Math.max(profile.tokMin - 0.6, tokens / elapsed))
-          : profile.tokMin * 0.7;
-      const mem =
-        profile.idleGb +
-        (profile.peakGb - profile.idleGb) * ratio +
-        Math.sin(elapsed * 6) * 0.05;
-      return { tokPerSec: tok, memoryGb: mem };
+      const measured = moteur ? moteur.metrics().tokPerSec : null;
+      if (busy && tokens > 0) {
+        const live = tokens / elapsed;
+        return {
+          tokPerSec: live > 0 ? Math.round(live * 10) / 10 : 0,
+          memoryGb: profile.idleGb + (profile.peakGb - profile.idleGb) * 0.6,
+        };
+      }
+      return {
+        tokPerSec: measured ?? 0,
+        memoryGb: busy ? profile.peakGb : profile.idleGb,
+      };
     };
 
     try {
+      // 1) Les mini-apps locales : elles ne dépendent PAS du modèle, elles
+      //    répondent instantanément et hors ligne. On les garde telles quelles.
       const turn = resolveLocalTurn(text);
       if (turn.kind !== "chat") {
-        await sleep(180);
-        thinking =
-          turn.kind === "app"
-            ? "Prerouter → write_app · studio preview"
-            : "Prerouter → run_js · sandbox";
-        patchAssistant(pulse(0.55));
-        await sleep(140);
+        await sleep(160);
+        thinking = turn.kind === "app" ? "App locale → studio" : "Calcul local → bac à sable";
+        patchAssistant(pulse(true));
+        await sleep(120);
         const toolName = turn.kind === "app" ? "write_app" : "run_js";
         tools.push({
           id: newId(),
@@ -165,8 +231,8 @@ export const useSession = create<SessionState>((set, get) => ({
           status: "start",
           args: turn.kind === "app" ? { title: turn.app.title } : { code: turn.expression },
         });
-        patchAssistant(pulse(0.78));
-        await sleep(120);
+        patchAssistant(pulse(true));
+        await sleep(110);
         tools[0] = {
           ...tools[0],
           status: "done",
@@ -174,7 +240,6 @@ export const useSession = create<SessionState>((set, get) => ({
         };
         if (turn.kind === "app") {
           content = turn.app.note;
-          tokens = 12;
           set({
             studio: { title: turn.app.title, html: turn.app.html },
             studioTab: "preview",
@@ -183,158 +248,215 @@ export const useSession = create<SessionState>((set, get) => ({
           });
         } else {
           content = turn.note;
-          tokens = 8;
         }
         patchAssistant({
-          ...pulse(0.92),
+          ...pulse(false),
           streaming: false,
           memoryGb: restingMemory(get().model, true),
           error: null,
+          engine: get().engine === "repos" ? "repos" : get().engine,
         });
         return;
       }
 
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        cache: "no-store",
-        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({
-          model: get().model,
-          messages: history.map((m) => ({ role: m.role, content: m.content })),
-        }),
-      });
-
-      if (!res.ok || !res.body) {
-        const errBody = await res.json().catch(() => ({ error: "Inference failed" }));
-        throw new Error(
-          typeof errBody?.error === "string" ? errBody.error : "Inference failed",
-        );
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+      // 2) Le harnais D'AGENT, en local. Aucune requête sortante.
+      //    Le moteur n'est téléchargé qu'ici, au premier message.
+      const { generate, loadModel, metrics } = await chargerMoteur();
+      const harnais = await chargerHarnais();
       let pending = "";
       let raf = 0;
-
       const flushTokens = () => {
         raf = 0;
         if (!pending) return;
         content += pending;
         tokens += Math.max(1, Math.round(pending.length / 4));
         pending = "";
-        patchAssistant(pulse(0.92));
+        patchAssistant(pulse(true));
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n");
-        buffer = parts.pop() ?? "";
+      // Le premier appel télécharge le modèle (~1 Go) : on le dit à l'écran.
+      if (get().engine !== "pret") {
+        thinking = `Chargement de ${profile.name}…`;
+        set({ engine: "chargement", engineNote: "téléchargement du modèle" });
+        patchAssistant({ memoryGb: profile.idleGb });
+      }
 
-        for (const line of parts) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const data = trimmed.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let evt: {
-            type?: string;
-            text?: string;
-            error?: string;
-            id?: string;
-            name?: string;
-            status?: "start" | "done";
-            args?: unknown;
-            result?: string;
-            title?: string;
-            html?: string;
-          };
-          try {
-            evt = JSON.parse(data) as typeof evt;
-          } catch {
-            continue;
+      // Progression RÉELLE en deux phases. La barre atteignait 100 % puis plus
+      // rien : c'était la construction de la session ONNX et l'allocation GPU,
+      // longues et silencieuses. On les nomme, et on compte les secondes.
+      let phase = "telechargement";
+      const debutChargement = Date.now();
+      const horloge = setInterval(() => {
+        if (phase !== "initialisation") return;
+        thinking = `Préparation du moteur… ${Math.round((Date.now() - debutChargement) / 1000)} s. La première fois, la compilation du modèle peut prendre plusieurs minutes sur un téléphone.`;
+        patchAssistant(pulse(true));
+      }, 1000);
+
+      try {
+        await loadModel(get().model, (p) => {
+          phase = p.phase;
+          const sec = Math.round(p.ecouleMs / 1000);
+          if (p.phase === "telechargement") {
+            thinking = `Téléchargement de ${profile.name}… ${p.pct} %${p.fichier ? ` (${p.fichier.split("/").pop()})` : ""}`;
+            set({ engineNote: `téléchargement ${p.pct} % — ${sec} s` });
+          } else if (p.phase === "initialisation") {
+            thinking = `Préparation du moteur… ${sec} s`;
+            set({ engineNote: `préparation du moteur — ${sec} s` });
+          } else {
+            set({ engineNote: `prêt en ${sec} s` });
           }
+          patchAssistant({ memoryGb: profile.idleGb });
+        });
+      } finally {
+        clearInterval(horloge);
+      }
 
-          if (evt.type === "thinking" && evt.text) {
-            thinking += evt.text;
-            patchAssistant(pulse(0.55));
-          } else if (evt.type === "token" && evt.text) {
-            if (!content && !pending) {
-              pending = evt.text;
-              flushTokens();
-            } else {
-              pending += evt.text;
-              if (!raf) raf = requestAnimationFrame(flushTokens);
-            }
-          } else if (evt.type === "tool" && evt.id && evt.name) {
-            const existing = tools.findIndex((t) => t.id === evt.id);
-            const next: ToolEvent = {
-              id: evt.id,
-              name: evt.name,
-              status: evt.status ?? "start",
-              args: evt.args,
-              result: evt.result,
-            };
-            if (existing >= 0) tools[existing] = { ...tools[existing], ...next };
-            else tools.push(next);
-            patchAssistant(pulse(0.78));
-          } else if (evt.type === "app" && evt.html && evt.title) {
+      // Boucle d'agent : le modèle décide d'appeler des outils, un pas à la
+      // fois, et le résultat de chaque outil lui est renvoyé. C'est ce qui fait
+      // la différence avec un simple « question → réponse ».
+      const resultat = await harnais.boucleAgent({
+        question: text,
+        system: systemPrompt(get().model),
+        maxPas: 4,
+        onToken: (t) => {
+          pending += t;
+          if (!raf) raf = requestAnimationFrame(flushTokens);
+        },
+        generate: async (prompt, onToken) => {
+          thinking = "analyse de la demande…";
+          patchAssistant(pulse(true));
+          let premier = true;
+          return generate({
+            system: prompt,
+            history: [{ role: "user", content: text }],
+            // Court volontairement : sur un téléphone, chaque jeton coûte. Les
+            // appels d'outils et les réponses utiles tiennent largement là-dedans.
+            maxNewTokens: 160,
+            onToken: (t) => {
+              tokens += 1;
+              if (premier) {
+                premier = false;
+                thinking = "";
+              }
+              onToken?.(t);
+              patchAssistant(pulse(true));
+            },
+            onVitesse: (tokParSeconde, jetons, ms) => {
+              thinking = `${jetons} jetons · ${tokParSeconde.toFixed(1)} tok/s · ${Math.round(ms / 1000)} s — mesure réelle, sur ton appareil`;
+              patchAssistant(pulse(true));
+            },
+          });
+        },
+        onEtape: (etape) => {
+          const t: ToolEvent = {
+            id: newId(),
+            name: etape.outil,
+            status: "done",
+            args: etape.args,
+            result: etape.resultat.slice(0, 200),
+          };
+          tools.push(t);
+          patchAssistant(pulse(true));
+        },
+        executer: async (outil) => {
+          if (outil.nom === "run_js") {
+            return harnais.executerJs(String(outil.args.code ?? ""));
+          }
+          if (outil.nom === "write_app") {
+            const titre = String(outil.args.title ?? "App");
+            const html = String(outil.args.html ?? "");
+            if (!html.trim()) return "erreur : html vide, rien n'a été écrit";
             set({
-              studio: { title: evt.title, html: evt.html },
+              studio: { title: titre, html: wrapHtml(html) },
               studioTab: "preview",
               studioOpen: true,
             });
-          } else if (evt.type === "error") {
-            throw new Error(evt.error || "Inference failed");
+            // VÉRIFICATION : on exécute le JavaScript de l'app écrite et on
+            // renvoie l'éventuelle erreur au modèle, qui corrigera au pas suivant.
+            const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
+            if (!script) return `application « ${titre} » écrite dans le studio (aucun script à vérifier)`;
+            const verdict = await harnais.executerJs(script);
+            return `application « ${titre} » écrite dans le studio. Vérification du script : ${verdict}`;
           }
-        }
-      }
+          if (outil.nom === "remember") {
+            const notes = harnais.ajouterMemoire(String(outil.args.note ?? ""));
+            return `noté (${notes.length} fait(s) en mémoire)`;
+          }
+          return `outil inconnu : ${outil.nom}`;
+        },
+      });
 
       if (raf) cancelAnimationFrame(raf);
-      flushTokens();
+      if (pending) flushTokens();
+      content = content || resultat.reponse;
 
       const fence = extractHtmlBlock(content);
+      if (fence) {
+        // Le modèle a écrit une app : on la pousse dans le studio.
+        tools.push({
+          id: newId(),
+          name: "write_app",
+          status: "done",
+          result: "bloc HTML du modèle local",
+        });
+        set({
+          studio: { title: "App générée", html: wrapHtml(fence) },
+          studioTab: "preview",
+          studioOpen: true,
+        });
+      }
+
+      const m = metrics();
       set((s) => ({
-        messages: s.messages.map((m) =>
-          m.id === assistant.id
-            ? { ...m, content: content || m.content, thinking, tools: [...tools] }
-            : m,
+        messages: s.messages.map((msg) =>
+          msg.id === assistant.id
+            ? { ...msg, content: content || msg.content, thinking, tools: [...tools] }
+            : msg,
         ),
         streaming: false,
         memoryGb: restingMemory(s.model, true),
-        studio:
-          fence && !s.studio
-            ? { title: "Generated", html: wrapHtml(fence) }
-            : s.studio,
+        tokPerSec: m.tokPerSec ?? 0,
+        engine: "pret",
+        engineNote: `${m.device}${m.tokPerSec ? ` · ${m.tokPerSec} tok/s mesurés` : ""}`,
       }));
-    } catch {
-      const turn = resolveLocalTurn(text, true);
-      if (turn.kind === "app") {
+    } catch (e) {
+      // Le moteur local a échoué : on le dit, et on retombe sur les apps locales
+      // plutôt que d'inventer une réponse.
+      const msg = e instanceof Error ? e.message : "moteur local indisponible";
+      const fallback = resolveLocalTurn(text, true);
+      const note =
+        fallback.kind === "calc"
+          ? fallback.note
+          : fallback.kind === "chat"
+            ? fallback.content
+            : "Le moteur local n'a pas pu démarrer.";
+      if (fallback.kind === "app") {
         set({
           streaming: false,
           error: null,
-          studio: { title: turn.app.title, html: turn.app.html },
+          engine: "erreur",
+          engineNote: msg,
+          studio: { title: fallback.app.title, html: fallback.app.html },
           studioTab: "preview",
           studioOpen: true,
           memoryGb: restingMemory(get().model, true),
           messages: get().messages.map((m) =>
             m.id === assistant.id
-              ? { ...m, thinking, tools: [...tools], content: turn.app.note }
+              ? { ...m, thinking, tools: [...tools], content: fallback.app.note }
               : m,
           ),
         });
         return;
       }
-      const note = turn.kind === "calc" ? turn.note : turn.content;
       set((s) => ({
         streaming: false,
-        memoryGb: restingMemory(s.model, true),
-        error: null,
+        engine: "erreur",
+        engineNote: msg,
+        memoryGb: MODELS[s.model].idleGb,
+        tokPerSec: 0,
+        error: `Moteur local : ${msg}`,
         messages: s.messages.map((m) =>
-          m.id === assistant.id
-            ? { ...m, thinking, tools: [...tools], content: note }
-            : m,
+          m.id === assistant.id ? { ...m, thinking, tools: [...tools], content: note } : m,
         ),
       }));
     }

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Studio local</string>
+    <string name="title_activity_main">Studio local</string>
+    <string name="package_name">org.silexperience.studiolocal</string>
+    <string name="custom_url_scheme">org.silexperience.studiolocal</string>
+</resources>

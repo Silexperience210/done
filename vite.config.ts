@@ -155,9 +155,20 @@ export default defineConfig(({ command, isPreview }) => ({
     host: "127.0.0.1",
     port: 8081,
     strictPort: true,
+    // Le contrôle d'hôte de Vite bloque par défaut tout Host inconnu (403
+    // « Blocked request »). On autorise le domaine des tunnels rapides
+    // Cloudflare — et SEULEMENT lui : `true` désactiverait la protection
+    // contre le DNS rebinding, ce qui n'est pas nécessaire ici.
+    allowedHosts: [".trycloudflare.com"],
   },
   resolve: { tsconfigPaths: true },
   plugins: [
+    // SSL DÉSACTIVÉ : le plugin @vitejs/plugin-basic-ssl casse le middleware SSR
+    // de TanStack Start (toutes les routes renvoient « Cannot GET / », même
+    // /login — la pile passe en HTTP/2 et le SSR n'est plus atteint).
+    // Pour WebGPU sur le téléphone, on utilise l'exception d'origine de Chrome
+    // (chrome://flags/#unsafely-treat-insecure-origin-as-secure) sur l'URL HTTP.
+    // ...(command === "serve" ? [basicSsl()] : []),
     pgliteBootstrapPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.
     authPopupPlugin(),
@@ -166,11 +177,37 @@ export default defineConfig(({ command, isPreview }) => ({
     // PWA head + ?install=1 tutorial page; runs before Start/Nitro.
     grokPwaPlugin(),
     tailwindcss(),
-    tanstackStart(),
-    ...(command === "build" || isPreview
+    tanstackStart(
+      // BUILD_SPA=1 → sortie STATIQUE (mode SPA de TanStack Start), la seule
+      // forme utilisable par Capacitor : un APK n'a pas de serveur pour rendre
+      // les pages. Sans cette variable, rien ne change.
+      process.env.BUILD_SPA === "1"
+        ? {
+            spa: {
+              enabled: true,
+              // Le pré-rendu interroge cette route : « / », pas « /index.html »
+              // (l'appli n'expose que « / » ; demander /index.html donne un 404
+              // et fait échouer tout le build).
+              maskPath: "/",
+              prerender: {
+                enabled: true,
+                outputPath: "index.html",
+                crawlLinks: false,
+                retryCount: 0,
+              },
+            },
+          }
+        : {},
+    ),
+    ...(process.env.BUILD_SPA !== "1" && (command === "build" || isPreview)
       ? [
           nitro({
-            preset: "vercel",
+            // AUTO-HÉBERGÉ, et non « vercel ». Le preset « vercel » produisait un
+            // paquet lié à un hébergeur : impossible à lancer sur la machine de
+            // l'utilisateur. « node-server » produit un serveur Node autonome
+            // (`node .output/server/index.mjs`), donc un déploiement réellement
+            // local.
+            preset: "node-server",
             // Auto-registers server/middleware/* (the PWA install page +
             // manifest + head-tag middleware). Nitro v3 defaults serverDir to
             // false, so removing this silently unwires /?install=1 on deploys.

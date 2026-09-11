@@ -50,35 +50,15 @@ jobs:
       - name: Copier l'interface dans le projet Android
         run: npx cap sync android
 
-      # Embarquer le modèle GGUF DANS l'APK plutôt que de le faire télécharger par
-      # l'appli à la première ouverture : l'inférence native (llama.cpp via le
-      # plugin llama-cpp-capacitor) doit fonctionner dès le premier lancement,
-      # sans dépendre d'une connexion réseau ni d'un tiers (Hugging Face) qui
-      # pourrait être indisponible, lent, ou changer la licence/le fichier.
-      # Le modèle voyage ainsi dans les assets : l'appli est autonome hors-ligne.
-      - name: Embarquer le modèle GGUF dans l'APK
-        run: |
-          set -euo pipefail
-          ASSETS_DIR="android/app/src/main/assets"
-          MODEL_NAME="Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf"
-          MODEL_URL="https://huggingface.co/bartowski/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf"
-          mkdir -p "$ASSETS_DIR"
-
-          # Idempotent : on ne retélécharge pas un modèle déjà présent (utile en
-          # cache de workflow et pour ne pas gaspiller ~400 Mo de bande passante).
-          if [ -s "$ASSETS_DIR/$MODEL_NAME" ]; then
-            echo "Modèle déjà présent, téléchargement ignoré."
-          else
-            echo "Téléchargement de $MODEL_NAME (~398 Mo)..."
-            curl -L --fail --retry 3 --no-progress-meter \
-              -o "$ASSETS_DIR/$MODEL_NAME" "$MODEL_URL"
-          fi
-
-          # Échouer tôt si le fichier manque ou fait 0 octet, plutôt que de
-          # produire un APK silencieusement dépourvu de modèle.
-          test -s "$ASSETS_DIR/$MODEL_NAME"
-          ls -la "$ASSETS_DIR/$MODEL_NAME"
-
+      # Le modèle GGUF n'est PLUS embarqué dans l'APK. Il a été retiré parce que
+      # le plugin llama-cpp-capacitor ne cherche le modèle que dans le système de
+      # fichiers (getFilesDir()/Documents, getExternalFilesDir(null)/Documents,
+      # /sdcard/Documents, …) et n'a AUCUN chemin d'assets : un GGUF posé dans
+      # les assets de l'APK était donc introuvable, d'où l'erreur « Failed to
+      # initialize native context ». Les 398 Mo embarqués ne servaient à rien et
+      # gonflaient l'APK ; il redescend à ~19 Mo. Le modèle est désormais
+      # téléchargé par l'appli au premier lancement dans getFilesDir()/Documents
+      # (voir src/ai/modeleLocal.ts), dossier que le plugin visite réellement.
       - name: Compiler l'APK de test
         working-directory: android
         run: |

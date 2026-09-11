@@ -9,8 +9,10 @@
  *    l'ordre de grandeur de la vitesse ;
  *  - libérer l'ancien modèle avant d'en charger un autre (sinon la RAM explose
  *    sur un téléphone) ;
- *  - le mode « asset » : un GGUF embarqué dans l'appli se désigne par son nom de
- *    fichier seul, avec `is_model_asset`. Un chemin complet y serait faux.
+ *  - le modèle se désigne par le NOM DE FICHIER SEUL (le plugin le résout dans
+ *    ses dossiers, dont getFilesDir()/Documents) et AUCUN `is_model_asset` n'est
+ *    transmis : ce paramètre n'est lu nulle part côté Android (vérifié dans
+ *    LlamaCpp.java), l'envoyer trompait sur sa prise en charge.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -68,18 +70,18 @@ test("n_ctx et les lots de pré-remplissage sont configurables", async () => {
   assert.equal(journal[0].n_ubatch, 256);
 });
 
-test("le mode asset passe is_model_asset et le NOM DE FICHIER seul", async () => {
-  // Un GGUF embarqué dans les ressources de l'appli n'a pas de chemin : llama.cpp
-  // le résout par son nom, à condition de le lui dire avec is_model_asset.
+test("le NOM DE FICHIER SEUL est transmis (résolu par les dossiers du plugin)", async () => {
+  // Le GGUF est téléchargé dans getFilesDir()/Documents/<fichier> par
+  // modeleLocal.ts. Le plugin Android ne retient que le nom de fichier
+  // (`new File(modelPath).getName()`) et le cherche dans ses propres dossiers :
+  // on lui passe donc le nom seul, exactement ce que fait cheminModele(id).
   const journal: Record<string, unknown>[] = [];
   const m = creerMoteurNatif({
     ...base,
-    asset: true,
     cheminModele: (mod) => mod.fichier,
     chargerPlugin: pluginFactice(journal),
   });
   await m.charger("coder05");
-  assert.equal(journal[0].is_model_asset, true, "le drapeau d'asset est transmis");
   assert.equal(
     journal[0].model,
     "Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
@@ -87,12 +89,40 @@ test("le mode asset passe is_model_asset et le NOM DE FICHIER seul", async () =>
   );
 });
 
-test("sans asset, aucun is_model_asset (comportement d'origine préservé)", async () => {
+test("aucun is_model_asset n'est transmis : le plugin Android l'ignore", async () => {
+  // Vérifié dans LlamaCpp.java : `is_model_asset` n'est lu nulle part côté
+  // Android. L'envoyer laissait croire qu'il activait la recherche dans les
+  // assets, ce qui n'existe pas — c'était la cause de l'échec de chargement.
   const journal: Record<string, unknown>[] = [];
   const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice(journal) });
   await m.charger("coder05");
-  assert.ok(!("is_model_asset" in journal[0]), "le drapeau ne doit pas apparaître");
-  assert.ok(String(journal[0].model).startsWith("/data/models/"), "on passe bien un chemin");
+  assert.ok(!("is_model_asset" in journal[0]), "le drapeau ignoré ne doit plus partir");
+});
+
+test("avec un chemin complet, on passe ce chemin tel quel", async () => {
+  // Le moteur ne présume pas de l'emplacement : il transmet ce que lui donne
+  // `cheminModele`. Le nom seul est le cas réel (voir modeleLocal.ts).
+  const journal: Record<string, unknown>[] = [];
+  const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice(journal) });
+  await m.charger("coder05");
+  assert.ok(String(journal[0].model).startsWith("/data/models/"), "le chemin fourni est transmis");
+});
+
+test("chaque modèle sait d'où venir et quelle taille attendre", () => {
+  // Un modèle sans URL ne serait pas téléchargeable : le champ est obligatoire.
+  // `octets` doit rester cohérent avec `tailleGo` (relevés sur le Hub).
+  for (const modele of MODELES_GGUF) {
+    assert.match(
+      modele.url,
+      /^https:\/\/huggingface\.co\/.+\/resolve\/main\/.+\.gguf$/,
+      `${modele.id} : URL directe vers le GGUF`,
+    );
+    const octetsParGo = modele.octets / modele.tailleGo;
+    assert.ok(
+      octetsParGo > 0.95e9 && octetsParGo < 1.05e9,
+      `${modele.id} : octets cohérent avec tailleGo (${modele.octets} / ${modele.tailleGo})`,
+    );
+  }
 });
 
 test("les jetons arrivent un par un et la vitesse vient de llama.cpp", async () => {

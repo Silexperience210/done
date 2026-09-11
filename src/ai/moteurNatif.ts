@@ -30,6 +30,19 @@ export type ModeleGguf = {
   fichier: string;
   /** Taille RÉELLE du fichier, relevée sur l'API du Hub (Go). */
   tailleGo: number;
+  /**
+   * Taille EXACTE en octets, relevée sur le Hub (`x-linked-size` de l'en-tête
+   * HTTP). Sert à VÉRIFIER un téléchargement : un fichier tronqué ou un mauvais
+   * fichier doit être refusé, pas chargé. Pour le 0.5B Q4_K_M il vaut
+   * 397 808 288 octets.
+   */
+  octets: number;
+  /**
+   * Adresse de téléchargement directe du GGUF (fichier public sur le Hugging
+   * Face Hub). Vérifiée : la taille annoncée par l'en-tête `content-length`
+   * correspond bien à `octets`.
+   */
+  url: string;
   /** Octets lus par jeton, en Q4 : ce qui décide vraiment de la vitesse. */
   lectureGoParJeton: number;
   note: string;
@@ -47,6 +60,8 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
     court: "0.5B Q4",
     fichier: "Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
     tailleGo: 0.398,
+    octets: 397_808_288,
+    url: "https://huggingface.co/bartowski/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
     lectureGoParJeton: 0.4,
     note: "Le plus léger. Sert à prouver que la chaîne native fonctionne.",
   },
@@ -56,6 +71,8 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
     court: "1.5B Q4",
     fichier: "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
     tailleGo: 0.986,
+    octets: 986_048_800,
+    url: "https://huggingface.co/bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
     lectureGoParJeton: 1.0,
     note: "Bon compromis sur un téléphone récent, et fiable pour les outils.",
   },
@@ -69,6 +86,8 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
     // sensiblement plus juste à budget de bits comparable.
     fichier: "Qwen3-Coder-30B-A3B-Instruct-UD-IQ1_S.gguf",
     tailleGo: 8.9,
+    octets: 8_914_328_736,
+    url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-UD-IQ1_S.gguf",
     lectureGoParJeton: 1.3,
     note: "Le pari : 30B de connaissances, 3B activés, donc peu d'octets lus par jeton — plus rapide qu'un dense 8B malgré quatre fois plus de poids. 8,9 Go sur douze, limite haute. La fiabilité des appels d'outils à 1 bit reste à prouver.",
   },
@@ -100,13 +119,6 @@ export type PluginLlama = {
 export type OptionsNatif = {
   /** Où trouver le GGUF sur l'appareil. */
   cheminModele: (m: ModeleGguf) => string;
-  /**
-   * Le GGUF est EMBARQUÉ dans les ressources de l'appli (assets Android / bundle
-   * iOS) au lieu d'être posé sur le système de fichiers. Dans ce cas llama.cpp
-   * attend le NOM DE FICHIER SEUL, et c'est `is_model_asset: true` qui le lui
-   * dit. Sans cette option, on garde le comportement d'origine : un chemin.
-   */
-  asset?: boolean;
   /** Charge le plugin (import dynamique en vrai, simulacre dans les tests). */
   chargerPlugin: () => Promise<PluginLlama>;
   nbCoeurs?: () => number;
@@ -211,11 +223,15 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       }
 
       contexte = await plugin.initLlama({
+        // NOM DE FICHIER SEUL. Sur Android, `LlamaCpp.initContext` ne retient du
+        // chemin que `new File(modelPath).getName()`, puis cherche ce nom dans
+        // ses propres dossiers : getFilesDir()/<nom>, getFilesDir()/Documents/<nom>,
+        // getExternalFilesDir(null)/<nom>, /sdcard/Documents/<nom>, etc. L'appli
+        // pose donc le GGUF dans getFilesDir()/Documents (voir modeleLocal.ts) et
+        // passe ici le seul nom de fichier. On n'envoie PLUS `is_model_asset` :
+        // le TypeScript du plugin le transmet, mais le code Android ne le lit
+        // nulle part (vérifié dans LlamaCpp.java) — il était purement ignoré.
         model: chemin,
-        // Modèle embarqué : llama.cpp va le chercher dans les ressources de
-        // l'appli et veut le nom de fichier seul ; `is_model_asset` le lui
-        // indique. Absent, on passe un chemin, comportement d'origine.
-        ...(opts.asset ? { is_model_asset: true } : {}),
         // 4096 jetons : la boucle d'agent réinjecte le prompt système, la
         // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
         // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
@@ -351,12 +367,12 @@ type ContextePlugin = {
  */
 export async function moteurNatifParDefaut(
   /**
-   * Où trouver le GGUF. En mode `asset`, on lui passe le NOM DE FICHIER SEUL
-   * (`modeleGguf(id).fichier`) : le GGUF est embarqué dans les ressources de
-   * l'appli, llama.cpp le résout par son nom.
+   * Où trouver le GGUF. En pratique on lui passe `cheminModele(id)` de
+   * `modeleLocal.ts`, c'est-à-dire le NOM DE FICHIER SEUL : le plugin Android le
+   * résout dans getFilesDir()/Documents/<fichier>, l'endroit où l'appli l'a
+   * téléchargé.
    */
   cheminModele: (m: ModeleGguf) => string,
-  asset?: boolean,
   /**
    * Chemin du fichier de cache de l'état du prompt. Laissé indéfini, le cache
    * est DÉSACTIVÉ : c'est le défaut, tant qu'aucun chemin réellement
@@ -407,5 +423,5 @@ export async function moteurNatifParDefaut(
   const libere = mod.releaseAllLlama?.bind(mod);
   if (libere) adaptateur.releaseAllLlama = () => libere();
 
-  return creerMoteurNatif({ cheminModele, asset, cheminCache, chargerPlugin: async () => adaptateur });
+  return creerMoteurNatif({ cheminModele, cheminCache, chargerPlugin: async () => adaptateur });
 }

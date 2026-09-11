@@ -79,13 +79,24 @@ function chargerMoteur(): Promise<MoteurActif> {
         // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
         // donc le build web reste intact.
         const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-        // Le GGUF est embarqué dans les ressources de l'appli : on le désigne
-        // par son NOM DE FICHIER seul, et `asset` fait transmettre
-        // `is_model_asset: true` au plugin.
-        const natif = await moteurNatifParDefaut((m) => m.fichier, true);
+        const { cheminModele, telechargerModele } = await import("@/ai/modeleLocal");
+        // Le GGUF n'est PLUS embarqué dans l'APK : on le télécharge dans
+        // getFilesDir()/Documents/<fichier> (le seul dossier que le plugin natif
+        // visite vraiment), puis on passe au moteur le NOM DE FICHIER SEUL.
+        // `telechargerModele` est un no-op si le fichier est déjà là et de la
+        // bonne taille. On n'envoie plus `is_model_asset` : le natif Android
+        // l'ignore.
+        // `moteurNatifParDefaut` attend une fonction `ModeleGguf → chemin` ;
+        // `cheminModele` prend un identifiant. On les relie par le `.id`.
+        const natif = await moteurNatifParDefaut((m) => cheminModele(m.id));
         return {
           nom: "natif",
-          charger: (id, onProgres) => natif.charger(id, onProgres),
+          charger: async (id, onProgres) => {
+            // 1) livrer le modèle sur le disque, puis 2) initialiser llama.cpp.
+            // La progression de téléchargement est remontée telle quelle.
+            await telechargerModele(id, onProgres);
+            await natif.charger(id, onProgres);
+          },
           generer: (options) => natif.generer(options),
           tokPerSec: () => natif.derniereVitesse(),
           device: () => (natif.modeleCharge() ? "llama.cpp (natif)" : "moteur natif"),
@@ -350,16 +361,14 @@ export const useSession = create<SessionState>((set, get) => ({
         patchAssistant(pulse(true));
       };
 
-      // Le premier appel charge le modèle : on le dit à l'écran. En natif il n'y
-      // a rien à télécharger (le GGUF est embarqué), donc on ne parle pas de
-      // téléchargement — ce serait faux.
+      // Le premier appel charge le modèle : on le dit à l'écran. En natif comme
+      // dans le navigateur, le modèle est désormais TÉLÉCHARGÉ au premier
+      // lancement (le GGUF n'est plus embarqué dans l'APK), puis chargé en
+      // mémoire. On ne présume donc pas de la phase : la progression qui suit
+      // (« telechargement » → « initialisation » → « pret ») la nomme.
       if (get().engine !== "pret") {
-        const natif = moteurActif.nom === "natif";
         thinking = `Chargement de ${profile.name}…`;
-        set({
-          engine: "chargement",
-          engineNote: natif ? "initialisation du moteur natif" : "téléchargement du modèle",
-        });
+        set({ engine: "chargement", engineNote: "préparation du modèle local" });
         patchAssistant({ memoryGb: profile.idleGb });
       }
 
@@ -508,8 +517,12 @@ export const useSession = create<SessionState>((set, get) => ({
       }));
     } catch (e) {
       // Le moteur local a échoué : on le dit, et on retombe sur les apps locales
-      // plutôt que d'inventer une réponse.
-      const msg = e instanceof Error ? e.message : "moteur local indisponible";
+      // plutôt que d'inventer une réponse. L'erreur est traduite en message
+      // ACTIONNABLE : l'utilisateur doit lire quoi FAIRE, jamais un code brut du
+      // moteur natif (« Failed to initialize native context »).
+      const { messageErreurActionnable } = await import("@/ai/modeleLocal");
+      const brut = e instanceof Error ? e.message : "moteur local indisponible";
+      const msg = messageErreurActionnable(brut, get().model);
       const fallback = resolveLocalTurn(text, true);
       const note =
         fallback.kind === "calc"

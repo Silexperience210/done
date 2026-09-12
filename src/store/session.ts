@@ -11,6 +11,7 @@ import {
   type ToolEvent,
 } from "@/lib/edge0";
 import { estApplicationNative } from "@/ai/moteur";
+import type { CheminManuel } from "@/ai/modeleLocal";
 import type { GenerateOptions, LocalModelId, ProgresChargement } from "@/ai/types";
 import { resolveLocalTurn } from "@/lib/local-apps";
 
@@ -58,13 +59,17 @@ function chargerMoteur(): Promise<MoteurActif> {
       // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
       // donc le build web reste intact.
       const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-      const { cheminModele, telechargerModele } = await import("@/ai/modeleLocal");
-      // Le GGUF n'est PAS embarqué dans l'APK : on le télécharge dans
-      // getFilesDir()/Documents/<fichier> (le seul dossier que le plugin natif
-      // visite vraiment), puis on passe au moteur le NOM DE FICHIER SEUL.
-      // `telechargerModele` est un no-op si le fichier est déjà là et de la
-      // bonne taille. On n'envoie pas `is_model_asset` : le natif Android
-      // l'ignore.
+      const { chargerPuisTelecharger, cheminModele, telechargerModele } = await import(
+        "@/ai/modeleLocal"
+      );
+      // ORDRE : on CHARGE D'ABORD, on ne télécharge qu'en secours. Le plugin
+      // natif cherche le GGUF par son nom de fichier dans huit emplacements —
+      // dont /sdcard/Download/ (LlamaCpp.java:1095, `getModelSearchPaths`) — donc
+      // un fichier déposé à la main par l'utilisateur est trouvé et chargé sans
+      // qu'une requête réseau soit émise. Télécharger d'abord faisait d'un
+      // `downloadFile` cassé (c'est le cas sur l'appareil visé) un blocage
+      // TOTAL : plus rien ne marchait, même avec le fichier disponible.
+      // Le téléchargement reste un confort, jamais un prérequis.
       // `moteurNatifParDefaut` attend une fonction `ModeleGguf → chemin` ;
       // `cheminModele` prend un identifiant. On les relie par le `.id`.
       //
@@ -79,11 +84,20 @@ function chargerMoteur(): Promise<MoteurActif> {
       const natif = await moteurNatifParDefaut((m) => cheminModele(m.id));
       return {
         nom: "natif",
+        // charger → (si échec) télécharger → recharger. Si le modèle est déjà là
+        // — y compris posé à la main dans Download —, on s'arrête au premier pas
+        // et AUCUNE requête réseau n'est faite.
         charger: async (id, onProgres) => {
-          // 1) livrer le modèle sur le disque, puis 2) initialiser llama.cpp.
-          // La progression de téléchargement est remontée telle quelle.
-          await telechargerModele(id, onProgres);
-          await natif.charger(id, onProgres);
+          await chargerPuisTelecharger(
+            {
+              id,
+              charger: (p) => natif.charger(id, p),
+              telecharger: async (p) => {
+                await telechargerModele(id, p);
+              },
+            },
+            onProgres,
+          );
         },
         generer: (options) => natif.generer(options),
         tokPerSec: () => natif.derniereVitesse(),
@@ -146,6 +160,14 @@ type SessionState = {
   /** État du moteur local, pour l'afficher honnêtement dans l'interface. */
   engine: "repos" | "chargement" | "pret" | "erreur";
   engineNote: string;
+  /**
+   * Chemin MANUEL à afficher quand le modèle est introuvable : nom EXACT du
+   * fichier attendu, URL directe à ouvrir dans Chrome, dossier où le poser.
+   * `null` quand il n'y a rien à signaler. Aucune dépendance native : c'est ce
+   * qui débloque l'utilisateur même quand le téléchargement de l'appli ne
+   * démarre pas du tout sur son appareil.
+   */
+  modeleManuel: CheminManuel | null;
   studio: StudioState | null;
   studioTab: StudioTab;
   studioOpen: boolean;
@@ -186,6 +208,7 @@ export const useSession = create<SessionState>((set, get) => ({
   tokPerSec: 0,
   engine: "repos",
   engineNote: "",
+  modeleManuel: null,
   studio: null,
   studioTab: "preview",
   studioOpen: false,
@@ -193,13 +216,15 @@ export const useSession = create<SessionState>((set, get) => ({
   setModel: (id) => {
     if (get().streaming) return;
     const hasReply = get().messages.some((m) => m.role === "assistant" && m.content);
-    // Changer de modèle recharge le moteur : le débit mesuré ne vaut plus rien.
+    // Changer de modèle recharge le moteur : le débit mesuré ne vaut plus rien,
+    // et l'indication manuelle de l'ancien fichier ne vaut plus rien non plus.
     set({
       model: id,
       memoryGb: restingMemory(id, hasReply),
       tokPerSec: 0,
       engine: "repos",
       engineNote: "",
+      modeleManuel: null,
     });
   },
 
@@ -530,15 +555,28 @@ export const useSession = create<SessionState>((set, get) => ({
         tokPerSec: vitesse ?? 0,
         engine: "pret",
         engineNote: `${moteurActif.device()}${vitesse ? ` · ${vitesse} tok/s mesurés` : ""}`,
+        // Le modèle est chargé : plus rien à télécharger à la main.
+        modeleManuel: null,
       }));
     } catch (e) {
       // Le moteur local a échoué : on le dit, et on retombe sur les apps locales
       // plutôt que d'inventer une réponse. L'erreur est traduite en message
-      // ACTIONNABLE : l'utilisateur doit lire quoi FAIRE, jamais un code brut du
-      // moteur natif (« Failed to initialize native context »).
-      const { messageErreurActionnable } = await import("@/ai/modeleLocal");
+      // ACTIONNABLE : l'utilisateur doit lire quoi FAIRE. L'erreur RÉELLE du
+      // téléchargement est CONSERVÉE dans ce message (c'est notre diagnostic), on
+      // ne la remplace donc plus par une phrase générique.
+      const { cheminManuel, messageErreurActionnable } = await import("@/ai/modeleLocal");
       const brut = e instanceof Error ? e.message : "moteur local indisponible";
       const msg = messageErreurActionnable(brut, get().model);
+      // Le modèle est introuvable : on affiche le chemin MANUEL (nom exact du
+      // fichier + URL + dossier Download), qui ne dépend ni du réseau ni de
+      // `downloadFile`. C'est ce qui débloque l'utilisateur quand la livraison
+      // par l'appli ne fonctionne pas sur son appareil. On le déduit du message
+      // lui-même : s'il NOMME le fichier attendu ou son URL, c'est bien le
+      // fichier qui manque — pas une erreur sans rapport (RAM, fichier corrompu).
+      const manuel = cheminManuel(get().model);
+      const mentionneLeFichier =
+        msg.includes(manuel.fichier) || msg.includes(manuel.url) || brut.includes(manuel.fichier);
+      const introuvable = get().modeleManuel ?? (mentionneLeFichier ? manuel : null);
       // On l'écrit aussi dans le fil de la conversation, en clair : un
       // téléchargement qui ne progresse plus (« le téléchargement ne progresse
       // plus depuis 60 s ») doit être LISIBLE, pas seulement dans un encart.
@@ -557,6 +595,7 @@ export const useSession = create<SessionState>((set, get) => ({
           error: null,
           engine: "erreur",
           engineNote: msg,
+          modeleManuel: introuvable,
           studio: { title: fallback.app.title, html: fallback.app.html },
           studioTab: "preview",
           studioOpen: true,
@@ -573,6 +612,7 @@ export const useSession = create<SessionState>((set, get) => ({
         streaming: false,
         engine: "erreur",
         engineNote: msg,
+        modeleManuel: introuvable,
         memoryGb: MODELS[s.model].idleGb,
         tokPerSec: 0,
         error: `Moteur local : ${msg}`,

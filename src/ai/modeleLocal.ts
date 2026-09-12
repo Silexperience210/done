@@ -1,31 +1,46 @@
 /**
- * LIVRAISON DU MODÈLE GGUF — le maillon qui manquait entre l'appli et le plugin.
+ * LIVRAISON DU MODÈLE GGUF — charger D'ABORD, télécharger seulement en secours.
  *
- * RAPPEL DU BUG (diagnostiqué dans le code du plugin, pas supposé). L'appli
- * embarquait le GGUF dans les assets de l'APK. Or `llama-cpp-capacitor` ne
- * cherche le modèle QUE sur le système de fichiers — `LlamaCpp.java`,
- * `getModelSearchPaths()` :
+ * ORDRE (c'est le correctif de ce fichier) : `charger` → `telecharger` →
+ * `charger`. Le moteur natif N'A PAS BESOIN que l'appli télécharge quoi que ce
+ * soit : `llama-cpp-capacitor` cherche le GGUF par son NOM DE FICHIER dans huit
+ * emplacements — `LlamaCpp.java:1095`, `getModelSearchPaths()` :
  *   getFilesDir()/<fichier>, getFilesDir()/Documents/<fichier>,
  *   getExternalFilesDir(null)/<fichier>, getExternalFilesDir(null)/Documents/<fichier>,
- *   /sdcard/Documents/<fichier>, /sdcard/Download/<fichier>, …
- * Aucun chemin d'assets, et le drapeau `is_model_asset` n'est lu NULLE PART côté
- * Android. Un GGUF posé dans les assets était donc introuvable → le natif
- * renvoyait « Failed to initialize native context ».
+ *   /sdcard/Documents/<fichier>, /sdcard/Download/<fichier>,
+ *   /sdcard/Downloads/<fichier>, /sdcard/Downloads/models/<fichier>.
+ * Et `jni.cpp:185-200` (`initContextNative`) essaie ces chemins dans l'ordre et
+ * s'arrête au premier fichier existant. Un GGUF déposé par l'utilisateur dans
+ * Download est donc TROUVÉ ET CHARGÉ sans qu'une ligne de code applicatif s'en
+ * mêle. Télécharger avant de charger faisait d'un téléchargement cassé un
+ * blocage TOTAL : plus rien ne marchait, même avec le fichier sous la main.
  *
- * CORRECTIF. L'appli TÉLÉCHARGE le GGUF au premier lancement dans
- * getFilesDir()/Documents/<fichier> — la 2e entrée de la liste ci-dessus — puis
- * passe au plugin le NOM DE FICHIER SEUL, qu'il résout tout seul.
+ * Ce qui reste VRAI du diagnostic d'origine : le plugin ne cherche JAMAIS dans
+ * les assets de l'APK (aucun chemin d'assets dans la liste ci-dessus, et le
+ * drapeau `is_model_asset` n'est lu NULLE PART côté Android). Un GGUF embarqué
+ * était donc introuvable → le natif rendait « Failed to initialize native
+ * context ». Le téléchargement par l'appli reste un CONFORT, pas un prérequis.
+ *
+ * CE QU'ON PASSE AU PLUGIN : le NOM DE FICHIER SEUL (`cheminModele`), jamais un
+ * chemin absolu. `LlamaCpp.initContext` n'en garde de toute façon que
+ * `new File(modelPath).getName()` (LlamaCpp.java:508), puis le natif cherche ce
+ * nom dans sa propre liste.
  *
  * POURQUOI `@capacitor/filesystem`, ET SES LIMITES (vérifiées dans le paquet
  * installé, version 8.1.3 — pas dans une doc) :
  *  - `Directory.Data` → `c.filesDir` = getFilesDir()
- *    (`LegacyFilesystemImplementation.getDirectory`) ;
- *  - `path` relatif est joint à ce dossier (`File(filesDir, path)`), donc
- *    `path: "Documents/<fichier>"` écrit EXACTEMENT là où le natif regarde ;
+ *    (`LegacyFilesystemImplementation.kt:50-60`, `getDirectory`) ;
+ *  - `downloadFile` en 8.1.3 passe par ce même code legacy et ACCEPTE un
+ *    sous-dossier dans `path` : `getFileObject` rend `File(filesDir, path)`
+ *    (`LegacyFilesystemImplementation.kt:62-81`), donc
+ *    `path: "Documents/<fichier>"` désigne bien getFilesDir()/Documents/<fichier>
+ *    — la 2e entrée de la liste de recherche du natif. Le sous-dossier n'est
+ *    donc PAS la cause d'un téléchargement qui ne démarre pas ; c'est vérifié
+ *    dans les sources installées, pas supposé ;
  *  - MAIS `downloadFile` n'honore PAS l'option `recursive` et ne crée pas les
  *    dossiers parents : il faut créer `Documents/` AVANT, via `mkdir`. Sans lui,
- *    `FileOutputStream` échoue (« No such file or directory »). C'est un piège
- *    réel, pas une précaution de style ;
+ *    `FileOutputStream(file, false)` (ligne 120) échoue (« No such file or
+ *    directory »). C'est un piège réel, pas une précaution de style ;
  *  - `downloadFile` est marqué déprécié en faveur de `@capacitor/file-transfer`,
  *    mais reste pleinement implémenté en 8.1.3. On l'utilise en connaissance de
  *    cause ; migrer vers `file-transfer` serait un changement d'API à part.
@@ -161,6 +176,186 @@ export function cheminModele(id: LocalModelId): string {
 }
 
 /**
+ * Dossier où Chrome dépose un téléchargement fait à la main : la mémoire interne
+ * partagée (`/sdcard/Download`, soit `Environment.getExternalStorageDirectory()`
+ * + « /Download »). C'est l'un des huit emplacements que le natif visite
+ * (`getModelSearchPaths`, LlamaCpp.java:1116) — d'où la consigne affichée à
+ * l'utilisateur : ce dossier, ce nom de fichier exact, et rien d'autre.
+ */
+export const DOSSIER_PUBLIC = "Download";
+
+/**
+ * Le chemin MANUEL, tel qu'on doit l'AFFICHER : de quoi débloquer l'utilisateur
+ * sans dépendre d'une seule ligne de code de l'appli. Trois choses, et aucune
+ * n'est facultative : le nom EXACT du fichier attendu (celui que le plugin
+ * cherchera — `modeleGguf().fichier`), l'URL directe à ouvrir dans Chrome, et le
+ * dossier où poser le fichier.
+ */
+export type CheminManuel = {
+  /** Nom EXACT attendu par le plugin, ex. « Qwen2.5-Coder-0.5B-…-Q4_K_M.gguf ». */
+  fichier: string;
+  /** URL directe du GGUF : à ouvrir dans Chrome, sans passer par l'appli. */
+  url: string;
+  /** Dossier où poser le fichier. */
+  dossier: string;
+  /** Chemin complet lisible, ex. « /sdcard/Download/<fichier> ». */
+  chemin: string;
+  /** Taille exacte à obtenir, en octets (affichée en clair par l'appelant). */
+  octets: number;
+  /** Nom lisible du modèle, pour que l'utilisateur sache ce qu'il télécharge. */
+  nom: string;
+};
+
+export function cheminManuel(id: LocalModelId): CheminManuel {
+  const modele = modeleGguf(id);
+  return {
+    fichier: modele.fichier,
+    url: modele.url,
+    dossier: DOSSIER_PUBLIC,
+    chemin: `/sdcard/${DOSSIER_PUBLIC}/${modele.fichier}`,
+    octets: modele.octets,
+    nom: modele.nom,
+  };
+}
+
+/**
+ * Message « le modèle n'est pas là » — autosuffisant, et VÉRIFIABLE par
+ * l'utilisateur sans nous : le nom exact du fichier, l'URL à ouvrir dans Chrome,
+ * et la consigne « le fichier doit se trouver dans le dossier Download ». C'est
+ * la voie de secours quand le téléchargement de l'appli ne démarre pas : elle ne
+ * dépend ni du réseau de l'appli, ni de `downloadFile`, ni de ce code.
+ */
+export function messageModeleIntrouvable(id: LocalModelId): string {
+  const c = cheminManuel(id);
+  return (
+    `modèle introuvable sur le téléphone « ${c.nom} ». Télécharge ce fichier avec ` +
+    `Chrome (${tailleLisible(c.octets)}) : ${c.url} — nom EXACT du fichier attendu : ` +
+    `${c.fichier}. Le fichier doit se trouver dans le dossier Download, c'est-à-dire ` +
+    `en ${c.chemin}. Ensuite, relance ta demande : rien d'autre à faire, le moteur ` +
+    `trouve le fichier tout seul.`
+  );
+}
+
+/**
+ * RECONNAÎT NOS PROPRES MESSAGES. Ils sont déjà rédigés pour l'utilisateur ET
+ * contiennent volontairement l'erreur brute (c'est le diagnostic) : les repasser
+ * dans `messageErreurActionnable` les remplacerait par une phrase générique,
+ * c'est-à-dire avalerait exactement ce qu'on cherche à montrer.
+ */
+export function estMessageLivraison(texte: string): boolean {
+  return /modèle introuvable|livraison du modèle impossible/i.test(texte);
+}
+
+/**
+ * Le message d'un ÉCHEC COMPLET : le chargement a échoué, le téléchargement de
+ * secours aussi. On y met les DEUX erreurs RÉELLES, mot pour mot, plus le chemin
+ * manuel — parce que c'est la seule façon de savoir pourquoi ça ne démarre pas,
+ * et la seule issue praticable quand `downloadFile` est cassé sur l'appareil.
+ */
+export function messageLivraisonRatee(
+  id: LocalModelId,
+  erreurs: { erreurChargement?: string | null; erreurTelechargement?: string | null },
+): string {
+  const morceaux = [`livraison du modèle impossible « ${modeleGguf(id).nom} ».`];
+  if (erreurs.erreurChargement) {
+    morceaux.push(`Le chargement du modèle a échoué : ${erreurs.erreurChargement}.`);
+  }
+  if (erreurs.erreurTelechargement) {
+    morceaux.push(`Le téléchargement de secours a échoué : ${erreurs.erreurTelechargement}.`);
+  }
+  morceaux.push(
+    `Solution qui ne dépend pas de l'appli — ${messageModeleIntrouvable(id)}`,
+  );
+  return morceaux.join(" ");
+}
+
+/**
+ * Ce que la livraison doit faire, injecté : les tests fournissent un chargeur et
+ * un téléchargeur simulés, l'appli le moteur natif et `telechargerModele`.
+ */
+export type Livraison = {
+  id: LocalModelId;
+  /** Charge le modèle dans le moteur natif. Lève si le fichier est introuvable. */
+  charger: (onProgres?: (p: ProgresChargement) => void) => Promise<void>;
+  /** Télécharge le GGUF. Appelé UNIQUEMENT si `charger` a échoué. */
+  telecharger: (onProgres?: (p: ProgresChargement) => void) => Promise<void>;
+};
+
+export type ResultatLivraison = {
+  /** Vrai si le fichier était déjà là : le premier chargement a suffi. */
+  dejaLa: boolean;
+  /** Erreur RÉELLE du premier chargement (diagnostic), null si tout de suite OK. */
+  erreurChargement: string | null;
+  /** Erreur RÉELLE du téléchargement de secours, null si non tenté ou réussi. */
+  erreurTelechargement: string | null;
+};
+
+/** Le texte d'une erreur, quelle que soit sa forme (Error, chaîne, objet). */
+function texteErreur(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
+/**
+ * L'ORDRE : charger d'abord, télécharger seulement si le chargement échoue.
+ *
+ * Pourquoi c'est le bon ordre, et pas juste une préférence : le plugin natif
+ * trouve le GGUF tout seul s'il est dans Download (voir l'en-tête de ce fichier).
+ * Télécharger d'abord faisait d'un `downloadFile` cassé — cas réel sur
+ * l'appareil visé, où l'appel reste muet — un blocage total, même avec le bon
+ * fichier déjà présent. Ici, AUCUNE requête réseau n'est faite si le modèle est
+ * déjà là.
+ *
+ * Quand tout échoue, l'erreur levée contient les deux erreurs RÉELLES et le
+ * chemin manuel (`messageLivraisonRatee`) : jamais un « échec » nu.
+ */
+export async function chargerPuisTelecharger(
+  livraison: Livraison,
+  onProgres?: (p: ProgresChargement) => void,
+): Promise<ResultatLivraison> {
+  // 1) CHARGER. Si le plugin trouve le fichier (Download, Documents, mémoire de
+  //    l'appli…), c'est fini : zéro requête réseau, zéro écriture disque.
+  try {
+    await livraison.charger(onProgres);
+    return { dejaLa: true, erreurChargement: null, erreurTelechargement: null };
+  } catch (e) {
+    const erreurChargement = texteErreur(e);
+    // Ce n'est PAS une erreur à afficher tout de suite : c'est le cas nominal du
+    // premier lancement. On journalise pour le diagnostic, et on continue.
+    console.warn("chargement direct du modèle impossible, on tente le secours :", erreurChargement);
+
+    // 2) TÉLÉCHARGER — confort, pas prérequis.
+    try {
+      await livraison.telecharger(onProgres);
+    } catch (e2) {
+      const erreurTelechargement = texteErreur(e2);
+      throw new Error(
+        messageLivraisonRatee(livraison.id, { erreurChargement, erreurTelechargement }),
+      );
+    }
+
+    // 3) RECHARGER, une seule fois : le téléchargement a peut-être livré le
+    //    fichier. S'il échoue encore, on ne le cache pas non plus.
+    try {
+      await livraison.charger(onProgres);
+    } catch (e3) {
+      throw new Error(
+        messageLivraisonRatee(livraison.id, {
+          erreurChargement: erreurChargement,
+          erreurTelechargement: `le fichier a été téléchargé mais reste introuvable pour le moteur : ${texteErreur(e3)}`,
+        }),
+      );
+    }
+    return { dejaLa: false, erreurChargement, erreurTelechargement: null };
+  }
+}
+
+/**
  * Chemin RELATIF sous `Directory.Data`, tel qu'attendu par le plugin llama.cpp :
  * « Documents/<fichier> », c'est-à-dire getFilesDir()/Documents/<fichier>.
  */
@@ -228,21 +423,37 @@ export function causeEchec(brut: string): "espace" | "reseau" | "inconnu" {
   return "inconnu";
 }
 
-/** Message actionnable pour un échec de téléchargement, selon sa cause réelle. */
-export function messageEchec(modele: ModeleGguf, brut: string): string {
+/**
+ * Message actionnable pour un échec de téléchargement, selon sa cause réelle.
+ *
+ * L'ERREUR BRUTE EST TOUJOURS CITÉE, entre parenthèses. C'est volontaire : sans
+ * elle, un `downloadFile` qui ne démarre pas laisse un « échec » sans cause, et
+ * on ne peut pas savoir ce qui s'est passé. `detail` ajoute ce que le plugin ne
+ * dit pas : le temps écoulé et les octets réellement reçus. Zéro octet reçu,
+ * c'est l'appel lui-même qui n'a pas démarré — on le DIT, au lieu de laisser
+ * croire à un problème de réseau.
+ */
+export function messageEchec(
+  modele: ModeleGguf,
+  brut: string,
+  detail?: { ecouleMs?: number; octetsRecus?: number },
+): string {
   const commune = ` Relance le téléchargement : il repart de zéro.`;
+  const diagnostic = diagnosticDemarrage(detail);
   switch (causeEchec(brut)) {
     case "espace":
       return (
         `le téléchargement de ${modele.nom} a échoué : il n'y a plus assez ` +
         `d'espace libre sur le téléphone pour ${tailleLisible(modele.octets)} ` +
         `(${brut}). Libère de la place, puis relance.` +
+        diagnostic +
         commune
       );
     case "reseau":
       return (
         `le téléchargement de ${modele.nom} a échoué : la connexion n'a pas ` +
         `tenu (${brut}). Vérifie le Wi-Fi, puis relance.` +
+        diagnostic +
         commune
       );
     default:
@@ -250,9 +461,28 @@ export function messageEchec(modele: ModeleGguf, brut: string): string {
         `le téléchargement de ${modele.nom} a échoué (${brut}). Vérifie que le ` +
         `téléphone est connecté à Internet et qu'il reste au moins ` +
         `${tailleLisible(modele.octets)} d'espace libre, puis relance.` +
+        diagnostic +
         commune
       );
   }
+}
+
+/**
+ * Ce qui distingue un échec d'un NON-DÉMARRAGE. Un `downloadFile` qui rejette
+ * sans avoir reçu le moindre octet n'a jamais commencé : ni le réseau, ni la
+ * place ne sont en cause, c'est l'appel natif. Le dire évite de chercher au
+ * mauvais endroit. Volontairement neutre en vocabulaire (« réseau », « espace »,
+ * « Wi-Fi » n'y apparaissent pas) : les messages de cause ci-dessus portent déjà
+ * ces mots, et les mélanger rendrait les deux diagnostics indiscernables.
+ */
+function diagnosticDemarrage(detail?: { ecouleMs?: number; octetsRecus?: number }): string {
+  if (!detail || detail.octetsRecus === undefined || detail.octetsRecus > 0) return "";
+  const ms = Math.max(0, Math.round(detail.ecouleMs ?? 0));
+  return (
+    ` Aucun octet n'a été reçu et l'appel a échoué en ${ms} ms : la panne est dans ` +
+    `l'appel de téléchargement lui-même, pas dans la bande passante. Passe par le ` +
+    `téléchargement manuel décrit ci-dessus.`
+  );
 }
 
 /**
@@ -284,17 +514,26 @@ async function taillePresente(plugin: PluginFichiers, chemin: string): Promise<n
  * `telechargerModele` sont actionnables et traversent la fonction inchangées.
  */
 export function messageErreurActionnable(brut: string, id?: LocalModelId): string {
+  // Nos propres diagnostics (messageLivraisonRatee, messageModeleIntrouvable)
+  // contiennent l'erreur brute EXPRÈS, et la phrase « Failed to initialize native
+  // context » peut s'y trouver. Les retraduire effacerait l'URL, le nom de
+  // fichier et l'erreur réelle : exactement ce qu'il ne faut plus avaler.
+  if (estMessageLivraison(brut)) return brut;
   // Erreur brute du plugin llama.cpp quand le fichier du modèle n'est pas
   // trouvé/chargeable (LlamaCpp.java : « Failed to initialize native context »).
   // C'est précisément le symptôme d'une livraison ratée du modèle.
   if (/Failed to initialize native context|Model path is required|Model not found/i.test(brut)) {
-    const nom = id ? ` « ${modeleGguf(id).nom} »` : "";
-    return (
-      `le moteur natif n'a pas pu ouvrir le fichier du modèle${nom}. ` +
-      `Il est peut-être incomplet ou corrompu : relance le téléchargement du ` +
-      `modèle (connexion Internet requise), en vérifiant qu'il reste assez ` +
-      `d'espace libre sur le téléphone.`
-    );
+    const prefixe = id
+      ? `Le moteur natif n'a pas pu ouvrir le fichier du modèle « ${modeleGguf(id).nom} », ` +
+        `qui est pourtant cherché sur le téléphone. `
+      : `Le moteur natif n'a pas pu ouvrir le fichier du modèle. `;
+    const suite = id
+      ? messageModeleIntrouvable(id)
+      : `Relance le téléchargement du modèle (connexion Internet requise), en vérifiant ` +
+        `qu'il reste assez d'espace libre sur le téléphone.`;
+    // On garde l'erreur brute à la fin : sans elle, impossible de savoir POURQUOI
+    // le natif n'a pas ouvert le fichier.
+    return `${prefixe}${suite} (erreur du moteur : ${brut})`;
   }
   return brut;
 }
@@ -302,6 +541,12 @@ export function messageErreurActionnable(brut: string, id?: LocalModelId): strin
 /**
  * Livre le GGUF sur l'appareil, à l'endroit que le plugin natif visite vraiment,
  * et VÉRIFIE le résultat. Renvoie le nom de fichier à passer comme `model`.
+ *
+ * SECOURS, PAS PRÉREQUIS : c'est `chargerPuisTelecharger` qui décide de
+ * l'appeler, et elle ne le fait QUE si le chargement direct a échoué. L'appli
+ * n'a donc pas besoin que cette fonction marche (c'est heureux : sur l'appareil
+ * visé, `downloadFile` ne démarre pas) ; un GGUF posé à la main dans Download
+ * suffit.
  *
  * - No-op si le fichier est déjà présent ET de taille plausible (pas de
  *   re-téléchargement de 400 Mo à chaque lancement) ;
@@ -462,6 +707,10 @@ export async function telechargerModele(
   }
 
   publier(0);
+  // Instant du DÉMARRAGE de l'appel : sert à dire « échec en X ms » quand
+  // `downloadFile` rejette tout de suite — c'est-à-dire quand il n'a jamais
+  // démarré. Sans ce chiffre, on ne peut pas distinguer les deux.
+  const debutAppel = maintenant();
   arreter = planifier(() => {
     void surveiller();
   }, 1000);
@@ -483,13 +732,27 @@ export async function telechargerModele(
   // `garde` plus haut. Le `Promise.race` ci-dessous continue de voir l'original.
   telechargement.catch(() => {});
 
+  /** Réponse BRUTE du plugin, gardée pour le diagnostic si le fichier manque. */
+  let reponse: { path?: string } | null = null;
   try {
-    await Promise.race([telechargement, garde]);
+    reponse = await Promise.race([telechargement, garde]);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     await effacer(dep, relatif);
-    // Le garde a DÉJÀ rédigé son message (il nomme les secondes et les octets).
-    throw echecGarde ?? new Error(messageEchec(modele, detail));
+    // L'ERREUR BRUTE EST TOUJOURS MONTRÉE (dans le message), et journalisée :
+    // c'est la seule façon de savoir pourquoi un téléchargement ne démarre pas.
+    console.warn("téléchargement du modèle échoué :", detail);
+    // Le garde a DÉJÀ rédigé son message (il nomme les secondes et les octets) ;
+    // sinon on cite l'erreur réelle, le temps écoulé et les octets reçus.
+    throw (
+      echecGarde ??
+      new Error(
+        messageEchec(modele, detail, {
+          ecouleMs: maintenant() - debutAppel,
+          octetsRecus,
+        }),
+      )
+    );
   } finally {
     fini = true;
     arreter();
@@ -502,9 +765,20 @@ export async function telechargerModele(
   const apres = await taillePresente(dep, relatif);
   if (apres === null) {
     await effacer(dep, relatif);
+    // Un `downloadFile` qui RÉUSSIT sur un fichier absent est un échec silencieux :
+    // on montre ce que le plugin a répondu et où on a cherché, sinon il ne reste
+    // rien à diagnostiquer.
+    const reponseTexte = JSON.stringify(reponse ?? {});
+    console.warn("téléchargement « réussi » mais fichier absent :", {
+      cheminCherche: relatif,
+      reponseDuPlugin: reponseTexte,
+    });
     throw new Error(
       `le fichier du modèle est introuvable après le téléchargement. ` +
-        `Vérifie que le téléphone a de l'espace de stockage libre, puis relance.`,
+        `Le plugin a répondu ${reponseTexte} pour « ${relatif} » ` +
+        `(mémoire de l'appli, dossier Documents). Vérifie que le téléphone a de ` +
+        `l'espace de stockage libre, puis relance — ou télécharge le fichier à la ` +
+        `main : ${cheminManuel(id).url}`,
     );
   }
   if (!taillePlausible(apres, modele.octets)) {

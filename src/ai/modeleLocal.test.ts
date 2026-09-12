@@ -16,14 +16,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  chargerPuisTelecharger,
+  cheminManuel,
   cheminModele,
   cheminRelatif,
   DELAI_GARDE_MS,
   DELAIS_HTTP,
+  DOSSIER_PUBLIC,
+  estMessageLivraison,
   gardeDepassee,
   messageEchec,
   messageErreurActionnable,
   messageGarde,
+  messageLivraisonRatee,
+  messageModeleIntrouvable,
   tailleLisible,
   taillePlausible,
   telechargerModele,
@@ -201,10 +207,19 @@ test("un fichier tronqué fait ÉCHOUER la livraison, avec un message clair", as
 });
 
 test("un fichier absent après téléchargement est rapporté, pas avalé", async () => {
+  const modele = modeleGguf("coder05");
   const { plugin } = pluginFactice({ tailles: [null, null] });
   await assert.rejects(
     () => telechargerModele("coder05", undefined, plugin),
-    /introuvable après le téléchargement/i,
+    (e: unknown) => {
+      const m = e instanceof Error ? e.message : String(e);
+      assert.match(m, /introuvable après le téléchargement/i);
+      // Un `downloadFile` qui RÉUSSIT sur un fichier absent est un échec
+      // silencieux : on montre où on a cherché, et l'issue manuelle.
+      assert.ok(m.includes("Documents/" + modele.fichier), "on dit où on a cherché");
+      assert.ok(m.includes(modele.url), "et l'URL du téléchargement manuel");
+      return true;
+    },
   );
 });
 
@@ -231,12 +246,28 @@ test("taillePlausible refuse 0, un négatif, NaN et un mauvais fichier", () => {
   assert.equal(taillePlausible(Number.NaN, TAILLE_05), false);
 });
 
-test("l'erreur brute du moteur natif devient un message actionnable", () => {
+test("l'erreur brute du moteur natif devient un message actionnable, chemin manuel compris", () => {
   const traduit = messageErreurActionnable("Failed to initialize native context", "coder05");
-  assert.match(traduit, /relance le téléchargement/i, "on dit quoi faire");
-  assert.ok(!/Failed to initialize/i.test(traduit), "aucun code brut ne reste visible");
+  // Ce qu'on doit POUVOIR FAIRE, sans dépendre de notre code de téléchargement :
+  const modele = modeleGguf("coder05");
+  assert.match(traduit, /Download/, "on nomme le dossier où poser le fichier");
+  assert.ok(traduit.includes(modele.fichier), "le nom EXACT du fichier attendu est affiché");
+  assert.ok(traduit.includes(modele.url), "l'URL directe est affichée, à ouvrir dans Chrome");
+  assert.match(traduit, /relance/i, "on dit quoi faire");
+  // ET l'erreur réelle reste visible : sans elle, impossible de savoir POURQUOI
+  // le natif n'a pas ouvert le fichier. On ne l'avale plus.
+  assert.ok(
+    traduit.includes("Failed to initialize native context"),
+    "l'erreur réelle du moteur est conservée",
+  );
   // Une erreur déjà actionnable passe inchangée (pas de double emballage).
   assert.equal(messageErreurActionnable("le fichier est introuvable"), "le fichier est introuvable");
+  // Nos propres diagnostics, même contenant l'erreur brute du moteur, ne sont PAS
+  // retraduits : ce serait avaler l'URL et le nom de fichier qu'ils portent.
+  const notre = messageLivraisonRatee("coder05", { erreurChargement: "Failed to initialize native context" });
+  assert.equal(messageErreurActionnable(notre, "coder05"), notre);
+  assert.equal(estMessageLivraison(notre), true);
+  assert.equal(estMessageLivraison("Failed to initialize native context"), false);
 });
 
 /**
@@ -519,5 +550,143 @@ test("messageEchec nomme la cause, et couvre une erreur inattendue", () => {
   assert.match(inconnu, /Internet/i);
   assert.match(inconnu, /398 Mo/, "la taille nécessaire est dite");
   assert.match(inconnu, /relance/i);
+});
+
+/* ===================================================================== */
+/* CHARGER D'ABORD — le téléchargement n'est plus un prérequis.          */
+/*                                                                       */
+/* C'est LE correctif : le plugin natif trouve le GGUF tout seul s'il est */
+/* dans Download (LlamaCpp.java:1095, `getModelSearchPaths`). Télécharger */
+/* avant de charger faisait d'un `downloadFile` cassé un blocage TOTAL.  */
+/* ===================================================================== */
+
+test("le modèle est CHARGÉ d'abord : trouvé sur le téléphone, aucune requête réseau", async () => {
+  // Le cas de l'utilisateur qui a déposé le GGUF dans Download : le chargement
+  // réussit du premier coup, et le téléchargement n'est JAMAIS appelé.
+  const appels: string[] = [];
+  const res = await chargerPuisTelecharger({
+    id: "coder05",
+    charger: async () => {
+      appels.push("charger");
+    },
+    telecharger: async () => {
+      appels.push("telecharger");
+    },
+  });
+
+  assert.deepEqual(appels, ["charger"], "aucun téléchargement n'a été tenté");
+  assert.equal(res.dejaLa, true);
+  assert.equal(res.erreurChargement, null);
+  assert.equal(res.erreurTelechargement, null);
+});
+
+test("chargement impossible → secours → rechargement, exactement dans cet ordre", async () => {
+  const appels: string[] = [];
+  let essais = 0;
+  const res = await chargerPuisTelecharger({
+    id: "coder05",
+    charger: async () => {
+      appels.push("charger");
+      essais += 1;
+      if (essais === 1) throw new Error("Failed to initialize native context");
+    },
+    telecharger: async () => {
+      appels.push("telecharger");
+    },
+  });
+
+  assert.deepEqual(appels, ["charger", "telecharger", "charger"]);
+  assert.equal(res.dejaLa, false);
+  assert.equal(res.erreurChargement, "Failed to initialize native context");
+});
+
+test("les deux échouent : l'erreur porte les DEUX erreurs RÉELLES et le chemin manuel", async () => {
+  const modele = modeleGguf("coder05");
+  await assert.rejects(
+    () =>
+      chargerPuisTelecharger({
+        id: "coder05",
+        charger: async () => {
+          throw new Error("Failed to initialize native context");
+        },
+        telecharger: async () => {
+          throw new Error("Error downloading file: java.io.FileNotFoundException");
+        },
+      }),
+    (e: unknown) => {
+      const m = e instanceof Error ? e.message : String(e);
+      // Rien n'est avalé : les deux erreurs réelles sont citées mot pour mot.
+      assert.match(m, /Failed to initialize native context/, "l'erreur du chargement est citée");
+      assert.match(m, /FileNotFoundException/, "l'erreur RÉELLE du téléchargement est citée");
+      // Et l'issue qui ne dépend pas de l'appli est donnée en entier.
+      assert.ok(m.includes(modele.fichier), "le nom EXACT du fichier attendu");
+      assert.ok(m.includes(modele.url), "l'URL directe à ouvrir dans Chrome");
+      assert.match(m, /dossier Download/i, "la consigne de dépôt");
+      return true;
+    },
+  );
+});
+
+test("téléchargement réussi mais modèle toujours introuvable : on ne le cache pas", async () => {
+  let essais = 0;
+  await assert.rejects(
+    () =>
+      chargerPuisTelecharger({
+        id: "coder05",
+        charger: async () => {
+          essais += 1;
+          if (essais > 1) throw new Error("Failed to initialize native context");
+          throw new Error("premier chargement : aucun fichier");
+        },
+        telecharger: async () => {},
+      }),
+    /reste introuvable pour le moteur : Failed to initialize native context/,
+  );
+});
+
+test("le chemin manuel affiche le nom EXACT, l'URL et le dossier Download", () => {
+  const modele = modeleGguf("coder05");
+  const c = cheminManuel("coder05");
+  assert.equal(c.fichier, modele.fichier, "le nom affiché = celui que le plugin cherchera");
+  assert.equal(c.url, modele.url, "l'URL est celle du GGUF, pas une page intermédiaire");
+  assert.equal(c.dossier, "Download");
+  assert.equal(c.dossier, DOSSIER_PUBLIC);
+  assert.equal(c.chemin, `/sdcard/Download/${modele.fichier}`);
+  assert.equal(c.octets, modele.octets, "la taille exacte attendue");
+});
+
+test("le message « introuvable » est autosuffisant : nom, URL, dossier Download", () => {
+  const modele = modeleGguf("coder3b");
+  const m = messageModeleIntrouvable("coder3b");
+  assert.ok(m.includes(modele.fichier), "le nom exact du fichier");
+  assert.ok(m.includes(modele.url), "l'URL directe");
+  assert.match(m, /dossier Download/i, "le dossier où le poser");
+  assert.match(m, /8,01 Go/, "la taille à obtenir, en clair");
+  // Chaque modèle a SON fichier et SON URL : aucune confusion possible.
+  assert.notEqual(cheminManuel("coder3b").fichier, cheminManuel("coder05").fichier);
+});
+
+/* ===================================================================== */
+/* ÉCHEC IMMÉDIAT ET SILENCIEUX — le cas rapporté : « ça ne démarre pas ». */
+/* ===================================================================== */
+
+test("un échec immédiat est DIT : erreur brute du plugin + zéro octet reçu", async () => {
+  // Le scénario réel : `downloadFile` (déprécié en 8.1.3) rejette tout de suite,
+  // sans jamais recevoir un octet. Le message doit citer l'erreur telle quelle ET
+  // dire que l'appel n'a pas démarré — sinon on cherche du côté du réseau à tort.
+  const { plugin } = pluginFactice({
+    tailles: [null],
+    echecTelechargement: "reject: no implementation found",
+  });
+  await assert.rejects(
+    () => telechargerModele("coder05", undefined, plugin),
+    (e: unknown) => {
+      const m = e instanceof Error ? e.message : String(e);
+      assert.match(m, /no implementation found/, "l'erreur réelle du plugin est affichée");
+      assert.match(m, /Aucun octet n'a été reçu/, "un non-démarrage est distingué d'un échec réseau");
+      assert.match(m, /en \d+ ms/, "le délai de l'échec est donné");
+      return true;
+    },
+  );
 });
 

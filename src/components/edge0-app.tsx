@@ -39,6 +39,7 @@ export function Edge0App({ overlay = false }: { overlay?: boolean }) {
       <AndroidStatusBar />
       <Header model={model} onModel={setModel} onClear={clear} streaming={streaming} />
       <Transcript />
+      <ModeleManuelCard />
       <Composer
         memoryGb={memoryGb}
         tokPerSec={tokPerSec}
@@ -51,6 +52,51 @@ export function Edge0App({ overlay = false }: { overlay?: boolean }) {
       />
       <AndroidNav />
       {overlay && studioOpen && <StudioOverlay />}
+    </div>
+  );
+}
+
+/**
+ * LE CHEMIN MANUEL — affiché quand le modèle est introuvable.
+ *
+ * Pourquoi ce panneau existe : sur l'appareil visé, `Filesystem.downloadFile`
+ * (déprécié en 8.1.3) ne démarre pas. Faire dépendre l'utilisateur de notre code
+ * de téléchargement le laissait bloqué. Le moteur natif, lui, cherche le GGUF
+ * par son nom de fichier dans huit emplacements, dont le dossier Download :
+ * télécharger le fichier avec Chrome et le laisser là SUFFIT. Ce panneau donne
+ * donc les trois choses nécessaires, sans jargon : le nom EXACT du fichier
+ * attendu, l'URL directe à ouvrir, et le dossier où le poser.
+ *
+ * Aucun appel natif, aucune condition : c'est du texte et un lien.
+ */
+function ModeleManuelCard() {
+  const chemin = useSession((s) => s.modeleManuel);
+  if (!chemin) return null;
+  return (
+    <div className="mx-3 mb-2 shrink-0 rounded-xl border border-border bg-elevated p-3">
+      <p className="text-xs font-medium text-fg">Modèle introuvable — mode manuel</p>
+      <p className="mt-1 text-xs leading-relaxed text-muted text-pretty">
+        Télécharge ce fichier avec Chrome, puis laisse-le dans le dossier{" "}
+        <span className="font-mono text-stat">{chemin.dossier}</span> : le moteur le
+        trouve tout seul au prochain essai, sans passer par l&apos;appli.
+      </p>
+      <dl className="mt-2 flex flex-col gap-1 text-xs">
+        <dt className="text-muted">Nom exact du fichier</dt>
+        <dd className="font-mono break-all text-stat">{chemin.fichier}</dd>
+        <dt className="text-muted">URL à ouvrir dans Chrome</dt>
+        <dd>
+          <a
+            href={chemin.url}
+            target="_blank"
+            rel="noreferrer"
+            className="font-mono break-all text-hot underline underline-offset-2"
+          >
+            {chemin.url}
+          </a>
+        </dd>
+        <dt className="text-muted">Emplacement attendu</dt>
+        <dd className="font-mono break-all text-stat">{chemin.chemin}</dd>
+      </dl>
     </div>
   );
 }

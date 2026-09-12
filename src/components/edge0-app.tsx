@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, Code2, Play, Plus, RotateCcw } from "lucide-react";
+import { ArrowUp, Code2, Play, Plus, RotateCcw, SlidersHorizontal } from "lucide-react";
 import { MODELS, SUGGESTIONS, type ModelId } from "@/lib/edge0";
 import { useSession } from "@/store/session";
 import { cn } from "@/lib/utils";
@@ -9,6 +9,8 @@ import { ThinkingBlock } from "./thinking";
 // L'IMPORT du modèle se fait là où il manque : dans la carte « modèle
 // introuvable », pas dans un panneau de diagnostic qui n'a plus à s'afficher.
 import { ImporterModele } from "./importer-modele";
+// Réglages du moteur : contexte, lot, threads. Sous l'en-tête, jamais sur la saisie.
+import { ReglagesMoteur } from "./reglages-moteur";
 
 export function Edge0App({ overlay = false }: { overlay?: boolean }) {
   const {
@@ -19,6 +21,7 @@ export function Edge0App({ overlay = false }: { overlay?: boolean }) {
     error,
     studio,
     studioOpen,
+    reglagesOuverts,
     send,
     clear,
     setModel,
@@ -33,6 +36,7 @@ export function Edge0App({ overlay = false }: { overlay?: boolean }) {
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-screen">
       <Header model={model} onModel={setModel} onClear={clear} streaming={streaming} />
+      {reglagesOuverts && <ReglagesMoteur />}
       <Transcript />
       <ModeleManuelCard />
       <Composer
@@ -118,6 +122,7 @@ function Header({
 }) {
   // L'état RÉEL du moteur : le témoin ci-dessous n'est plus vert par défaut.
   const engine = useSession((s) => s.engine);
+  const basculerReglages = useSession((s) => s.basculerReglages);
   return (
     <header className="flex shrink-0 flex-col items-center gap-1 px-3 pt-1 pb-2">
       <div className="flex w-full items-center justify-between">
@@ -136,6 +141,15 @@ function Header({
       <p className="flex items-center gap-1.5 text-xs text-muted">
         <span className={cn("size-1.5 rounded-full", pointEtat(engine))} />
         {MODELS[model].name} · on-device
+        <button
+          type="button"
+          onClick={() => basculerReglages()}
+          className="ml-1 flex items-center gap-1 rounded-full px-1.5 py-0.5 text-muted hover:text-fg"
+          aria-label="Réglages du moteur"
+        >
+          <SlidersHorizontal className="size-3" strokeWidth={2} />
+          réglages
+        </button>
       </p>
     </header>
   );

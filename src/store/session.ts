@@ -10,6 +10,8 @@ import {
 } from "@/lib/edge0";
 import { estApplicationNative } from "@/ai/moteur";
 import type { CheminManuel } from "@/ai/modeleLocal";
+// RÉGLAGES DU MOTEUR (contexte, lot, threads) : réglables par l'utilisateur.
+import { ecrireReglages, lireReglages, type ReglagesMoteur } from "@/ai/reglages";
 import {
   libelleEtape,
   type EtapeChargement,
@@ -45,12 +47,24 @@ type MoteurActif = {
   tokPerSec: () => number | null;
   /** Backend réellement utilisé, pour l'afficher sans mentir. */
   device: () => string;
+  /**
+   * Libère la mémoire native. Appelé quand on jette le moteur (changement de
+   * réglages) : le contexte llama.cpp vit dans le processus, pas dans la WebView.
+   */
+  liberer: () => Promise<void>;
 };
 
 let moteur: MoteurActif | null = null;
 let moteurEnCours: Promise<MoteurActif> | null = null;
 
-function chargerMoteur(): Promise<MoteurActif> {
+/**
+ * Construit (ou rend) le moteur partagé de la session.
+ *
+ * `reglagesLive` est une FONCTION, pas une valeur : le moteur est construit une
+ * fois, mais les réglages peuvent changer ensuite — auquel cas l'appelant jette
+ * ce moteur (et libère sa mémoire native) puis en redemande un.
+ */
+function chargerMoteur(reglagesLive: () => ReglagesMoteur): Promise<MoteurActif> {
   if (moteur) return Promise.resolve(moteur);
   if (!moteurEnCours) {
     moteurEnCours = (async (): Promise<MoteurActif> => {
@@ -106,7 +120,7 @@ function chargerMoteur(): Promise<MoteurActif> {
           await chargerPuisTelecharger(
             {
               id,
-              charger: (p) => natif.charger(id, p),
+              charger: (p) => natif.charger(id, p, reglagesLive()),
               telecharger: async (p) => {
                 // LIVRAISON AUTOMATIQUE : la WebView télécharge (fetch en flux) et
                 // écrit dans la mémoire de l'appli ; le téléchargeur du plugin ne
@@ -120,6 +134,10 @@ function chargerMoteur(): Promise<MoteurActif> {
           );
         },
         generer: (options) => natif.generer(options),
+        // La libération remonte jusqu'au moteur natif : c'est la WebView qui
+        // décide de jeter le moteur, mais c'est le processus qui doit rendre la
+        // mémoire.
+        liberer: () => natif.liberer(),
         tokPerSec: () => natif.derniereVitesse(),
         device: () => (natif.modeleCharge() ? "llama.cpp (natif)" : "moteur natif"),
       };
@@ -170,6 +188,14 @@ export type StudioState = {
 
 type SessionState = {
   model: ModelId;
+  /**
+   * Réglages du moteur (contexte, lot, threads). Le contexte est le levier qui
+   * décide si un gros modèle TIENT en mémoire : 96 Mo de cache KV par millier de
+   * jetons sur le 30B-A3B.
+   */
+  reglages: ReglagesMoteur;
+  /** Le panneau de réglages est-il ouvert ? */
+  reglagesOuverts: boolean;
   messages: ChatMessage[];
   streaming: boolean;
   error: string | null;
@@ -198,6 +224,10 @@ type SessionState = {
   studioTab: StudioTab;
   studioOpen: boolean;
   setModel: (id: ModelId) => void;
+  /** Enregistre les réglages et JETTE le moteur en mémoire (reconstruit au message suivant). */
+  setReglages: (r: ReglagesMoteur) => void;
+  /** Ouvre ou ferme le panneau de réglages. */
+  basculerReglages: (ouvert?: boolean) => void;
   send: (text: string) => Promise<void>;
   clear: () => void;
   openStudio: (tab?: StudioTab) => void;
@@ -222,6 +252,9 @@ export const useSession = create<SessionState>((set, get) => ({
   // l'utilisateur monte en qualité quand la chaîne est prouvée. C'est un défaut,
   // pas une rétrogradation : rien n'est retiré.
   model: "coder05",
+  // Réglages lus du stockage (défauts : 4096 jetons, lot 512, threads auto).
+  reglages: lireReglages("coder05"),
+  reglagesOuverts: false,
   // Conversation VIDE au démarrage : aucune fausse conversation pré-affichée.
   messages: [],
   streaming: false,
@@ -242,6 +275,10 @@ export const useSession = create<SessionState>((set, get) => ({
     // et l'indication manuelle de l'ancien fichier ne vaut plus rien non plus.
     set({
       model: id,
+      // Le contexte maximal et le cache KV dépendent du modèle : les réglages
+      // sont relus POUR LUI — un 32768 resté d'un petit modèle ferait exploser
+      // la mémoire avec le 30B.
+      reglages: lireReglages(id),
       memoryGb: MODELS[id].idleGb,
       tokPerSec: 0,
       engine: "repos",
@@ -249,6 +286,42 @@ export const useSession = create<SessionState>((set, get) => ({
       modeleManuel: null,
     });
   },
+
+  setReglages: (r) => {
+    if (get().streaming) return;
+    ecrireReglages(r);
+    // Le moteur en mémoire a été construit avec les ANCIENS réglages : on le jette
+    // ET on libère sa mémoire native — sinon deux contextes cohabitent, et sur le
+    // 30B c'est 8 Go + 8 Go, donc l'appli tuée par le système.
+    const ancien = moteur;
+    moteur = null;
+    moteurEnCours = null;
+    if (ancien) {
+      void ancien.liberer().catch(() => {
+        /* libération impossible : le prochain chargement remplacera le contexte */
+      });
+    }
+    set({
+      reglages: r,
+      engine: "repos",
+      engineNote:
+        "réglages enregistrés : le moteur se rechargera au prochain message " +
+        `(contexte ${r.nCtx} jetons, lot ${r.nBatch}, threads ${r.nThreads === 0 ? "auto" : r.nThreads})`,
+      tokPerSec: 0,
+    });
+    void import("@/ai/journal")
+      .then(({ noter }) =>
+        noter(
+          `réglages moteur changés : n_ctx=${r.nCtx}, n_batch=${r.nBatch}, ` +
+            `n_threads=${r.nThreads === 0 ? "auto" : r.nThreads}`,
+        ),
+      )
+      .catch(() => {
+        /* le journal n'est pas indispensable ici */
+      });
+  },
+
+  basculerReglages: (ouvert) => set({ reglagesOuverts: ouvert ?? !get().reglagesOuverts }),
 
   clear: () => {
     if (get().streaming) return;
@@ -350,7 +423,7 @@ export const useSession = create<SessionState>((set, get) => ({
       // Le harnais D'AGENT, en local. Aucune requête sortante.
       //    Le moteur natif n'est résolu qu'ici, au premier message ;
       //    `chargerMoteur` choisit une fois pour toute la session.
-      const moteurActif = await chargerMoteur();
+      const moteurActif = await chargerMoteur(() => get().reglages);
       const harnais = await chargerHarnais();
       let pending = "";
       let raf = 0;

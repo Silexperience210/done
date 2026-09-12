@@ -20,7 +20,17 @@ export type NomMoteur = "natif";
 
 export type Moteur = {
   nom: NomMoteur;
-  charger: (id: LocalModelId, onProgres?: (p: ProgresChargement) => void) => Promise<void>;
+  charger: (
+    id: LocalModelId,
+    onProgres?: (p: ProgresChargement) => void,
+    /**
+     * Réglages du moteur pour CE chargement (contexte, lot, threads). Structure
+     * volontairement écrite ici plutôt qu'importée de `reglages.ts` : ce fichier
+     * est le contrat commun au moteur natif et au harnais, et il ne doit pas
+     * dépendre d'un module qui, lui, connaît la table des modèles.
+     */
+    reglages?: { nCtx?: number; nBatch?: number; nThreads?: number },
+  ) => Promise<void>;
   generer: (options: GenerateOptions) => Promise<string>;
   pret: () => boolean;
 };

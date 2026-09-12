@@ -121,6 +121,24 @@ export type ModeleGguf = {
   url: string;
   /** Octets lus par jeton, en Q4 : ce qui décide vraiment de la vitesse. */
   lectureGoParJeton: number;
+  /**
+   * Paramètres du cache KV, RELEVÉS dans l'en-tête GGUF du fichier (`qwen2.` /
+   * `qwen3moe.` : `block_count`, `attention.head_count_kv`,
+   * `attention.key_length` — ou `embedding_length / head_count` quand la
+   * dimension de tête n'est pas donnée). Ils servent à calculer la mémoire du
+   * contexte : n_ctx × couches × têtes KV × dimension × 2 (clé et valeur) × 2
+   * (f16). Ce sont des faits sur les fichiers, pas des estimations.
+   */
+  kv: {
+    /** Nombre de couches (blocs). */
+    couches: number;
+    /** Têtes clé/valeur : ce qui compte, bien moins que le nombre de têtes. */
+    tetesKV: number;
+    /** Dimension d'une tête, en éléments. */
+    dimensionTete: number;
+    /** Contexte maximal annoncé par le modèle, en jetons. */
+    contexteMax: number;
+  };
   note: string;
 };
 
@@ -139,6 +157,8 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
     octets: 397_808_288,
     url: "https://huggingface.co/bartowski/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
     lectureGoParJeton: 0.4,
+    // GGUF : qwen2.block_count=24, head_count=14, head_count_kv=2, head_dim=896/14=64
+    kv: { couches: 24, tetesKV: 2, dimensionTete: 64, contexteMax: 32768 },
     note: "Le plus léger. Sert à prouver que la chaîne native fonctionne.",
   },
   {
@@ -150,6 +170,8 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
     octets: 986_048_800,
     url: "https://huggingface.co/bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
     lectureGoParJeton: 1.0,
+    // GGUF : qwen2.block_count=28, head_count=12, head_count_kv=2, head_dim=1536/12=128
+    kv: { couches: 28, tetesKV: 2, dimensionTete: 128, contexteMax: 32768 },
     note: "Bon compromis sur un téléphone récent, et fiable pour les outils.",
   },
   {
@@ -171,6 +193,11 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
     octets: 8_005_213_344,
     url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf",
     lectureGoParJeton: 1.3,
+    // GGUF : qwen3moe.block_count=48, attention.head_count_kv=4,
+    // attention.key_length=128, context_length=262144 (262144 jetons de contexte
+    // sont annoncés par le modèle, mais la mémoire du téléphone s'arrête bien
+    // avant : les valeurs proposées à l'écran plafonnent à 32768).
+    kv: { couches: 48, tetesKV: 4, dimensionTete: 128, contexteMax: 32768 },
     note: "Le pari : 30B de connaissances, 3B activés, donc peu d'octets lus par jeton — plus rapide qu'un dense 8B malgré quatre fois plus de poids. 8,0 Go sur douze : il reste de quoi tenir la KV et les buffers. La fiabilité des appels d'outils à 1 bit reste à prouver.",
   },
 ];
@@ -406,6 +433,12 @@ export type MoteurNatif = Moteur & {
   derniereVitesse: () => number | null;
   /** Chemin du modèle actuellement chargé. */
   modeleCharge: () => string | null;
+  /**
+   * Libère la mémoire native (l'ancien contexte llama.cpp) et remet le moteur à
+   * zéro. À appeler AVANT de jeter le moteur : sinon son contexte reste
+   * alloué dans le processus, invisible depuis la WebView.
+   */
+  liberer: () => Promise<void>;
 };
 
 /**
@@ -506,6 +539,12 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   let contexte: unknown = null;
   let charge: LocalModelId | null = null;
   let dernierTokParSeconde: number | null = null;
+  /**
+   * Le plugin NATIF réellement chargé, gardé pour pouvoir libérer la mémoire
+   * ensuite : `liberer()` ne doit pas dépendre du fait qu'un chargement soit en
+   * cours, ni recharger le module natif juste pour appeler `releaseAllLlama`.
+   */
+  let pluginCharge: PluginLlama | null = null;
   /** Nombre d'appels de `generer` : distingue le PREMIER calcul des suivants. */
   let generations = 0;
 
@@ -564,6 +603,31 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   return {
     nom: "natif",
 
+    /**
+     * LIBÈRE la mémoire native et repart à zéro.
+     *
+     * POURQUOI C'EST INDISPENSABLE : le contexte llama.cpp vit dans la mémoire du
+     * processus, pas dans la WebView. Changer un réglage (contexte, threads)
+     * oblige à en construire un nouveau ; remplacer l'ancien SANS le libérer
+     * empilerait deux contextes — 8 Go chacun sur le 30B — et le système tuerait
+     * l'appli pour de bon, ce qui ressemblerait à « les réglages ont cassé
+     * l'appli ».
+     */
+    async liberer() {
+      try {
+        // On libère via le plugin RÉELLEMENT chargé ; s'il n'y en a pas (aucun
+        // modèle chargé), il n'y a rien à libérer et ce n'est pas une erreur.
+        await pluginCharge?.releaseAllLlama?.();
+        await journaliser("moteur libéré (mémoire native rendue)");
+      } catch (e) {
+        await journaliser(`libération du moteur impossible : ${texteErreurComplete(e)}`);
+      } finally {
+        contexte = null;
+        charge = null;
+        dernierTokParSeconde = null;
+      }
+    },
+
     pret: () => contexte !== null,
 
     derniereVitesse: () => dernierTokParSeconde,
@@ -573,7 +637,11 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
     // défini ; il n'écrase donc jamais un choix réel de l'utilisateur.
     modeleCharge: () => (contexte === null ? null : opts.cheminModele(modeleGguf(charge ?? "coder05"))),
 
-    async charger(id: LocalModelId, onProgres?: (p: ProgresChargement) => void): Promise<void> {
+    async charger(
+      id: LocalModelId,
+      onProgres?: (p: ProgresChargement) => void,
+      reglages?: { nCtx?: number; nBatch?: number; nThreads?: number },
+    ): Promise<void> {
       const debut = Date.now();
       if (contexte && charge === id) {
         await journaliser(`chargement ignoré : « ${id} » est déjà chargé`);
@@ -587,6 +655,7 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       await journaliser(`── chargement demandé : « ${id} » (${modeleGguf(id).nom})`);
 
       const plugin = await opts.chargerPlugin();
+      pluginCharge = plugin; // gardé pour `liberer()`
       await journaliser("plugin llama.cpp chargé (import dynamique)");
 
       const modele = modeleGguf(id);
@@ -661,11 +730,11 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           // 4096 jetons : la boucle d'agent réinjecte le prompt système, la
           // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
           // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
-          n_ctx: opts.nCtx ?? 4096,
+          n_ctx: reglages?.nCtx ?? opts.nCtx ?? 4096,
           // Lots de pré-remplissage : jetons traités par passe. C'est le SEUL
           // levier de vitesse de chargement réellement lu par le natif, et il
           // compte davantage maintenant que les noyaux dotprod/i8mm sont compilés.
-          n_batch: opts.nBatch ?? 512,
+          n_batch: reglages?.nBatch ?? opts.nBatch ?? 512,
           // PAS de `n_gpu_layers` : le binaire du plugin ne contient aucun backend
           // GPU (ni OpenCL ni Vulkan) et llama-model.cpp:1965-1971 met
           // `act_gpu_layers = 0` quand la liste de devices est vide. L'envoyer ne
@@ -678,7 +747,9 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           // attend TOUS ses threads à la barrière de fin d'étape : un thread sur
           // un petit cœur ralentit l'étape entière. Le défaut natif, si on
           // n'envoyait rien, applique exactement la même règle.
-          n_threads: opts.nThreads ?? nbThreadsCalcul(),
+          // 0 = « automatique » : c'est le calcul habituel (moitié des processeurs
+          // logiques, borné à 6) qui s'applique, pas zéro thread.
+          n_threads: reglages?.nThreads || opts.nThreads || nbThreadsCalcul(),
           // use_mmap: true — LE MAPPAGE MÉMOIRE EST RÉTABLI, et c'est le DÉFAUT
           // de llama.cpp (`common_params::use_mmap = true`, common.h:383 ; le
           // JNI du plugin écrit la même valeur, jni.cpp:265). On ne l'envoie
@@ -727,6 +798,7 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
     async generer(options: GenerateOptions): Promise<string> {
       if (!contexte) throw new Error("aucun modèle natif chargé");
       const plugin = await opts.chargerPlugin();
+      pluginCharge = plugin; // gardé pour `liberer()`
       const prompt = gabaritQwen(options.system, options.history);
       const maintenant = opts.maintenant ?? (() => Date.now());
       const debut = maintenant();

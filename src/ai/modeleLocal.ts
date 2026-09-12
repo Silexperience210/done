@@ -442,8 +442,10 @@ export type Livraison = {
   id: LocalModelId;
   /** Charge le modèle dans le moteur natif. Lève si le fichier est introuvable. */
   charger: (onProgres?: (p: ProgresChargement) => void) => Promise<void>;
-  /** Télécharge le GGUF. Appelé UNIQUEMENT si `charger` a échoué. */
+  /** Télécharge le GGUF. Appelé UNIQUEMENT si `charger` a échoué ET que le fichier n'est pas là. */
   telecharger: (onProgres?: (p: ProgresChargement) => void) => Promise<void>;
+  /** Cherche le fichier sur le disque. Injectable pour les tests ; défaut : `chercherModele`. */
+  chercher?: (id: LocalModelId) => Promise<EtatFichierModele>;
 };
 
 export type ResultatLivraison = {
@@ -454,6 +456,29 @@ export type ResultatLivraison = {
   /** Erreur RÉELLE du téléchargement de secours, null si non tenté ou réussi. */
   erreurTelechargement: string | null;
 };
+
+/**
+ * Message quand le FICHIER EST LÀ mais que le moteur n'arrive pas à l'ouvrir.
+ *
+ * Il existe pour empêcher le pire des remèdes : retélécharger plusieurs gigas
+ * alors que le fichier est complet. Il dit donc (a) que le fichier est présent et
+ * à la bonne taille, (b) que rien ne sera retéléchargé, (c) quoi regarder — la
+ * mémoire d'abord, parce que c'est la cause la plus fréquente sur un téléphone,
+ * et parce que le contexte est réglable.
+ */
+export function messageFichierPresentMaisInexploitable(
+  id: LocalModelId,
+  infos: { erreurChargement: string; chemin: string; octets: number },
+): string {
+  const modele = modeleGguf(id);
+  return (
+    `« ${modele.nom} » est bien installé (${tailleLisible(infos.octets)}, ${infos.chemin}) : ` +
+    "le fichier n'est PAS retéléchargé, ce serait inutile.\n" +
+    `Le moteur n'a pas réussi à l'ouvrir : ${infos.erreurChargement}\n` +
+    "À regarder, dans cet ordre : la mémoire vive (un contexte plus petit laisse plus de place au modèle), " +
+    "puis le fichier lui-même s'il a été interrompu (dans ce cas, réimporte-le)."
+  );
+}
 
 /** Le texte d'une erreur, quelle que soit sa forme (Error, chaîne, objet). */
 function texteErreur(e: unknown): string {
@@ -563,6 +588,46 @@ export async function chargerPuisTelecharger(
     // premier lancement. On journalise pour le diagnostic, et on continue.
     console.warn("chargement direct du modèle impossible, on tente le secours :", erreurChargement);
     await journaliser(`chargement direct impossible : ${erreurChargement}`);
+
+    // 1bis) LE FICHIER EST-IL DÉJÀ LÀ, À LA BONNE TAILLE ?
+    //
+    // C'est LE contrôle qui manquait. `charger` peut échouer pour une raison qui
+    // n'a RIEN à voir avec une absence de fichier : mémoire vive insuffisante,
+    // contexte trop grand, GGUF tronqué, quantification non gérée. Dans ce cas on
+    // téléchargeait quand même — huit gigas pour rien, à chaque essai, et l'échec
+    // se reproduisait à l'identique. Constaté sur téléphone (« pourquoi je dois
+    // télécharger à chaque fois ? »), alors que le 30B était déjà livré.
+    //
+    // Donc : si un fichier de la BONNE TAILLE existe (±2 %), on ne touche pas au
+    // réseau et on dit l'échec réel, tel quel.
+    const modele = modeleGguf(livraison.id);
+    let etatFichier: EtatFichierModele | null = null;
+    try {
+      etatFichier = await (livraison.chercher ?? chercherModele)(livraison.id);
+    } catch (e) {
+      await journaliser(`recherche du fichier impossible (${texteErreur(e)}) : on ne peut pas conclure`);
+    }
+    const dejaComplet = etatFichier?.trouves.find((e) => taillePlausible(e.octets ?? 0, modele.octets)) ?? null;
+    if (dejaComplet) {
+      await journaliser(
+        `le fichier est PRÉSENT (${dejaComplet.chemin}, ${dejaComplet.octets} octets) : ` +
+          "AUCUN téléchargement, l'échec vient d'ailleurs",
+      );
+      throw new Error(
+        messageFichierPresentMaisInexploitable(livraison.id, {
+          erreurChargement,
+          chemin: dejaComplet.chemin,
+          octets: dejaComplet.octets ?? 0,
+        }),
+      );
+    }
+    if (etatFichier && etatFichier.trouves.length > 0) {
+      await journaliser(
+        `fichier(s) présent(s) mais TAILLE FAUSSE (${etatFichier.trouves
+          .map((t) => `${t.chemin}: ${t.octets}`)
+          .join(", ")}) : on télécharge pour compléter (reprise)`,
+      );
+    }
 
     // 2) TÉLÉCHARGER — confort, pas prérequis.
     await journaliser("livraison : on tente le téléchargement de secours (réseau)");

@@ -18,7 +18,6 @@ import {
   type PhaseChargement,
   type ProgresChargement,
 } from "@/ai/types";
-import { resolveLocalTurn } from "@/lib/local-apps";
 
 /**
  * UN SEUL moteur : llama.cpp en natif, dans l'APK.
@@ -330,53 +329,25 @@ export const useSession = create<SessionState>((set, get) => ({
     });
 
     try {
-      // 1) Les mini-apps locales : elles ne dépendent PAS du modèle, elles
-      //    répondent instantanément et hors ligne. C'est une fonctionnalité
-      //    LOCALE et DÉTERMINISTE (un vrai jeu, un vrai calcul), pas une
-      //    imitation du modèle : rien ici ne prétend venir du moteur. Quand
-      //    `resolveLocalTurn` renvoie `null`, on passe au modèle local.
-      const turn = resolveLocalTurn(text);
-      if (turn) {
-        await sleep(160);
-        thinking = turn.kind === "app" ? "App locale → studio" : "Calcul local → bac à sable";
-        patchAssistant(pulse(true));
-        await sleep(120);
-        const toolName = turn.kind === "app" ? "write_app" : "run_js";
-        tools.push({
-          id: newId(),
-          name: toolName,
-          status: "start",
-          args: turn.kind === "app" ? { title: turn.app.title } : { code: turn.expression },
-        });
-        patchAssistant(pulse(true));
-        await sleep(110);
-        tools[0] = {
-          ...tools[0],
-          status: "done",
-          result: turn.kind === "app" ? turn.app.title : turn.value,
-        };
-        if (turn.kind === "app") {
-          content = turn.app.note;
-          set({
-            studio: { title: turn.app.title, html: turn.app.html },
-            studioTab: "preview",
-            studioOpen: true,
-            error: null,
-          });
-        } else {
-          content = turn.note;
-        }
-        patchAssistant({
-          ...pulse(false),
-          streaming: false,
-          memoryGb: MODELS[get().model].idleGb,
-          error: null,
-          engine: get().engine === "repos" ? "repos" : get().engine,
-        });
-        return;
-      }
-
-      // 2) Le harnais D'AGENT, en local. Aucune requête sortante.
+      // PLUS AUCUNE RÉPONSE ÉCRITE EN DUR, ET PLUS AUCUN ROUTAGE PAR MOTS-CLÉS.
+      //
+      // Il y avait ici un premier étage « mini-apps locales » : un routeur à
+      // mots-clés (`resolveLocalTurn`) qui, dès qu'une demande contenait
+      // « html », « jeu », « canvas », « widget »… renvoyait une application
+      // ping-pong PRÉ-ÉCRITE dans le code et l'ouvrait dans le studio. Le
+      // résultat constaté sur téléphone : demander du CODE ouvrait un ping-pong,
+      // et la question posée n'atteignait jamais le modèle.
+      //
+      // Ce qui a été supprimé (fichier `src/lib/local-apps.ts`, en entier) :
+      //   - les trois applications écrites à la main (ping-pong, snake,
+      //     particules) et leur HTML complet ;
+      //   - le routeur à mots-clés qui les déclenchait ;
+      //   - le calcul local « calcule X » (le calcul était RÉEL, mais le routage
+      //     restait un mot-clé écrit en dur qui court-circuitait le modèle).
+      //
+      // DÉSORMAIS : toute demande va au modèle local, qui répond ou appelle un
+      // outil (`write_app`, `run_js`) ; rien n'est servi depuis le code.
+      // Le harnais D'AGENT, en local. Aucune requête sortante.
       //    Le moteur natif n'est résolu qu'ici, au premier message ;
       //    `chargerMoteur` choisit une fois pour toute la session.
       const moteurActif = await chargerMoteur();

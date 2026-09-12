@@ -69,7 +69,10 @@ import type { LocalModelId, ProgresChargement } from "./types.ts";
 // LA TRACE (voir journal.ts) : les étapes de livraison y sont écrites AVANT
 // d'être tentées, pour qu'un téléchargement qui ne rend jamais la main laisse
 // une dernière ligne utilisable.
-import { journaliser, noter } from "./journal.ts";
+import { journaliser, noter, texteErreurComplete } from "./journal.ts";
+// Le TÉLÉCHARGEUR de la WebView (fetch en flux) : la livraison automatique passe
+// par lui, pas par `Filesystem.downloadFile` (voir `telechargerModeleAutomatique`).
+import { telechargerModeleParFetch } from "./telechargementModele.ts";
 
 /**
  * `Directory.Data` de @capacitor/filesystem vaut la chaîne « DATA » ; sur Android
@@ -460,6 +463,69 @@ function texteErreur(e: unknown): string {
     return JSON.stringify(e);
   } catch {
     return String(e);
+  }
+}
+
+/**
+ * LE CHEMIN DE LIVRAISON AUTOMATIQUE, celui qui doit marcher sans que
+ * l'utilisateur touche à un fichier.
+ *
+ * POURQUOI IL EXISTE : `Filesystem.downloadFile` (code legacy) ne rend pas la
+ * main sur l'appareil visé — le fichier n'arrive donc jamais, et l'utilisateur se
+ * retrouve à télécharger 398 Mo avec Chrome puis à les importer à la main. Ce
+ * n'est pas une livraison automatique, c'est un contournement.
+ *
+ * Ici : la WebView télécharge elle-même (`fetch` en flux, voir
+ * `telechargementModele.ts`) et écrit par morceaux dans la mémoire privée de
+ * l'appli, sous le nom EXACT que le moteur cherchera. Ce qui la rend possible a
+ * été vérifié avant d'écrire le code : le CDN du Hub renvoie
+ * `access-control-allow-origin: *` après redirection et accepte l'origine de
+ * l'appli. Aucun plugin natif, aucune dépendance ajoutée.
+ *
+ * LE TÉLÉCHARGEUR DU PLUGIN RESTE EN REPLI : si le fetch échoue (WebView sans
+ * `ReadableStream`, réseau filtré, CORS changé côté Hub), on essaie l'ancienne
+ * voie — elle coûte un essai, pas une fonctionnalité. Chaque échec est journalisé
+ * avec son message brut : c'est ce qui évite de rechercher pendant une heure
+ * pourquoi « le téléchargement ne démarre pas ».
+ */
+export async function telechargerModeleAutomatique(
+  id: LocalModelId,
+  onProgres?: (p: ProgresChargement) => void,
+  /** Injection POUR LES TESTS : les deux téléchargeurs, remplaçables. */
+  deps?: {
+    parFetch?: typeof telechargerModeleParFetch;
+    parPlugin?: typeof telechargerModele;
+  },
+): Promise<void> {
+  const modele = modeleGguf(id);
+  const parFetch = deps?.parFetch ?? telechargerModeleParFetch;
+  const parPlugin = deps?.parPlugin ?? telechargerModele;
+  const debut = Date.now();
+  try {
+    await journaliser(
+      `téléchargement par la WebView (fetch en flux) : ${modele.url} ` +
+        `(${modele.octets} octets attendus)`,
+    );
+    const resultat = await parFetch(id, (p) => {
+      onProgres?.({
+        phase: "telechargement",
+        pct: Math.round((p.octetsRecus / p.octetsTotal) * 100),
+        fichier: `${modele.court} → ${tailleLisible(p.octetsRecus)} / ${tailleLisible(p.octetsTotal)}`,
+        ecouleMs: Date.now() - debut,
+        octetsRecus: p.octetsRecus,
+        octetsTotal: p.octetsTotal,
+      });
+    });
+    await journaliser(
+      `téléchargement par la WebView terminé : ${resultat.chemin} (${resultat.octets} octets)`,
+    );
+  } catch (e) {
+    const brut = texteErreurComplete(e);
+    await journaliser(
+      `téléchargement par la WebView IMPOSSIBLE (${brut}) : repli sur le téléchargeur du plugin`,
+    );
+    console.warn("téléchargement par la WebView impossible, repli sur le plugin :", brut);
+    await parPlugin(id, onProgres);
   }
 }
 

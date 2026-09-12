@@ -35,6 +35,16 @@ export function TraceNative() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!estApplicationNative()) return;
+    // LE PANNEAU NE S'AFFICHE PLUS TOUT SEUL. Le diagnostic a rempli son rôle
+    // (il a nommé l'étape bloquée : le chargement natif était atteint et le
+    // fichier du modèle absent). Il gênait l'usage normal, alors il ne s'ouvre
+    // que sur demande : en développement, ou en posant le drapeau
+    // `studio.trace-native = "1"` dans la mémoire de la WebView. Aucun
+    // reconstruire n'est nécessaire pour le rouvrir sur un appareil.
+    const dev =
+      (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
+    const demande = window.localStorage.getItem("studio.trace-native") === "1";
+    if (!dev && !demande) return;
     setMonte(true);
 
     let vivant = true;

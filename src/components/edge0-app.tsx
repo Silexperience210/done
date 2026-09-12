@@ -6,6 +6,9 @@ import { cn } from "@/lib/utils";
 import { AndroidNav } from "./android-phone";
 import { StudioOverlay } from "./studio";
 import { ThinkingBlock } from "./thinking";
+// L'IMPORT du modèle se fait là où il manque : dans la carte « modèle
+// introuvable », pas dans un panneau de diagnostic qui n'a plus à s'afficher.
+import { ImporterModele } from "./importer-modele";
 
 export function Edge0App({ overlay = false }: { overlay?: boolean }) {
   const {
@@ -70,12 +73,15 @@ function ModeleManuelCard() {
     <div className="mx-3 mb-2 shrink-0 rounded-xl border border-border bg-elevated p-3">
       <p className="text-xs font-medium text-fg">Modèle introuvable — import manuel</p>
       <p className="mt-1 text-xs leading-relaxed text-muted text-pretty">
-        Télécharge ce fichier avec Chrome, puis <span className="text-fg">importe-le dans l&apos;appli</span>{" "}
-        avec le bouton « importer le fichier du modèle », en haut de l&apos;écran : elle le copie dans sa
-        mémoire interne, sous le nom exact ci-dessous. Ne le pose PAS dans le dossier partagé (Download) :
-        l&apos;appli n&apos;a aucune permission de stockage et ne peut pas y lire — c&apos;est pour ça que
-        le fichier doit passer par l&apos;import.
+        L&apos;appli essaie de le télécharger elle-même ; si ça échoue,{" "}
+        <span className="text-fg">importe-le depuis le téléphone</span> avec le bouton ci-dessous : elle
+        le copie dans sa mémoire interne, sous le nom exact ci-dessous. Ne le pose PAS dans le dossier
+        partagé (Download) : l&apos;appli n&apos;a aucune permission de stockage et ne peut pas y lire —
+        c&apos;est pour ça que le fichier doit passer par l&apos;import.
       </p>
+      <div className="mt-2">
+        <ImporterModele sansEntete />
+      </div>
       <dl className="mt-2 flex flex-col gap-1 text-xs">
         <dt className="text-muted">Nom exact du fichier</dt>
         <dd className="font-mono break-all text-stat">{chemin.fichier}</dd>

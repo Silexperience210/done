@@ -35,7 +35,7 @@ function tailleLisible(octets: number): string {
 
 type Etat = "repos" | "ecriture" | "ok" | "erreur";
 
-export function ImporterModele() {
+export function ImporterModele({ sansEntete = false }: { sansEntete?: boolean } = {}) {
   const champ = useRef<HTMLInputElement | null>(null);
   const [etat, setEtat] = useState<Etat>("repos");
   const [progres, setProgres] = useState<ProgresImport | null>(null);
@@ -90,11 +90,13 @@ export function ImporterModele() {
 
   return (
     <div className="mb-2 rounded border border-white/15 bg-white/5 px-2 py-1.5 font-sans">
-      <p className="text-[11px] text-white/75">
-        <span className="font-semibold">Le modèle n&apos;est pas dans l&apos;appli ?</span> Télécharge-le
-        avec Chrome, puis importe-le ici — l&apos;appli le copie dans sa mémoire interne, sous le nom
-        exact que le moteur cherche. Aucun réseau n&apos;est utilisé.
-      </p>
+      {!sansEntete && (
+        <p className="text-[11px] text-white/75">
+          <span className="font-semibold">Le modèle n&apos;est pas dans l&apos;appli ?</span> Télécharge-le
+          avec Chrome, puis importe-le ici — l&apos;appli le copie dans sa mémoire interne, sous le nom
+          exact que le moteur cherche. Aucun réseau n&apos;est utilisé.
+        </p>
+      )}
       <div className="mt-1 flex items-center gap-2">
         <input
           ref={champ}

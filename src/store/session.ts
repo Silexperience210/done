@@ -68,7 +68,7 @@ function chargerMoteur(): Promise<MoteurActif> {
       // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
       // donc le build web reste intact.
       const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-      const { chargerPuisTelecharger, cheminModele, chercherModele, telechargerModele } =
+      const { chargerPuisTelecharger, cheminModele, chercherModele, telechargerModeleAutomatique } =
         await import("@/ai/modeleLocal");
       // ORDRE : on CHARGE D'ABORD, on ne télécharge qu'en secours. Le plugin
       // natif cherche le GGUF par son nom de fichier dans huit emplacements —
@@ -109,7 +109,12 @@ function chargerMoteur(): Promise<MoteurActif> {
               id,
               charger: (p) => natif.charger(id, p),
               telecharger: async (p) => {
-                await telechargerModele(id, p);
+                // LIVRAISON AUTOMATIQUE : la WebView télécharge (fetch en flux) et
+                // écrit dans la mémoire de l'appli ; le téléchargeur du plugin ne
+                // sert plus que de repli quand le fetch échoue. Sans ça, il faut
+                // 398 Mo téléchargés à la main puis importés — ce n'est pas
+                // automatique, c'est un contournement.
+                await telechargerModeleAutomatique(id, p);
               },
             },
             onProgres,

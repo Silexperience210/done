@@ -25,12 +25,20 @@
  *     `cacheSauve = true` mensonger et un `loadSession` à chaque pas pour rien.
  *     Ce module ne les appelle plus et ne les expose plus.
  *
- *  3. AUCUN réglage du nombre de threads depuis ici. `jni.cpp:322-406` ne lit
- *     que `n_ctx`, `n_batch`, `n_gpu_layers`, `use_mmap`, `use_mlock` et
- *     `embedding` ; tout le reste (`n_threads`, `n_ubatch`, `flash_attn`,
- *     `cache_type_k/v`, `n_cpu_moe`, `swa_full`, `draft_model`) est ignoré. Le
- *     moteur tourne à `LM_GGML_DEFAULT_N_THREADS = 4` (`ggml.h:228`). Calculer
- *     `nbCoeurs - 1` était donc décoratif : ce calcul est supprimé.
+ *  3. LE NOMBRE DE THREADS EST MAINTENANT RÉGLABLE — et il est réglé. Ce n'était
+ *     pas le cas : `jni.cpp:322-406` ne lisait que `n_ctx`, `n_batch`,
+ *     `n_gpu_layers`, `use_mmap`, `use_mlock` et `embedding`, donc `n_threads`
+ *     était ignoré en silence et le moteur retombait sur
+ *     `LM_GGML_DEFAULT_N_THREADS = 4` (`ggml.h:228`) — 4 threads sur un
+ *     téléphone 8 cœurs, quelle que soit la machine. Corrigé par le second
+ *     patch natif (`patches/llama-cpp-capacitor+0.1.5+001+threads.patch`) : le
+ *     JNI lit désormais `n_threads` et le nombre demandé arrive vraiment au
+ *     moteur. C'est `nbThreadsCalcul()` qui choisit la valeur (voir son
+ *     commentaire : la moitié des processeurs logiques, bornée).
+ *     Ce qui n'a PAS changé : `n_ubatch`, `flash_attn`, `cache_type_k/v`,
+ *     `n_cpu_moe`, `swa_full` et `draft_model` restent ignorés par ce lecteur
+ *     JNI. Le calcul `nbCoeurs - 1` d'autrefois reste mort : personne ne lit
+ *     `nbCoeurs`.
  *
  * CE QUI RESTE, ET QU'IL FAUT PROTÉGER : la réutilisation du préfixe de prompt,
  * elle, est réelle et AUTOMATIQUE. À chaque appel, `cap-completion.cpp:178`
@@ -137,6 +145,62 @@ export function modeleGguf(id: LocalModelId): ModeleGguf {
 }
 
 /**
+ * Processeurs logiques vus par la WebView. `navigator.hardwareConcurrency`
+ * existe dans toute WebView Android moderne ; le repli à 4 n'est atteint que
+ * dans un environnement sans `navigator` (tests Node, rendu serveur).
+ */
+function nbProcesseursLogiques(): number {
+  const n = typeof navigator !== "undefined" ? navigator.hardwareConcurrency : undefined;
+  return typeof n === "number" && Number.isFinite(n) && n >= 1 ? Math.floor(n) : 4;
+}
+
+/**
+ * Nombre de threads de CALCUL à demander au moteur, pour un processeur
+ * hétérogène (big.LITTLE).
+ *
+ * POURQUOI PAS TOUS LES CŒURS : ggml découpe le travail d'une étape de graphe en
+ * `n_threads` parts et attend TOUS ses threads à la barrière de fin d'étape
+ * (`lm_ggml_graph_compute_kickoff` / `lm_ggml_graph_compute_thread`,
+ * `ggml-cpu.c`). Une étape ne peut donc pas aller plus vite que son thread le
+ * plus lent : un seul thread qui atterrit sur un petit cœur — ou qui se fait
+ * préempter dessus — ralentit l'étape ENTIÈRE. Sur un big.LITTLE, demander
+ * `hardwareConcurrency` revient à garantir que des threads tournent sur les
+ * petits cœurs, donc à payer la barrière pour rien.
+ *
+ * LA RÈGLE, ET POURQUOI ELLE : la moitié des processeurs logiques. Sur les
+ * topologies réelles (1+3+4, 2+6, 4+4 — tous les 8 cœurs de téléphone), la
+ * moitié EST la taille du cluster de performance. C'est aussi exactement la
+ * règle de repli que llama.cpp s'applique à lui-même quand il ne sait pas
+ * compter les cœurs « math » : `n <= 4 ? n : n / 2` (`common.cpp:126-127`, et
+ * `:100` côté Windows). On ne réinvente donc rien, on applique la même formule
+ * là où elle est utile — dans l'appli, qui connaît `hardwareConcurrency`.
+ *
+ * BORNES : au moins 1 (un appareil mono-cœur doit rester utilisable) et au plus
+ * 6 (sur les 12 cœurs et plus, garder des cœurs pour la WebView, le fil
+ * d'affichage et l'OS évite que l'appli entière se fige pendant que le moteur
+ * calcule ; au-delà de 6, le gain mesuré sur téléphone ne compense plus ce coût).
+ *
+ * CE QUE ÇA DONNE ICI : sur le téléphone 8 cœurs visé, la formule tombe sur 4 —
+ * le même NOMBRE que la constante 4 qui s'appliquait par accident. Ce n'est pas
+ * un hasard : c'est la taille du cluster de performance. Ce qui change vraiment,
+ * c'est que ce 4 est désormais CHOISI, TRANSMIS et honoré (avant, le réglage
+ * était ignoré en silence), qu'il suit le SoC (6 sur 12 cœurs), et qu'il
+ * s'accompagne d'un pool de threads PERSISTANT côté natif au lieu d'un pool
+ * recréé à chaque graphe calculé — donc à chaque jeton.
+ *
+ * Le natif applique la même règle en repli (`nb_threads_par_defaut`, `jni.cpp`)
+ * pour le cas où l'appelant n'envoie rien : les deux moitiés ne peuvent pas
+ * diverger.
+ */
+export function nbThreadsCalcul(logiques: number = nbProcesseursLogiques()): number {
+  const n = Number.isFinite(logiques) && logiques >= 1 ? Math.floor(logiques) : 4;
+  // ≤ 4 : il n'y a pas de cluster de performance à isoler (et c'est la règle de
+  // llama.cpp lui-même). Au-delà : la moitié.
+  const base = n <= 4 ? n : Math.floor(n / 2);
+  return Math.min(Math.max(base, 1), 6);
+}
+
+/**
  * Ce qu'on attend du plugin, et rien de plus (donc simulable).
  *
  * PAS de `saveSession`/`loadSession` ici : dans la version installée (0.1.5),
@@ -176,6 +240,18 @@ export type OptionsNatif = {
    * (aucun GPU, et paramètre ignoré).
    */
   nBatch?: number;
+  /**
+   * Threads de CALCUL. Défaut : `nbThreadsCalcul()`, c'est-à-dire la taille
+   * estimée du cluster de performance (la moitié des processeurs logiques,
+   * bornée à [1, 6]). Surchargeable pour mesurer une autre valeur sur appareil.
+   *
+   * RÉELLEMENT transmis au moteur depuis le patch natif
+   * `patches/llama-cpp-capacitor+0.1.5+001+threads.patch` (le JNI lit la clé
+   * `n_threads`). Sans ce patch, la clé est ignorée en silence et le moteur
+   * reste à 4 threads (`ggml.h:228`) : l'envoyer n'est jamais une erreur, au
+   * pire c'est sans effet.
+   */
+  nThreads?: number;
 };
 
 function gabaritQwen(system: string, history: { role: string; content: string }[]): string {
@@ -275,9 +351,14 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         // `act_gpu_layers = 0` quand la liste de devices est vide. L'envoyer ne
         // déplaçait pas une seule couche — c'était un réglage décoratif.
         //
-        // PAS de `n_threads` non plus : absent du lecteur JNI de 0.1.5 (le
-        // moteur reste à 4 threads, ggml.h:228).
-        //
+        // `n_threads` : RÉELLEMENT lu par le natif depuis le second patch
+        // (`patches/llama-cpp-capacitor+0.1.5+001+threads.patch`, jni.cpp :
+        // « Extract n_threads »). La valeur vient de `nbThreadsCalcul()` — la
+        // moitié des processeurs logiques, bornée à [1, 6] — parce que ggml
+        // attend TOUS ses threads à la barrière de fin d'étape : un thread sur
+        // un petit cœur ralentit l'étape entière. Le défaut natif, si on
+        // n'envoyait rien, applique exactement la même règle.
+        n_threads: opts.nThreads ?? nbThreadsCalcul(),
         // use_mmap: false — sur téléphone, le coût de la projection mémoire et
         // des défauts de page pendant le pré-remplissage pèse plus lourd que le
         // gain de RAM : le chargement va plus vite jusqu'au premier jeton. C'est

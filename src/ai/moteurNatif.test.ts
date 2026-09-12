@@ -9,8 +9,11 @@
  *    aucun backend GPU, donc `n_gpu_layers` ne déplace rien (llama-model.cpp
  *    met `act_gpu_layers = 0` quand la liste de devices est vide). L'envoyer
  *    promettait un gain qui n'existe pas ;
- *  - AUCUN réglage de threads n'est prétendu : `jni.cpp` ne lit pas `n_threads`
- *    (le moteur reste à 4 threads, ggml.h:228) ;
+ *  - LE NOMBRE DE THREADS EST RÉGLABLE, ET IL EST RÉGLÉ : le natif lit bien
+ *    `n_threads` (second patch, `patches/llama-cpp-capacitor+0.1.5+001+threads.patch`),
+ *    et la valeur vient de `nbThreadsCalcul()` — la moitié des processeurs
+ *    logiques, bornée à [1, 6] — pour ne pas jeter des threads sur les petits
+ *    cœurs d'un big.LITTLE, où ggml les attendrait à la barrière de fin d'étape ;
  *  - les méthodes de session (`saveSession`/`loadSession`) ne sont JAMAIS
  *    appelées : dans la version installée elles font « rien » en répondant un
  *    succès (LlamaCpp.java:801-823). C'était un cache mensonger ;
@@ -31,6 +34,7 @@ import {
   creerMoteurNatif,
   modeleGguf,
   MODELES_GGUF,
+  nbThreadsCalcul,
   nettoyerPourAffichage,
   type PluginLlama,
 } from "./moteurNatif.ts";
@@ -58,12 +62,14 @@ const base = {
 };
 
 test("on n'envoie QUE les paramètres que le JNI lit vraiment, sans rien pour le GPU", async () => {
-  // Lu dans jni.cpp (version installée 0.1.5) : le natif ne consomme que
-  // `n_ctx`, `n_batch`, `n_gpu_layers`, `use_mmap`, `use_mlock` et `embedding`.
+  // Lu dans jni.cpp, version installée PUIS patchée (0.1.5 +
+  // patches/llama-cpp-capacitor+0.1.5+001+threads.patch) : le natif consomme
+  // `n_ctx`, `n_batch`, `n_gpu_layers`, `n_threads` (ajouté par le patch),
+  // `use_mmap`, `use_mlock` et `embedding`.
   // `n_gpu_layers` est justement celui qu'on n'envoie PLUS : le .so ne contient
   // ni backend OpenCL ni backend Vulkan, et llama-model.cpp force
-  // `act_gpu_layers = 0` sur une liste de devices vide. `n_threads` est ignoré
-  // (le moteur reste à 4 threads, ggml.h:228) et `n_ubatch` aussi.
+  // `act_gpu_layers = 0` sur une liste de devices vide. `n_ubatch` n'est
+  // toujours pas lu par le JNI, et n'est donc pas envoyé.
   const journal: Record<string, unknown>[] = [];
   const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice(journal) });
   await m.charger("coder15");
@@ -73,10 +79,51 @@ test("on n'envoie QUE les paramètres que le JNI lit vraiment, sans rien pour le
   assert.equal(init.use_mmap, false, "sans mmap : plus rapide jusqu'au premier jeton");
   assert.equal(init.use_mlock, false);
   assert.ok(!("n_gpu_layers" in init), "aucun déport GPU : le binaire n'a aucun backend GPU");
-  assert.ok(!("n_threads" in init), "le JNI ne lit pas n_threads : ne pas prétendre le régler");
+  // Le patch AJOUTE `n_threads` au lecteur JNI : la valeur part, et c'est un
+  // entier (le JNI l'extrait avec `intValue()`, jni.cpp).
+  assert.ok("n_threads" in init, "n_threads est transmis : le JNI le lit depuis le patch threads");
+  assert.equal(
+    init.n_threads,
+    nbThreadsCalcul(),
+    "la valeur transmise est celle du calcul big.LITTLE, pas une constante",
+  );
+  assert.ok(Number.isInteger(init.n_threads), "entier : le JNI appelle Integer.intValue()");
   assert.ok(!("n_ubatch" in init), "n_ubatch n'est pas lu par le JNI non plus");
   assert.ok(String(init.model).endsWith("Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf"));
   assert.equal(m.pret(), true);
+});
+
+test("nbThreadsCalcul : la taille du cluster de performance, jamais tous les cœurs", () => {
+  // `hardwareConcurrency` compte les processeurs LOGIQUES. Sur un big.LITTLE,
+  // demander ce total revient à garantir que des threads tournent sur les petits
+  // cœurs — et ggml attend tous ses threads à la barrière de fin d'étape.
+  assert.equal(nbThreadsCalcul(8), 4, "8 cœurs (1+3+4, 4+4, 2+6) : la moitié, PAS les 8");
+  assert.equal(nbThreadsCalcul(6), 3, "6 cœurs : la moitié");
+  assert.equal(nbThreadsCalcul(12), 6, "12 cœurs : la moitié, plafonnée à 6");
+  assert.equal(nbThreadsCalcul(16), 6, "au-delà : toujours 6, pour garder l'UI réactive");
+  assert.equal(nbThreadsCalcul(4), 4, "4 cœurs : pas de petite grappe à isoler");
+  assert.equal(nbThreadsCalcul(2), 2);
+  assert.equal(nbThreadsCalcul(1), 1, "jamais 0 : ggml le relirait comme la constante 4");
+  assert.equal(nbThreadsCalcul(0), 4, "valeur absurde -> repli sûr");
+  assert.equal(nbThreadsCalcul(Number.NaN), 4, "valeur absurde -> repli sûr");
+  assert.equal(nbThreadsCalcul(7.9), 3, "arrondi vers le bas, pas de 0,5 thread");
+  // La propriété qui compte, énoncée telle quelle :
+  for (const logiques of [8, 9, 10, 12, 16]) {
+    assert.ok(
+      nbThreadsCalcul(logiques) < logiques,
+      `${logiques} cœurs : on ne demande jamais tous les cœurs`,
+    );
+  }
+  // Et le défaut, sans argument, se lit sur la machine — jamais une constante :
+  assert.equal(nbThreadsCalcul(), nbThreadsCalcul(navigator.hardwareConcurrency));
+});
+
+test("nThreads permet de forcer une autre valeur (mesure sur appareil)", async () => {
+  const journal: Record<string, unknown>[] = [];
+  const m = creerMoteurNatif({ ...base, nThreads: 3, chargerPlugin: pluginFactice(journal) });
+  await m.charger("coder15");
+  assert.equal(journal[0].n_threads, 3, "la surcharge passe telle quelle");
+  assert.notEqual(nbThreadsCalcul(), 3, "et elle est bien distincte du défaut ici");
 });
 
 test("n_ctx et le lot de pré-remplissage sont configurables", async () => {

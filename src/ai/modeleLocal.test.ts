@@ -19,6 +19,7 @@ import {
   cheminModele,
   cheminRelatif,
   DELAI_GARDE_MS,
+  DELAIS_HTTP,
   gardeDepassee,
   messageEchec,
   messageErreurActionnable,
@@ -358,6 +359,24 @@ test("le dossier parent est créé AVANT le téléchargement, jamais après", as
   assert.ok(iDl >= 0, "le téléchargement a bien eu lieu");
   assert.ok(iMkdir < iDl, "mkdir(« Documents ») précède downloadFile");
   assert.equal(phases.at(-1)?.phase, "pret");
+});
+
+test("des délais HTTP sont imposés au natif, sinon il attend indéfiniment", async () => {
+  // `LegacyFilesystemImplementation.kt:92-93` lit ces deux options et
+  // `HttpRequestHandler.java:112-113` ne les applique que si elles sont NON
+  // NULLES. Absentes, `HttpURLConnection` garde son défaut (0 = pour toujours) :
+  // un Wi-Fi qui tombe bloque le fil de téléchargement sans jamais rejeter, et
+  // l'écran reste figé — exactement le symptôme rapporté.
+  const modele = modeleGguf("coder05");
+  const { plugin, journal } = pluginFactice({ tailles: [null, modele.octets] });
+  await telechargerModele("coder05", undefined, plugin);
+  const dl = journal.find((j) => "downloadFile" in j)?.downloadFile as Record<string, unknown>;
+  assert.equal(dl.connectTimeout, DELAIS_HTTP.CONNEXION_MS, "délai de connexion transmis");
+  assert.equal(dl.readTimeout, DELAIS_HTTP.LECTURE_MS, "délai de lecture transmis");
+  assert.ok(
+    DELAIS_HTTP.LECTURE_MS < DELAI_GARDE_MS,
+    "le natif doit abandonner AVANT le garde JS : lui seul libère le socket et le fichier",
+  );
 });
 
 /* ===================================================================== */

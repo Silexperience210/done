@@ -84,6 +84,10 @@ export type PluginFichiers = {
     directory: string;
     progress?: boolean;
     recursive?: boolean;
+    /** Attente maximale de l'ÉTABLISSEMENT de la connexion (ms). */
+    connectTimeout?: number;
+    /** Attente maximale entre deux paquets reçus (ms), réarmée à chaque lecture. */
+    readTimeout?: number;
   }) => Promise<{ path?: string }>;
   addListener: (
     event: "progress",
@@ -102,6 +106,26 @@ export type PluginFichiers = {
  * totale, sinon un gros modèle sur une connexion lente serait tué à tort.
  */
 export const DELAI_GARDE_MS = 60_000;
+
+/**
+ * DÉLAIS HTTP CÔTÉ NATIF — sans eux, un téléchargement calé ne finit JAMAIS.
+ *
+ * Preuve, lue dans les sources installées (pas une précaution de style) :
+ *  - `LegacyFilesystemImplementation.kt:92-93` lit `connectTimeout`/`readTimeout`
+ *    dans les options de l'appel et les passe au constructeur de connexion ;
+ *  - `HttpRequestHandler.java:112-113` (@capacitor/android) ne les applique que
+ *    s'ils sont NON NULS : `if (connectTimeout != null) …`. Absents, la connexion
+ *    garde les valeurs par défaut de `HttpURLConnection`, soit **0 = attendre
+ *    indéfiniment**. Un socket qui cesse de livrer des octets bloque alors le fil
+ *    de téléchargement (`thread { … }`, même fichier, lignes 31-39) pour toujours :
+ *    ni succès, ni rejet, donc aucun message à l'écran.
+ *
+ * `LECTURE_MS` est volontairement INFÉRIEUR à `DELAI_GARDE_MS` : on veut que le
+ * natif abandonne le premier, ce qui libère vraiment le socket et le
+ * `FileOutputStream` ; le délai de garde JS reste le filet de sécurité au cas où
+ * le natif ne rendrait pas la main (il ne peut pas être interrompu depuis ici).
+ */
+export const DELAIS_HTTP = { CONNEXION_MS: 20_000, LECTURE_MS: 45_000 } as const;
 
 /** Options injectables : les tests pilotent l'horloge et la minuterie. */
 export type OptionsLivraison = {
@@ -442,18 +466,25 @@ export async function telechargerModele(
     void surveiller();
   }, 1000);
 
+  const telechargement = dep.downloadFile({
+    url: modele.url,
+    path: relatif,
+    directory: DOSSIER_DATA,
+    // `progress: true` déclenche les évènements « progress » écoutés ci-dessus.
+    progress: Boolean(onProgres),
+    recursive: true,
+    // SANS CES DEUX DÉLAIS, un téléchargement calé ne rend jamais la main
+    // (HttpURLConnection attend indéfiniment) : voir `DELAIS_HTTP`.
+    connectTimeout: DELAIS_HTTP.CONNEXION_MS,
+    readTimeout: DELAIS_HTTP.LECTURE_MS,
+  });
+  // Si le délai de garde gagne la course, ce rejet arriverait SANS preneur (et la
+  // WebView le signalerait en « unhandled rejection ») : on l'apprivoise, comme
+  // `garde` plus haut. Le `Promise.race` ci-dessous continue de voir l'original.
+  telechargement.catch(() => {});
+
   try {
-    await Promise.race([
-      dep.downloadFile({
-        url: modele.url,
-        path: relatif,
-        directory: DOSSIER_DATA,
-        // `progress: true` déclenche les évènements « progress » écoutés ci-dessus.
-        progress: Boolean(onProgres),
-        recursive: true,
-      }),
-      garde,
-    ]);
+    await Promise.race([telechargement, garde]);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     await effacer(dep, relatif);

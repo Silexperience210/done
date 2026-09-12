@@ -29,6 +29,7 @@ export function TraceNative() {
   const [monte, setMonte] = useState(false);
   const [trace, setTrace] = useState<EtatTraceNative | null>(null);
   const [copie, setCopie] = useState(false);
+  const [majA, setMajA] = useState("");
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -38,7 +39,13 @@ export function TraceNative() {
     let vivant = true;
     const relire = async () => {
       const etat = await lireTraceNative();
-      if (vivant) setTrace(etat);
+      if (vivant) {
+        setTrace(etat);
+        // L'HEURE DE RELECTURE est affichée : sans elle, un panneau qui ne bouge
+        // pas ne se distingue pas d'un panneau figé, et c'est exactement la
+        // confusion qu'on cherche à lever.
+        setMajA(new Date().toLocaleTimeString());
+      }
     };
     void relire();
     const minuteur = setInterval(() => void relire(), PERIODE_MS);
@@ -63,14 +70,17 @@ export function TraceNative() {
     }
   };
 
+  // EN HAUT, ET PAS EN BAS : le champ de saisie de l'appli est en bas, et un
+  // panneau posé dessus empêcherait justement d'envoyer la demande qui déclenche
+  // le chargement à observer. En haut, il ne gêne rien.
   return (
     <div
       data-testid="trace-native"
-      className="fixed bottom-0 left-0 right-0 z-50 max-h-[42vh] overflow-auto border-t border-white/15 bg-black/85 px-3 py-2 font-mono text-[10px] leading-tight text-white/85 backdrop-blur"
+      className="fixed left-0 right-0 top-0 z-50 max-h-[28vh] overflow-auto border-b border-white/15 bg-black/85 px-3 py-2 font-mono text-[10px] leading-tight text-white/85 backdrop-blur"
     >
       <div className="mb-1 flex items-center justify-between gap-2">
         <span className="font-sans text-[10px] uppercase tracking-wide text-white/60">
-          trace native (diagnostic)
+          trace native (diagnostic){majA ? ` · relu à ${majA}` : ""}
         </span>
         {lignes !== null && lignes.length > 0 && (
           <button

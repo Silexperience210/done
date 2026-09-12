@@ -1,5 +1,5 @@
 diff --git a/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt b/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt
-index f849d84..98bb035 100644
+index f849d84..4f03e57 100644
 --- a/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt
 +++ b/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt
 @@ -24,6 +24,33 @@ set(
@@ -36,7 +36,7 @@ index f849d84..98bb035 100644
      ${LLAMACPP_LIB_DIR}/ggml-cpu/unary-ops.cpp
      ${LLAMACPP_LIB_DIR}/ggml-cpu/binary-ops.cpp
      ${LLAMACPP_LIB_DIR}/ggml-cpu/vec.cpp
-@@ -95,14 +122,44 @@ function(build_library_arm64 target_name)
+@@ -95,14 +122,60 @@ function(build_library_arm64 target_name)
          ${SOURCE_FILES}
      )
  
@@ -45,21 +45,37 @@ index f849d84..98bb035 100644
 +    #
 +    # CE QUI A CHANGÉ, ET POURQUOI (chaque point est vérifiable par lecture) :
 +    #
-+    # 1. -march=armv8-a -> armv8.6-a+dotprod+i8mm. Avec armv8-a, le compilateur
-+    #    ne définissait NI __ARM_FEATURE_DOTPROD NI __ARM_FEATURE_MATMUL_INT8 :
-+    #    tous les noyaux NEON/SDOT/I8MM d'arch/arm étaient compilés OUT, et
-+    #    ggml-cpu.c (lm_ggml_cpu_has_dotprod, ligne 3484) répondait 0 — d'où
-+    #    0 SDOT/I8MM dans le .text livré.
-+    #    dotprod et i8mm sont OPTIONNELS depuis armv8.2-a mais ne sont BASELINE
-+    #    qu'à partir d'armv8.6-a : écrire « armv8.2-a+i8mm » n'est pas garanti
-+    #    accepté par l'outillage. C'est le même contournement que llama.cpp en
-+    #    amont, qui remonte à armv8.6-a dès que i8mm est retenu
-+    #    (ggml-cpu/CMakeLists.txt amont : ARM_MCPU = armv8.6-a si
-+    #    GGML_INTERNAL_MATMUL_INT8). Les deux extensions restent explicitées
-+    #    pour ne pas dépendre du baseline implicite.
-+    #    ATTENTION : ces instructions deviennent OBLIGATOIRES à l'exécution (un
-+    #    seul binaire, aucun dispatch multi-variantes). Un arm64 plus ancien que
-+    #    dotprod/i8mm lèverait SIGILL. Compromis assumé pour l'accélération.
++    # 1. -march=armv8-a -> armv8.2-a+dotprod.
++    #    (armv8-a) le compilateur ne définissait NI __ARM_FEATURE_DOTPROD NI
++    #    __ARM_FEATURE_MATMUL_INT8 : tous les noyaux NEON/SDOT/I8MM d'arch/arm
++    #    étaient compilés OUT, et ggml-cpu.c (lm_ggml_cpu_has_dotprod, ligne
++    #    3484) répondait 0 — d'où 0 SDOT/I8MM dans le .text livré.
++    #    (armv8.6-a+dotprod+i8mm) c'est la version intermédiaire, ABANDONNÉE :
++    #    elle rendait i8mm OBLIGATOIRE À L'EXÉCUTION. Le .so est unique, sans
++    #    choix de variante : sur un arm64 sans i8mm (Cortex-A76/A77/A78/X1 —
++    #    Snapdragon 855/865/870/888, Exynos 2100, Tensor G1/G2…), les SMMLA
++    #    émis par arch/arm/quants.c et arch/arm/repack.cpp sont des instructions
++    #    invalides. C'est la cause probable de l'arrêt au chargement sur le
++    #    téléphone visé (désassemblage de l'APK livré : 116 SMMLA ; à confirmer
++    #    par logcat et /proc/cpuinfo, non re-mesuré ici).
++    #    (armv8.2-a+dotprod) c'est le plancher qui garde l'essentiel. dotprod
++    #    est OPTIONNEL depuis armv8.2-a : le demander ne réclame donc rien que
++    #    l'architecture de base n'autorise, et reste bien plus large qu'i8mm,
++    #    BASELINE seulement à partir d'armv8.6-a. Vérifié en compilant les deux
++    #    fichiers ci-dessus avec clang 18 (la version du NDK 27) pour
++    #    aarch64-linux-android24 :
++    #      armv8.6-a+dotprod+i8mm -> 286 SDOT + 77 SMMLA (quants 194+36,
++    #                                repack 92+41)
++    #      armv8.2-a+dotprod      -> 286 SDOT inchangés, SMMLA = 0
++    #    On garde donc TOUT le NEON/SDOT — le gain principal, sur les
++    #    quantifications Q4_0/Q8_0/Q4_K/Q6_K — et on perd SMMLA : le matmul
++    #    int8 (nrows=2 dans ggml-cpu.c, vmmlaq_s32) plus le nrows=2 des
++    #    variantes repack. Aucun dispatch multi-variantes ici : binaire unique
++    #    veut dire plus petit dénominateur commun. Pour récupérer i8mm un jour,
++    #    il faudra plusieurs .so choisis à l'exécution selon HWCAP/HWCAP2 (ce
++    #    que fait llama.rn/PocketPal), et surtout pas relever -march sur un
++    #    binaire unique — clang 18 accepte pourtant armv8.2-a+i8mm, mais un
++    #    tel binaire leverait de nouveau SIGILL sur les SoC sans i8mm.
 +    #
 +    # 2. -DLM_GGML_CPU_GENERIC SUPPRIMÉ. Cette macro faisait renommer par
 +    #    arch-fallback.h les implémentations scalaires `*_generic` en symboles
@@ -74,7 +90,7 @@ index f849d84..98bb035 100644
 +    #    enregistré, et tout le repack (gemm/gemv interleavés) restait mort.
      target_compile_options(${target_name} PRIVATE
 -        -march=armv8-a
-+        -march=armv8.6-a+dotprod+i8mm
++        -march=armv8.2-a+dotprod
          -mtune=cortex-a76
          -O3
          -DNDEBUG
@@ -84,10 +100,10 @@ index f849d84..98bb035 100644
          -fno-finite-math-only
          -funroll-loops
      )
-@@ -127,5 +184,5 @@ build_library_arm64(llama-cpp-arm64)
+@@ -127,5 +200,5 @@ build_library_arm64(llama-cpp-arm64)
  message(STATUS "Building llama-cpp for Android ARM64 (real devices)")
  message(STATUS "Source directory: ${LLAMACPP_LIB_DIR}")
  message(STATUS "Architecture: ARM64 (arm64-v8a)")
 -message(STATUS "Optimizations: ARMv8-A, Cortex-A76 tuning")
-+message(STATUS "Optimizations: ARMv8.6-A +dotprod +i8mm, Cortex-A76 tuning, CPU_REPACK (arch/arm sources compiled)")
++message(STATUS "Optimizations: ARMv8.2-A +dotprod (NO i8mm: binaire unique -> doit demarrer partout), Cortex-A76 tuning, CPU_REPACK (arch/arm sources compiled)")
  message(STATUS "Output directory: ${CMAKE_CURRENT_SOURCE_DIR}/jniLibs/arm64-v8a")

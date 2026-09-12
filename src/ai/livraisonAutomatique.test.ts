@@ -28,9 +28,9 @@ test("le téléchargeur de la WebView est essayé en PREMIER, et l'avancement po
     {
       parFetch: async (_id, cb) => {
         appels.push("fetch");
-        cb?.({ octetsRecus: 100_000_000, octetsTotal: modele.octets, morceaux: 48 });
-        cb?.({ octetsRecus: modele.octets, octetsTotal: modele.octets, morceaux: 191 });
-        return { octets: modele.octets, chemin: `Documents/${modele.fichier}` };
+        cb?.({ octetsRecus: 100_000_000, octetsTotal: modele.octets, morceaux: 48, repris: 0 });
+        cb?.({ octetsRecus: modele.octets, octetsTotal: modele.octets, morceaux: 191, repris: 0 });
+        return { octets: modele.octets, chemin: `Documents/${modele.fichier}`, essais: 1 };
       },
       parPlugin: async () => {
         appels.push("plugin");

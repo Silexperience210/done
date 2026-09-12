@@ -510,7 +510,11 @@ export async function telechargerModeleAutomatique(
       onProgres?.({
         phase: "telechargement",
         pct: Math.round((p.octetsRecus / p.octetsTotal) * 100),
-        fichier: `${modele.court} → ${tailleLisible(p.octetsRecus)} / ${tailleLisible(p.octetsTotal)}`,
+        // La REPRISE est dite à l'écran : sans ça, un compteur qui repart à
+        // 6,2 Go passerait pour un bug de l'appli.
+        fichier:
+          `${modele.court} → ${tailleLisible(p.octetsRecus)} / ${tailleLisible(p.octetsTotal)}` +
+          (p.repris > 0 ? ` — reprise après ${tailleLisible(p.repris)}` : ""),
         ecouleMs: Date.now() - debut,
         octetsRecus: p.octetsRecus,
         octetsTotal: p.octetsTotal,

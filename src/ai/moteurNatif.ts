@@ -87,7 +87,13 @@
  * durée étant relevée dans l'appli. Les détails et l'ordre de priorité sont
  * dans `debitMesure`.
  */
-import type { GenerateOptions, LocalModelId, ProgresChargement } from "./types.ts";
+import type {
+  BilanGeneration,
+  GenerateOptions,
+  LocalModelId,
+  ProgresChargement,
+  RaisonArret,
+} from "./types.ts";
 import type { Moteur } from "./moteur.ts";
 // La TRACE, écrite AVANT chaque étape (voir journal.ts). Module volontairement
 // sans dépendance native : il n'importe Capacitor qu'à l'appel, donc ce fichier
@@ -288,7 +294,41 @@ export type ReponseCompletion = {
    * de débit réellement exploitable en production.
    */
   tokens_predicted?: number;
+  /** Jetons du prompt réellement évalués (`prompt_tokens.size()`, jni.cpp). */
   tokens_evaluated?: number;
+  /**
+   * DRAPEAUX D'ARRÊT — les VRAIES valeurs du moteur depuis le patch natif
+   * `002+completion.patch` (jni.cpp, « Add completion status flags — VALEURS
+   * RÉELLES du moteur ») : ils sont lus sur l'objet de complétion
+   * (`cap-completion.cpp`, `nextToken`) et non plus écrits en dur.
+   *
+   *  - `stopped_limit`  : `n_predict` atteint (`n_remain == 0`) — sortie COUPÉE.
+   *  - `stopped_eos`    : fin de message émise par le modèle — il a FINI.
+   *  - `context_full`   : plus de place dans `n_ctx`.
+   *  - `truncated`      : le PROMPT a été rogné pour tenir dans `n_ctx`.
+   *  - `interrupted`    : `stopCompletion` a été appelé.
+   *  - `stopped_word`   : une chaîne d'arrêt (`stop`) a été atteinte. ATTENTION :
+   *    dans le paquet 0.1.5 tel que livré, jni.cpp (comme LlamaCpp.swift:400)
+   *    écrit ici la CHAÎNE VIDE "" en dur, pas un booléen — le drapeau posé par
+   *    `findStoppingStrings` n'était jamais relu. Le patch natif
+   *    `005+raison-arret.patch` remplace ces deux valeurs par le booléen et la
+   *    chaîne réels. On accepte donc les deux formes : booléen (patché) ou
+   *    chaîne (non patché, où "" veut dire « on ne sait pas »).
+   *  - `stopping_word`  : LA chaîne d'arrêt atteinte (ex. `</html>`), avec le
+   *    même patch ; "" sans lui.
+   *
+   * Le type déclaré par le plugin (`definitions.d.ts:301-307`) dit
+   * `stopped_limit: number` et `stopped_word: string` : c'est l'union des deux
+   * plateformes, pas ce qu'Android envoie (des `java.lang.Boolean`). On lit les
+   * deux sans présumer.
+   */
+  stopped_limit?: boolean | number;
+  stopped_eos?: boolean;
+  stopped_word?: boolean | string;
+  stopping_word?: string;
+  truncated?: boolean;
+  context_full?: boolean;
+  interrupted?: boolean;
   /**
    * Bloc de mesure du moteur. Sur Android il ne contient QUE `prompt_n` et
    * `predicted_n` (`jni.cpp:986-997`) ; les champs de débit et de durée
@@ -531,6 +571,77 @@ export function debitMesure(
   return { tokParSeconde: taux, jetons, msDepuisPremier: Math.round(dureeMs) };
 }
 
+/** Un drapeau du natif : `true`, ou le nombre 1 (forme déclarée par le plugin). */
+function drapeau(v: unknown): boolean {
+  return v === true || v === 1;
+}
+
+/**
+ * LA RAISON D'ARRÊT, lue dans les drapeaux du moteur — jamais devinée.
+ *
+ * Ordre de lecture, et pourquoi : `context_full` d'abord (c'est la panne la plus
+ * grave, elle rend le pas suivant impossible), puis `stopped_limit` (la sortie
+ * est coupée : c'est le diagnostic qu'on cherche), puis `stopped_eos`,
+ * `interrupted`, et la chaîne d'arrêt. Deux drapeaux vrais à la fois ne se
+ * produisent pas dans `nextToken` (chaque cause pose `has_next_token = false`
+ * et s'arrête), mais s'ils l'étaient, cet ordre choisit la cause la plus
+ * limitante.
+ *
+ * `stopped_word` : booléen avec le patch natif 005, chaîne "" sans lui. La
+ * chaîne vide n'est PAS « faux », c'est « non renseigné » : on ne conclut
+ * alors ni à un arrêt sur chaîne, ni à autre chose — `inconnue`.
+ */
+export function raisonArret(reponse: ReponseCompletion | null | undefined): RaisonArret {
+  if (!reponse) return "inconnue";
+  if (drapeau(reponse.context_full)) return "contexte_plein";
+  if (drapeau(reponse.stopped_limit)) return "limite";
+  if (drapeau(reponse.stopped_eos)) return "eos";
+  if (drapeau(reponse.interrupted)) return "interrompu";
+  if (
+    drapeau(reponse.stopped_word) ||
+    (typeof reponse.stopping_word === "string" && reponse.stopping_word.length > 0)
+  ) {
+    return "chaine";
+  }
+  return "inconnue";
+}
+
+/** Un entier positif ou nul exploitable, sinon `null` (0 jeton EST une mesure). */
+function compteJetons(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : null;
+}
+
+/**
+ * LE BILAN D'UN APPEL — chiffres du moteur + durées relevées ici. Pure, donc
+ * testée à sec. `fenetre.premierJetonMs` vaut 0 quand aucun jeton n'a été vu :
+ * les deux durées sont alors `null` (« — »), pas 0.
+ */
+export function bilanGeneration(
+  reponse: ReponseCompletion | null | undefined,
+  fenetre: { debutMs: number; premierJetonMs: number; finMs: number },
+  demande: { nPredict: number; nCtx: number | null; nBatch: number | null; nThreads: number | null },
+): BilanGeneration {
+  const timings = reponse?.timings;
+  const aVuUnJeton = fenetre.premierJetonMs > 0;
+  const chaine =
+    typeof reponse?.stopping_word === "string" && reponse.stopping_word.length > 0
+      ? reponse.stopping_word
+      : null;
+  return {
+    raison: raisonArret(reponse),
+    chaineArret: chaine,
+    jetonsPrompt: compteJetons(timings?.prompt_n) ?? compteJetons(reponse?.tokens_evaluated),
+    jetonsPredits: compteJetons(timings?.predicted_n) ?? compteJetons(reponse?.tokens_predicted),
+    nPredict: demande.nPredict,
+    promptTronque: drapeau(reponse?.truncated),
+    msPreremplissage: aVuUnJeton ? Math.max(0, fenetre.premierJetonMs - fenetre.debutMs) : null,
+    msDecodage: aVuUnJeton ? Math.max(0, fenetre.finMs - fenetre.premierJetonMs) : null,
+    nCtx: demande.nCtx,
+    nBatch: demande.nBatch,
+    nThreads: demande.nThreads,
+  };
+}
+
 /**
  * Construit le moteur natif. Tout ce qui touche au matériel est injecté, donc la
  * logique est vérifiable sans téléphone.
@@ -547,6 +658,12 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   let pluginCharge: PluginLlama | null = null;
   /** Nombre d'appels de `generer` : distingue le PREMIER calcul des suivants. */
   let generations = 0;
+  /**
+   * Les réglages RÉELLEMENT transmis à `initLlama`, gardés pour les répéter
+   * dans le bilan de chaque génération : une ligne de trace qui ne dit pas avec
+   * quel `n_ctx` et combien de threads elle a été obtenue ne se compare à rien.
+   */
+  let reglagesTransmis: { nCtx: number; nBatch: number; nThreads: number } | null = null;
 
   /**
    * DEMANDE OÙ EST LE FICHIER, ET LE TRACE. Jamais fatal : cette vérification
@@ -625,6 +742,7 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         contexte = null;
         charge = null;
         dernierTokParSeconde = null;
+        reglagesTransmis = null;
       }
     },
 
@@ -716,6 +834,11 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       // toutes les minutes tant que l'étape dure, sans jamais l'interrompre.
       (veille as unknown as { unref?: () => void }).unref?.();
 
+      const parametres = {
+        nCtx: reglages?.nCtx ?? opts.nCtx ?? 4096,
+        nBatch: reglages?.nBatch ?? opts.nBatch ?? 512,
+        nThreads: reglages?.nThreads || opts.nThreads || nbThreadsCalcul(),
+      };
       try {
         contexte = await plugin.initLlama({
           // NOM DE FICHIER SEUL. Sur Android, `LlamaCpp.initContext` ne retient du
@@ -730,11 +853,11 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           // 4096 jetons : la boucle d'agent réinjecte le prompt système, la
           // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
           // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
-          n_ctx: reglages?.nCtx ?? opts.nCtx ?? 4096,
+          n_ctx: parametres.nCtx,
           // Lots de pré-remplissage : jetons traités par passe. C'est le SEUL
           // levier de vitesse de chargement réellement lu par le natif, et il
           // compte davantage maintenant que les noyaux dotprod/i8mm sont compilés.
-          n_batch: reglages?.nBatch ?? opts.nBatch ?? 512,
+          n_batch: parametres.nBatch,
           // PAS de `n_gpu_layers` : le binaire du plugin ne contient aucun backend
           // GPU (ni OpenCL ni Vulkan) et llama-model.cpp:1965-1971 met
           // `act_gpu_layers = 0` quand la liste de devices est vide. L'envoyer ne
@@ -749,7 +872,7 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           // n'envoyait rien, applique exactement la même règle.
           // 0 = « automatique » : c'est le calcul habituel (moitié des processeurs
           // logiques, borné à 6) qui s'applique, pas zéro thread.
-          n_threads: reglages?.nThreads || opts.nThreads || nbThreadsCalcul(),
+          n_threads: parametres.nThreads,
           // use_mmap: true — LE MAPPAGE MÉMOIRE EST RÉTABLI, et c'est le DÉFAUT
           // de llama.cpp (`common_params::use_mmap = true`, common.h:383 ; le
           // JNI du plugin écrit la même valeur, jni.cpp:265). On ne l'envoie
@@ -775,6 +898,7 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         });
         if (veille !== null) clearInterval(veille);
         veille = null;
+        reglagesTransmis = parametres;
         await journaliser("fin de l'initialisation du moteur (contexte créé)");
       } catch (e) {
         if (veille !== null) clearInterval(veille);
@@ -821,16 +945,21 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
           : `début du calcul n°${generations} (${prompt.length} caractères de prompt)`,
       );
 
+      const nPredict = options.maxNewTokens ?? 256;
       const resultat = await plugin.completion(
         {
           prompt,
-          n_predict: options.maxNewTokens ?? 256,
+          n_predict: nPredict,
           temperature: 0.2,
           top_p: 0.9,
           emit_partial_completion: true,
           // S'arrêter à la balise de fin évite de générer 256 jetons pour rien :
-          // sur un téléphone, c'est du temps réel gagné.
-          stop: ["<|im_end|>", "<|im_start|>"],
+          // sur un téléphone, c'est du temps réel gagné. Les chaînes de
+          // l'appelant (`</html>` pour la production d'une app) s'y ajoutent :
+          // le natif tronque le texte JUSTE AVANT la chaîne atteinte
+          // (`generated_text.resize(stop_pos)`, jni.cpp), donc elle n'apparaît
+          // pas dans le texte rendu — c'est à l'appelant de le savoir.
+          stop: ["<|im_end|>", "<|im_start|>", ...(options.stop ?? [])],
           // Contraintes de sortie structurée. `json_schema` (chaîne) est
           // converti en grammaire par llama.cpp ; `grammar` (GBNF) est utilisé
           // directement et prime si les deux sont fournis. Absents, le moteur
@@ -868,13 +997,30 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         options.onVitesse?.(mesure.tokParSeconde, mesure.jetons, mesure.msDepuisPremier);
       }
 
+      // LE BILAN : raison d'arrêt et compteurs tels que le natif les rend, durées
+      // relevées ici, réglages répétés. C'est ce que la trace par pas et la frise
+      // consomment ; ce qui n'a pas été mesuré y est `null`, donc « — ».
+      const bilan = bilanGeneration(
+        resultat,
+        { debutMs: debut, premierJetonMs, finMs: fin },
+        {
+          nPredict,
+          nCtx: reglagesTransmis?.nCtx ?? null,
+          nBatch: reglagesTransmis?.nBatch ?? null,
+          nThreads: reglagesTransmis?.nThreads ?? null,
+        },
+      );
+      options.onBilan?.(bilan);
+
       options.onEtape?.("termine");
       await journaliser(
-        mesure
+        (mesure
           ? `fin de génération : ${mesure.jetons} jetons, ${mesure.tokParSeconde.toFixed(1)} tok/s mesurés, ` +
-              `${flux.length} caractères rendus`
+            `${flux.length} caractères rendus`
           : `fin de génération : débit NON MESURABLE (ni débit du moteur, ni couple ` +
-              `« compte de jetons + durée » exploitable), ${flux.length} caractères rendus`,
+            `« compte de jetons + durée » exploitable), ${flux.length} caractères rendus`) +
+          ` · arrêt : ${bilan.raison}${bilan.chaineArret ? ` (« ${bilan.chaineArret} »)` : ""}` +
+          ` · n_predict ${nPredict}${bilan.promptTronque ? " · PROMPT TRONQUÉ par n_ctx" : ""}`,
       );
 
       // LE TEXTE EST RENDU TEL QUEL — c'est la seule forme qui laisse le
@@ -882,7 +1028,14 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       // `common_part` au pas suivant : les jetons du préfixe ne correspondent
       // plus, et tout ce qui suit est réévalué. Le nettoyage d'affichage
       // (`nettoyerPourAffichage`) est l'affaire de l'appelant, PAS d'ici.
-      return flux || resultat?.text || "";
+      //
+      // ON PRÉFÈRE LE TEXTE FINAL DU MOTEUR AU FLUX : quand une chaîne d'arrêt
+      // est atteinte, le natif rogne `generated_text` juste avant elle, mais les
+      // jetons qui la commençaient (« </ », « html ») ont déjà été diffusés dans
+      // le flux. Le flux porte donc un bout de chaîne d'arrêt que le texte
+      // final n'a pas ; c'est ce dernier qui fait foi. Le flux reste le repli
+      // pour un plugin qui ne rendrait pas `text`.
+      return typeof resultat?.text === "string" ? resultat.text : flux;
     },
   };
 }

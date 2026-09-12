@@ -46,14 +46,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  bilanGeneration,
   creerMoteurNatif,
   debitMesure,
   modeleGguf,
   MODELES_GGUF,
   nbThreadsCalcul,
   nettoyerPourAffichage,
+  raisonArret,
   type PluginLlama,
 } from "./moteurNatif.ts";
+import type { BilanGeneration } from "./types.ts";
 import {
   demarrerJournal,
   reinitialiserJournal,
@@ -775,4 +778,117 @@ test("une vérification de fichier qui ne répond JAMAIS ne bloque pas le charge
     "et c'est DIT dans la trace, au lieu d'être avalé",
   );
   assert.match(trace.contenu(), /fin de l'initialisation du moteur/, "le chargement est allé au bout");
+});
+
+/* ─── Raison d'arrêt et bilan de génération (P1) ─────────────────────── */
+
+test("raisonArret lit les drapeaux RÉELS du natif, dans l'ordre de gravité, et n'invente rien", () => {
+  assert.equal(raisonArret(undefined), "inconnue");
+  assert.equal(raisonArret({}), "inconnue", "aucun drapeau : on ne devine pas");
+  assert.equal(raisonArret({ stopped_eos: true }), "eos");
+  assert.equal(raisonArret({ stopped_limit: true }), "limite");
+  assert.equal(raisonArret({ stopped_limit: 1 }), "limite", "forme déclarée par le plugin : un nombre");
+  assert.equal(raisonArret({ context_full: true, stopped_limit: true }), "contexte_plein", "le plus grave d'abord");
+  assert.equal(raisonArret({ interrupted: true }), "interrompu");
+  // Sans le patch natif 005, jni.cpp écrit "" en dur pour stopped_word : ce
+  // n'est PAS « faux », c'est « non renseigné ».
+  assert.equal(raisonArret({ stopped_word: "" }), "inconnue");
+  assert.equal(raisonArret({ stopped_word: true }), "chaine");
+  assert.equal(raisonArret({ stopping_word: "</html>" }), "chaine");
+  assert.equal(raisonArret({ truncated: true }), "inconnue", "truncated parle du PROMPT, pas de l'arrêt");
+});
+
+test("bilanGeneration : compteurs du natif, durées relevées ici, réglages répétés, « — » sinon", () => {
+  const b = bilanGeneration(
+    {
+      tokens_predicted: 23,
+      tokens_evaluated: 812,
+      stopped_eos: true,
+      truncated: false,
+      timings: { prompt_n: 812, predicted_n: 23 },
+    },
+    { debutMs: 1000, premierJetonMs: 2240, finMs: 3420 },
+    { nPredict: 48, nCtx: 4096, nBatch: 512, nThreads: 4 },
+  );
+  assert.equal(b.raison, "eos");
+  assert.equal(b.jetonsPrompt, 812);
+  assert.equal(b.jetonsPredits, 23);
+  assert.equal(b.nPredict, 48);
+  assert.equal(b.msPreremplissage, 1240, "du début au premier jeton");
+  assert.equal(b.msDecodage, 1180, "du premier jeton à la fin");
+  assert.equal(b.promptTronque, false);
+  assert.deepEqual([b.nCtx, b.nBatch, b.nThreads], [4096, 512, 4]);
+
+  // Aucun jeton vu, aucun compteur : les durées sont null (« — »), pas 0.
+  const vide = bilanGeneration({}, { debutMs: 0, premierJetonMs: 0, finMs: 500 }, { nPredict: 30, nCtx: null, nBatch: null, nThreads: null });
+  assert.equal(vide.jetonsPredits, null);
+  assert.equal(vide.msPreremplissage, null);
+  assert.equal(vide.msDecodage, null);
+  assert.equal(vide.raison, "inconnue");
+  // 0 jeton produit EST une mesure (le moteur a répondu « 0 »), pas une absence.
+  assert.equal(bilanGeneration({ tokens_predicted: 0 }, { debutMs: 0, premierJetonMs: 0, finMs: 1 }, { nPredict: 1, nCtx: null, nBatch: null, nThreads: null }).jetonsPredits, 0);
+  // La chaîne d'arrêt nommée par le natif (patch 005) est rendue telle quelle.
+  assert.equal(
+    bilanGeneration({ stopped_word: true, stopping_word: "</html>" }, { debutMs: 0, premierJetonMs: 1, finMs: 2 }, { nPredict: 1500, nCtx: 4096, nBatch: 512, nThreads: 4 }).chaineArret,
+    "</html>",
+  );
+});
+
+test("generer remonte le bilan via onBilan, transmet les chaînes d'arrêt et préfère le texte final du moteur au flux", async () => {
+  const journal: Record<string, unknown>[] = [];
+  const plugin: PluginLlama = {
+    initLlama: async (p) => {
+      journal.push(p);
+      return { id: "contexte" };
+    },
+    completion: async (p, cb) => {
+      journal.push(p);
+      // Le natif diffuse « </ » puis « html » AVANT de reconnaître la chaîne
+      // d'arrêt, puis rogne le texte final juste avant elle (jni.cpp,
+      // `generated_text.resize(stop_pos)`) : le flux et le texte divergent.
+      for (const t of ["<html>", "x", "</", "html"]) cb?.({ token: t });
+      return {
+        text: "<html>x",
+        tokens_predicted: 4,
+        tokens_evaluated: 90,
+        stopped_word: true,
+        stopping_word: "</html>",
+        stopped_eos: false,
+        stopped_limit: false,
+        truncated: false,
+        context_full: false,
+        timings: { prompt_n: 90, predicted_n: 4 },
+      };
+    },
+  };
+  const m = creerMoteurNatif({
+    ...base,
+    maintenant: horlogeValeurs([0, 100, 700]),
+    chargerPlugin: async () => plugin,
+  });
+  await m.charger("coder05", undefined, { nCtx: 2048, nBatch: 256, nThreads: 3 });
+  let bilan: BilanGeneration | null = null;
+  const texte = await m.generer({
+    system: "s",
+    history: [],
+    maxNewTokens: 1500,
+    stop: ["</html>"],
+    onBilan: (b) => {
+      bilan = b;
+    },
+  });
+  assert.equal(texte, "<html>x", "le texte final du moteur, sans le bout de chaîne d'arrêt du flux");
+  const params = journal[1];
+  assert.deepEqual(params.stop, ["<|im_end|>", "<|im_start|>", "</html>"], "les chaînes de l'appelant s'ajoutent");
+  assert.equal(params.n_predict, 1500);
+  assert.ok(bilan, "un bilan est remonté");
+  const b = bilan as unknown as BilanGeneration;
+  assert.equal(b.raison, "chaine");
+  assert.equal(b.chaineArret, "</html>");
+  assert.equal(b.jetonsPredits, 4);
+  assert.equal(b.jetonsPrompt, 90);
+  assert.equal(b.nPredict, 1500);
+  assert.equal(b.msPreremplissage, 100);
+  assert.equal(b.msDecodage, 600);
+  assert.deepEqual([b.nCtx, b.nBatch, b.nThreads], [2048, 256, 3], "les réglages RÉELLEMENT transmis à initLlama");
 });

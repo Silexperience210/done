@@ -1,0 +1,34 @@
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+index 1287612..0c8172d 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
++++ b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+@@ -1293,11 +1293,26 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
+             env->NewObject(env->FindClass("java/lang/Boolean"), 
+                 env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), drapeau_interrompu ? JNI_TRUE : JNI_FALSE));
+         
+-        // Add empty strings for stop reasons
++        // ─── ARRÊT SUR CHAÎNE : LES VRAIES VALEURS ───────────────────────
++        // Avant : `stopped_word` et `stopping_word` étaient écrits "" EN DUR
++        // (« Add empty strings for stop reasons »), alors que `findStoppingStrings`
++        // (cap-completion.cpp, STOP_FULL) pose bien `stopped_word = true` et
++        // `stopping_word = <la chaîne>` sur l'objet de complétion. Résultat côté
++        // JS : impossible de distinguer « le modèle s'est arrêté sur `</html>`
++        // comme demandé » de « on ne sait pas pourquoi il s'est arrêté » — et le
++        // harnais ne pouvait pas remettre la balise `</html>` que le natif venait
++        // de rogner (`generated_text.resize(stop_pos)`) sans DEVINER. On rend
++        // donc le booléen réel et la chaîne réelle ; sans arrêt sur chaîne, le
++        // booléen est faux et la chaîne vide — même forme qu'avant, mais vraie.
++        const bool drapeau_word = ctx->completion != nullptr && ctx->completion->stopped_word;
++        const std::string chaine_arret =
++            (ctx->completion != nullptr && drapeau_word) ? ctx->completion->stopping_word : std::string();
+         env->CallObjectMethod(resultMap, putMethod,
+-            jni_utils::string_to_jstring(env, "stopped_word"), jni_utils::string_to_jstring(env, ""));
++            jni_utils::string_to_jstring(env, "stopped_word"),
++            env->NewObject(env->FindClass("java/lang/Boolean"),
++                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), drapeau_word ? JNI_TRUE : JNI_FALSE));
+         env->CallObjectMethod(resultMap, putMethod,
+-            jni_utils::string_to_jstring(env, "stopping_word"), jni_utils::string_to_jstring(env, ""));
++            jni_utils::string_to_jstring(env, "stopping_word"), jni_utils::string_to_jstring(env, chaine_arret));
+         
+         // Add timing information (basic)
+         jobject timingsMap = env->NewObject(hashMapClass, hashMapConstructor);

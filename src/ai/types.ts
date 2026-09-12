@@ -92,11 +92,78 @@ export type ProgresChargement = {
   etape?: EtapeChargement;
 };
 
+/**
+ * POURQUOI LA GÉNÉRATION S'EST ARRÊTÉE — telle que le moteur la rapporte.
+ *
+ * C'est LA mesure qui manquait au harnais : sans elle, un JSON coupé par
+ * `n_predict` (le modèle n'a pas fini) est indiscernable d'un JSON cassé par le
+ * modèle (il a fini, mais mal). Les deux appellent des réactions opposées —
+ * plus de budget, ou un autre format — et le harnais redemandait la même chose
+ * avec le même budget dans les deux cas.
+ *
+ *  - `eos`            : le modèle a émis sa fin de message (`<|im_end|>`) — il a FINI.
+ *  - `limite`         : `n_predict` atteint — la sortie est COUPÉE.
+ *  - `chaine`         : une chaîne d'arrêt demandée par l'appli a été atteinte
+ *                       (par exemple `</html>`), le texte s'arrête juste avant.
+ *  - `contexte_plein` : plus de place dans `n_ctx` — coupé, et le prompt est trop long.
+ *  - `interrompu`     : `stopCompletion` a été appelé.
+ *  - `inconnue`       : le moteur n'a posé aucun drapeau (ancienne version du
+ *                       .so, ou plateforme qui ne les remplit pas). On l'écrit
+ *                       tel quel : « — », jamais une raison devinée.
+ */
+export type RaisonArret = "eos" | "limite" | "chaine" | "contexte_plein" | "interrompu" | "inconnue";
+
+/**
+ * BILAN D'UNE GÉNÉRATION : les chiffres RÉELS d'un appel au moteur, tels que le
+ * natif les a rendus, plus les deux durées relevées dans l'appli. `null` partout
+ * où rien n'a été mesuré — l'écran écrit alors « — ». Rien ici n'est estimé.
+ *
+ * Les réglages (`nCtx`, `nBatch`, `nThreads`) sont répétés dans CHAQUE bilan :
+ * deux taux de réussite ne se comparent que si l'on sait avec quels réglages
+ * chacun a été obtenu, et une trace qui ne les porte pas sur chaque ligne oblige
+ * à les retrouver ailleurs.
+ */
+export type BilanGeneration = {
+  raison: RaisonArret;
+  /** La chaîne d'arrêt atteinte, quand le natif la nomme (sinon `null`). */
+  chaineArret: string | null;
+  /** Jetons du prompt réellement évalués (`tokens_evaluated` / `timings.prompt_n`). */
+  jetonsPrompt: number | null;
+  /** Jetons produits (`tokens_predicted` / `timings.predicted_n`). */
+  jetonsPredits: number | null;
+  /** Budget demandé pour cet appel (`n_predict`). */
+  nPredict: number;
+  /**
+   * `truncated` du moteur : le PROMPT ne tenait pas dans `n_ctx` et a été rogné
+   * par le natif. À ne pas confondre avec une SORTIE coupée (`raison: "limite"`).
+   */
+  promptTronque: boolean;
+  /** Du début de l'appel au premier jeton : le pré-remplissage du prompt. */
+  msPreremplissage: number | null;
+  /** Du premier jeton à la fin de l'appel : le décodage seul. */
+  msDecodage: number | null;
+  nCtx: number | null;
+  nBatch: number | null;
+  nThreads: number | null;
+};
+
 export type GenerateOptions = {
   system: string;
   history: { role: string; content: string }[];
   maxNewTokens?: number;
+  /**
+   * Chaînes d'arrêt SUPPLÉMENTAIRES (en plus des balises de fin de tour). Sert à
+   * la production d'une app : s'arrêter sur `</html>` évite de payer des jetons
+   * de bavardage après le document.
+   */
+  stop?: string[];
   onToken?: (text: string) => void;
+  /**
+   * Appelé UNE fois, à la fin, avec le bilan RÉEL de l'appel (raison d'arrêt,
+   * jetons, durées, réglages). C'est la donnée que la trace par pas et la
+   * frise à l'écran consomment ; sans lui, elles écrivent « — ».
+   */
+  onBilan?: (bilan: BilanGeneration) => void;
   /**
    * Appelé UNE fois, à la fin de la génération, avec la mesure du débit.
    *

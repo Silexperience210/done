@@ -53,11 +53,13 @@ export function Edge0App({ overlay = false }: { overlay?: boolean }) {
  *
  * Pourquoi ce panneau existe : sur l'appareil visé, `Filesystem.downloadFile`
  * (déprécié en 8.1.3) ne démarre pas. Faire dépendre l'utilisateur de notre code
- * de téléchargement le laissait bloqué. Le moteur natif, lui, cherche le GGUF
- * par son nom de fichier dans huit emplacements, dont le dossier Download :
- * télécharger le fichier avec Chrome et le laisser là SUFFIT. Ce panneau donne
- * donc les trois choses nécessaires, sans jargon : le nom EXACT du fichier
- * attendu, l'URL directe à ouvrir, et le dossier où le poser.
+ * de téléchargement le laissait bloqué. Mais le laisser poser le GGUF dans le
+ * stockage PARTAGÉ ne marche pas non plus — l'appli n'a que la permission
+ * INTERNET, elle ne peut pas y lire (la trace native le montre : les
+ * emplacements /sdcard/* répondent « absent »). Ce panneau donne donc les trois
+ * choses nécessaires, sans jargon : le nom EXACT du fichier attendu, l'URL
+ * directe à ouvrir dans Chrome, et le fait qu'il faut l'IMPORTER dans l'appli
+ * (bouton du panneau de diagnostic), qui le copie dans sa mémoire interne.
  *
  * Aucun appel natif, aucune condition : c'est du texte et un lien.
  */
@@ -66,11 +68,13 @@ function ModeleManuelCard() {
   if (!chemin) return null;
   return (
     <div className="mx-3 mb-2 shrink-0 rounded-xl border border-border bg-elevated p-3">
-      <p className="text-xs font-medium text-fg">Modèle introuvable — mode manuel</p>
+      <p className="text-xs font-medium text-fg">Modèle introuvable — import manuel</p>
       <p className="mt-1 text-xs leading-relaxed text-muted text-pretty">
-        Télécharge ce fichier avec Chrome, puis laisse-le dans le dossier{" "}
-        <span className="font-mono text-stat">{chemin.dossier}</span> : le moteur le trouve tout
-        seul au prochain essai, sans passer par l&apos;appli.
+        Télécharge ce fichier avec Chrome, puis <span className="text-fg">importe-le dans l&apos;appli</span>{" "}
+        avec le bouton « importer le fichier du modèle », en haut de l&apos;écran : elle le copie dans sa
+        mémoire interne, sous le nom exact ci-dessous. Ne le pose PAS dans le dossier partagé (Download) :
+        l&apos;appli n&apos;a aucune permission de stockage et ne peut pas y lire — c&apos;est pour ça que
+        le fichier doit passer par l&apos;import.
       </p>
       <dl className="mt-2 flex flex-col gap-1 text-xs">
         <dt className="text-muted">Nom exact du fichier</dt>
@@ -86,8 +90,10 @@ function ModeleManuelCard() {
             {chemin.url}
           </a>
         </dd>
-        <dt className="text-muted">Emplacement attendu</dt>
-        <dd className="font-mono break-all text-stat">{chemin.chemin}</dd>
+        <dt className="text-muted">Emplacement final, dans l&apos;appli</dt>
+        <dd className="font-mono break-all text-stat">
+          mémoire privée de l&apos;appli / Documents / {chemin.fichier}
+        </dd>
       </dl>
     </div>
   );

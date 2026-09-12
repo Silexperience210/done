@@ -21,6 +21,7 @@
 import { useEffect, useState } from "react";
 import { dernieresLignes, lireTraceNative, type EtatTraceNative } from "@/ai/traceNatif";
 import { estApplicationNative } from "@/ai/moteur";
+import { ImporterModele } from "@/components/importer-modele";
 
 /** Période de relecture : 2 s. La trace s'écrit par étapes, pas par jetons. */
 const PERIODE_MS = 2_000;
@@ -78,6 +79,7 @@ export function TraceNative() {
       data-testid="trace-native"
       className="fixed left-0 right-0 top-0 z-50 max-h-[28vh] overflow-auto border-b border-white/15 bg-black/85 px-3 py-2 font-mono text-[10px] leading-tight text-white/85 backdrop-blur"
     >
+      <ImporterModele />
       <div className="mb-1 flex items-center justify-between gap-2">
         <span className="font-sans text-[10px] uppercase tracking-wide text-white/60">
           trace native (diagnostic){majA ? ` · relu à ${majA}` : ""}

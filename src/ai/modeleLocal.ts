@@ -386,10 +386,15 @@ export function messageModeleIntrouvable(id: LocalModelId): string {
   const c = cheminManuel(id);
   return (
     `modèle introuvable sur le téléphone « ${c.nom} ». Télécharge ce fichier avec ` +
-    `Chrome (${tailleLisible(c.octets)}) : ${c.url} — nom EXACT du fichier attendu : ` +
-    `${c.fichier}. Le fichier doit se trouver dans le dossier Download, c'est-à-dire ` +
-    `en ${c.chemin}. Ensuite, relance ta demande : rien d'autre à faire, le moteur ` +
-    `trouve le fichier tout seul.`
+    `Chrome (${tailleLisible(c.octets)}) : ${c.url} — l'appli tente son propre ` +
+    `téléchargement, mais sur certains appareils il ne rend pas la main ; le ` +
+    `téléchargement par Chrome marche toujours. Ensuite, IMPORTE-LE DANS L'APPLI avec ` +
+    `le bouton « importer le fichier du modèle » (en haut de l'écran) : l'appli le copie ` +
+    `dans sa mémoire interne sous le nom exact ${c.fichier}. ` +
+    `NE LE POSE PAS dans Download ni ailleurs dans le stockage partagé : l'appli n'a ` +
+    `aucune permission de stockage, elle ne peut pas y lire — c'est la raison pour ` +
+    `laquelle le fichier doit passer par l'import. Ensuite, relance ta demande : le ` +
+    `moteur le chargera.`
   );
 }
 

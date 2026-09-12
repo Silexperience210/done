@@ -252,7 +252,12 @@ test("l'erreur brute du moteur natif devient un message actionnable, chemin manu
   const traduit = messageErreurActionnable("Failed to initialize native context", "coder05");
   // Ce qu'on doit POUVOIR FAIRE, sans dépendre de notre code de téléchargement :
   const modele = modeleGguf("coder05");
-  assert.match(traduit, /Download/, "on nomme le dossier où poser le fichier");
+  assert.match(traduit, /importer le fichier du modèle/i, "on dit COMMENT le faire entrer dans l'appli");
+  assert.match(
+    traduit,
+    /aucune permission de stockage/i,
+    "on dit pourquoi le poser dans Download ne marchera pas",
+  );
   assert.ok(traduit.includes(modele.fichier), "le nom EXACT du fichier attendu est affiché");
   assert.ok(traduit.includes(modele.url), "l'URL directe est affichée, à ouvrir dans Chrome");
   assert.match(traduit, /relance/i, "on dit quoi faire");
@@ -623,7 +628,7 @@ test("les deux échouent : l'erreur porte les DEUX erreurs RÉELLES et le chemin
       // Et l'issue qui ne dépend pas de l'appli est donnée en entier.
       assert.ok(m.includes(modele.fichier), "le nom EXACT du fichier attendu");
       assert.ok(m.includes(modele.url), "l'URL directe à ouvrir dans Chrome");
-      assert.match(m, /dossier Download/i, "la consigne de dépôt");
+      assert.match(m, /importer le fichier du modèle/i, "la consigne d'import dans l'appli");
       return true;
     },
   );
@@ -657,12 +662,16 @@ test("le chemin manuel affiche le nom EXACT, l'URL et le dossier Download", () =
   assert.equal(c.octets, modele.octets, "la taille exacte attendue");
 });
 
-test("le message « introuvable » est autosuffisant : nom, URL, dossier Download", () => {
+test("le message « introuvable » est autosuffisant : nom, URL, import dans l'appli", () => {
   const modele = modeleGguf("coder3b");
   const m = messageModeleIntrouvable("coder3b");
   assert.ok(m.includes(modele.fichier), "le nom exact du fichier");
   assert.ok(m.includes(modele.url), "l'URL directe");
-  assert.match(m, /dossier Download/i, "le dossier où le poser");
+  // La consigne doit être FAISABLE : l'appli n'a aucune permission de stockage,
+  // donc « pose-le dans Download » était une fausse piste (relevée par l'audit).
+  assert.match(m, /IMPORTE-LE DANS L'APPLI/i, "la consigne d'import");
+  assert.match(m, /aucune permission de stockage/i, "la raison, dite en clair");
+  assert.doesNotMatch(m, /doit se trouver dans le dossier Download/i, "plus de fausse piste");
   assert.match(m, /8,01 Go/, "la taille à obtenir, en clair");
   // Chaque modèle a SON fichier et SON URL : aucune confusion possible.
   assert.notEqual(cheminManuel("coder3b").fichier, cheminManuel("coder05").fichier);

@@ -29,9 +29,9 @@ export function Stage() {
             </span>
           </p>
           <p className="mt-4 max-w-sm text-sm leading-relaxed text-muted text-pretty">
-            Le GGUF est téléchargé une fois ({profile.diskGb.toFixed(1)} Go) dans le stockage de
-            l'appli, puis exécuté par llama.cpp en natif : ensuite, tout se calcule sur l'appareil,
-            même hors ligne.
+            Le GGUF ({profile.diskGb.toFixed(1)} Go) est téléchargé par l'appli au premier
+            lancement, puis exécuté par llama.cpp en natif : une fois là, tout se calcule sur
+            l'appareil, même hors ligne.
           </p>
           <div className="mt-6">
             <EnginePanel
@@ -43,7 +43,7 @@ export function Stage() {
           </div>
           {last?.role === "assistant" && (last.tools?.length || last.thinking) ? (
             <p className="mt-4 font-mono text-xs text-muted">
-              {streaming ? "decode / tools live" : "last turn"}
+              {streaming ? "tour en cours" : "dernier tour"}
               {last.tools?.length
                 ? ` · ${last.tools.length} tool call${last.tools.length > 1 ? "s" : ""}`
                 : ""}

@@ -40,6 +40,24 @@
  *     JNI. Le calcul `nbCoeurs - 1` d'autrefois reste mort : personne ne lit
  *     `nbCoeurs`.
  *
+ * LA TRACE, ÉCRITE AVANT CHAQUE ÉTAPE (voir `journal.ts`) : ce module écrit dans
+ * un fichier lisible sur le téléphone — pas seulement dans la console — le
+ * chemin résolu du modèle, la présence et la taille du fichier, le début et la
+ * fin de la lecture/initialisation, le début du premier calcul, le premier jeton
+ * et la fin de génération, plus toute erreur dans son texte intégral. La raison
+ * est mécanique : la ligne est écrite AVANT l'étape, donc si une étape ne rend
+ * jamais la main, la dernière ligne du fichier la nomme. Un journal écrit après
+ * coup serait muet au moment précis où il servirait.
+ *
+ * DEUX RÉGLAGES DU MOTEUR ONT ÉTÉ CORRIGÉS ICI, et il ne faut pas les remettre :
+ *  - `use_mmap: false` a été retiré (retour au défaut `true`). Il forçait la
+ *    lecture COMPLÈTE du GGUF en mémoire vive avant que le contexte existe — sur
+ *    un téléphone contraint, c'est un pic d'allocation qui peut faire échanger
+ *    de la mémoire au lieu d'avancer. Aucun gain n'avait été mesuré ;
+ *  - le « pool de threads persistant » du patch C++ a été retiré, pour la même
+ *    raison : jamais mesuré, sans effet sur le nombre de threads de l'appareil,
+ *    et un attachement de pool mal formé peut bloquer ggml sans erreur.
+ *
  * CE QUI RESTE, ET QU'IL FAUT PROTÉGER : la réutilisation du préfixe de prompt,
  * elle, est réelle et AUTOMATIQUE. À chaque appel, `cap-completion.cpp:178`
  * (`n_past = common_part(embd, text_tokens)`) compare les jetons du prompt
@@ -71,6 +89,13 @@
  */
 import type { GenerateOptions, LocalModelId, ProgresChargement } from "./types.ts";
 import type { Moteur } from "./moteur.ts";
+// La TRACE, écrite AVANT chaque étape (voir journal.ts). Module volontairement
+// sans dépendance native : il n'importe Capacitor qu'à l'appel, donc ce fichier
+// reste chargeable dans un navigateur et dans les tests Node.
+import { journaliser, noter, texteErreurComplete } from "./journal.ts";
+// Type SEULEMENT : `modeleLocal.ts` importe `modeleGguf` d'ici, et un import de
+// valeur créerait un cycle. `import type` disparaît à la compilation.
+import type { EtatFichierModele } from "./modeleLocal.ts";
 
 export type ModeleGguf = {
   /** Identifiant local, aligné sur `MODELS` (lib/edge0.ts). */
@@ -151,7 +176,12 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
 ];
 
 export function modeleGguf(id: LocalModelId): ModeleGguf {
-  return MODELES_GGUF.find((m) => m.id === id) ?? MODELES_GGUF[1];
+  // Repli = le modèle de DÉMARRAGE, celui dont `MODELES_GGUF[0]` est la
+  // définition : le 0.5B, le seul que la chaîne native peut charger sans risque
+  // mémoire. Le repli précédent (`MODELES_GGUF[1]`, le 1.5B) faisait charger un
+  // modèle plus gros que celui annoncé à l'écran dès qu'un identifiant ne
+  // correspondait à rien — l'inverse de ce que le repli doit faire.
+  return MODELES_GGUF.find((m) => m.id === id) ?? MODELES_GGUF[0];
 }
 
 /**
@@ -193,10 +223,18 @@ function nbProcesseursLogiques(): number {
  * CE QUE ÇA DONNE ICI : sur le téléphone 8 cœurs visé, la formule tombe sur 4 —
  * le même NOMBRE que la constante 4 qui s'appliquait par accident. Ce n'est pas
  * un hasard : c'est la taille du cluster de performance. Ce qui change vraiment,
- * c'est que ce 4 est désormais CHOISI, TRANSMIS et honoré (avant, le réglage
- * était ignoré en silence), qu'il suit le SoC (6 sur 12 cœurs), et qu'il
- * s'accompagne d'un pool de threads PERSISTANT côté natif au lieu d'un pool
- * recréé à chaque graphe calculé — donc à chaque jeton.
+ * c'est que ce 4 est désormais CHOISI et TRANSMIS (avant, le réglage était
+ * ignoré en silence) et qu'il suit le SoC (6 sur 12 cœurs).
+ *
+ * CE QUI NE VA PAS AVEC : un « pool de threads persistant » côté natif a été
+ * essayé, puis RETIRÉ. Il n'a jamais été mesuré, il ne changeait rien au nombre
+ * de threads sur l'appareil visé (4 dans les deux cas), et un pool attaché de
+ * travers peut faire attendre ggml indéfiniment à sa barrière de fin d'étape —
+ * c'est-à-dire bloquer le chargement ou le calcul sans erreur ni journal. Voir
+ * l'en-tête de `patches/llama-cpp-capacitor+0.1.5+001+threads.patch`. Le pool
+ * jetable recréé par ggml est le comportement PAR DÉFAUT de llama.cpp : plus
+ * lent à la marge, jamais bloquant. Ce choix-là se reprend avec un chronomètre,
+ * pas avec une hypothèse.
  *
  * Le natif applique la même règle en repli (`nb_threads_par_defaut`, `jni.cpp`)
  * pour le cas où l'appelant n'envoie rien : les deux moitiés ne peuvent pas
@@ -262,6 +300,25 @@ export type OptionsNatif = {
   /** Charge le plugin (import dynamique en vrai, simulacre dans les tests). */
   chargerPlugin: () => Promise<PluginLlama>;
   /**
+   * VÉRIFIE OÙ EST LE FICHIER, et sa taille, AVANT d'appeler le moteur. Injecté
+   * (et non importé) pour la même raison que `cheminModele` : le moteur natif ne
+   * doit dépendre ni de `@capacitor/filesystem`, ni d'un chemin en dur, pour
+   * rester testable sans téléphone. En production, c'est `chercherModele` de
+   * `modeleLocal.ts` — les emplacements qu'il interroge sont ceux où le natif
+   * cherchera vraiment le GGUF.
+   *
+   * Sert au DIAGNOSTIC, pas à la décision : le moteur natif reste seul juge de
+   * ce qu'il peut ouvrir. Son résultat est journalisé (`journal.ts`) pour qu'une
+   * trace montre si le fichier était là, où, et de quelle taille.
+   */
+  verifierFichier?: (m: ModeleGguf) => Promise<EtatFichierModele>;
+  /**
+   * Délai maximal accordé à `verifierFichier` (défaut : `DIAGNOSTIC_MAX_MS`).
+   * Configurable pour les TESTS : un diagnostic abandonné doit être vérifiable
+   * sans faire durer la suite de tests quatre secondes.
+   */
+  delaiDiagnosticMs?: number;
+  /**
    * Taille du contexte en jetons. 4096 par défaut : un agent reçoit des
    * résultats d'outils (code, erreurs, HTML) en plus du prompt système, et 2048
    * débordait. Configurable pour un appareil à court de RAM.
@@ -296,6 +353,34 @@ export type OptionsNatif = {
    */
   maintenant?: () => number;
 };
+
+/**
+ * Délai maximal accordé à la VÉRIFICATION du fichier (diagnostic, 4 s). C'est une
+ * information, pas une condition : un `stat` qui ne rend pas la main est
+ * abandonné et le chargement continue. Sans ce plafond, le diagnostic pourrait
+ * devenir la panne qu'il est censé décrire.
+ */
+export const DIAGNOSTIC_MAX_MS = 4_000;
+
+/**
+ * Rend le résultat de `p`, ou `null` s'il n'arrive pas dans `ms`. Le rejet
+ * éventuel de `p` APRÈS l'expiration est apprivoisé ici, pour ne pas finir en
+ * « unhandled rejection » (même précaution que dans `telechargerModele`).
+ */
+async function avecDelai<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  p.catch(() => {});
+  let minuteur: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<null>((resoudre) => {
+        minuteur = setTimeout(() => resoudre(null), ms);
+      }),
+    ]);
+  } finally {
+    if (minuteur !== null) clearTimeout(minuteur);
+  }
+}
 
 function gabaritQwen(system: string, history: { role: string; content: string }[]): string {
   const parts = [`<|im_start|>system\n${system}<|im_end|>\n`];
@@ -421,6 +506,60 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   let contexte: unknown = null;
   let charge: LocalModelId | null = null;
   let dernierTokParSeconde: number | null = null;
+  /** Nombre d'appels de `generer` : distingue le PREMIER calcul des suivants. */
+  let generations = 0;
+
+  /**
+   * DEMANDE OÙ EST LE FICHIER, ET LE TRACE. Jamais fatal : cette vérification
+   * est un diagnostic, pas une condition. Si elle ne peut pas répondre, on
+   * l'écrit — c'est déjà une information (« on n'a pas pu savoir ») — et le
+   * moteur natif reste seul juge.
+   *
+   * On écrit AUSSI la taille attendue à côté de la taille vue : c'est ce qui
+   * permet de reconnaître d'un coup d'œil un fichier tronqué (téléchargement
+   * interrompu), qu'aucun message du moteur ne distingue d'un fichier absent.
+   */
+  async function verifierEtTracer(modele: ModeleGguf): Promise<void> {
+    if (!opts.verifierFichier) {
+      await journaliser(
+        "vérification du fichier non branchée ici : le moteur natif jugera lui-même de sa présence",
+      );
+      return;
+    }
+    try {
+      // AVEC UN PLAFOND : la vérification est un diagnostic, jamais une
+      // condition. Un `stat` qui ne répond pas ne doit pas retenir le
+      // chargement — sinon le journal deviendrait la panne qu'il décrit.
+      const delaiDiagnostic = opts.delaiDiagnosticMs ?? DIAGNOSTIC_MAX_MS;
+      const etat = await avecDelai(opts.verifierFichier(modele), delaiDiagnostic);
+      if (etat === null) {
+        await journaliser(
+          `vérification du fichier ABANDONNÉE (aucun retour en ${delaiDiagnostic} ms) : ` +
+            "le chargement continue sans cette information",
+        );
+        return;
+      }
+      if (etat.trouves.length === 0) {
+        // Ce n'est PAS forcément une erreur : le natif visite d'autres
+        // emplacements que ceux-ci. Mais c'est exactement ce qu'il faut lire
+        // quand le message final est « Failed to initialize native context ».
+        await journaliser(
+          `fichier jamais trouvé aux emplacements vérifiés : ${etat.emplacements
+            .map((e) => `${e.chemin}${e.erreur ? ` (${e.erreur})` : ""}`)
+            .join(" | ")}`,
+        );
+        return;
+      }
+      for (const trouve of etat.trouves) {
+        await journaliser(
+          `fichier trouvé : ${trouve.chemin} — ${trouve.octets} octets ` +
+            `(taille attendue ${modele.octets} octets)`,
+        );
+      }
+    } catch (e) {
+      await journaliser(`vérification du fichier impossible : ${texteErreurComplete(e)}`);
+    }
+  }
 
   return {
     nom: "natif",
@@ -436,66 +575,153 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
 
     async charger(id: LocalModelId, onProgres?: (p: ProgresChargement) => void): Promise<void> {
       const debut = Date.now();
-      if (contexte && charge === id) return;
+      if (contexte && charge === id) {
+        await journaliser(`chargement ignoré : « ${id} » est déjà chargé`);
+        return;
+      }
+
+      // CHAQUE LIGNE EST ÉCRITE (et attendue) AVANT l'étape qu'elle annonce.
+      // C'est tout l'intérêt : si une étape ne rend jamais la main, la dernière
+      // ligne du fichier la nomme. Une ligne écrite après coup ne serait jamais
+      // écrite dans ce cas-là.
+      await journaliser(`── chargement demandé : « ${id} » (${modeleGguf(id).nom})`);
 
       const plugin = await opts.chargerPlugin();
+      await journaliser("plugin llama.cpp chargé (import dynamique)");
+
       const modele = modeleGguf(id);
       const chemin = opts.cheminModele(modele);
+      // CHEMIN RÉSOLU, tel qu'il partira au moteur. Sur Android, le plugin n'en
+      // retient que le nom de fichier et le cherche dans ses propres dossiers :
+      // cette ligne dit donc exactement ce que le moteur va chercher.
+      await journaliser(`chemin du modèle transmis au moteur : ${chemin}`);
 
+      // 1) OÙ EST LE FICHIER, ET DE QUELLE TAILLE. Deux choses différentes :
+      //    « le fichier n'est pas là où on croit » et « le fichier est là mais
+      //    le moteur se bloque » ne se diagnostiquent pas pareil.
       onProgres?.({
         phase: "initialisation",
+        etape: "recherche_modele",
         pct: 100,
         fichier: `${modele.court} → mémoire`,
         ecouleMs: Date.now() - debut,
       });
+      await verifierEtTracer(modele);
 
       if (contexte && charge && charge !== id) {
+        await journaliser(`libération du modèle précédent (« ${charge} ») avant de charger « ${id} »`);
         await plugin.releaseAllLlama?.();
         contexte = null;
       }
 
-      contexte = await plugin.initLlama({
-        // NOM DE FICHIER SEUL. Sur Android, `LlamaCpp.initContext` ne retient du
-        // chemin que `new File(modelPath).getName()`, puis cherche ce nom dans
-        // ses propres dossiers : getFilesDir()/<nom>, getFilesDir()/Documents/<nom>,
-        // getExternalFilesDir(null)/<nom>, /sdcard/Documents/<nom>, etc. L'appli
-        // pose donc le GGUF dans getFilesDir()/Documents (voir modeleLocal.ts) et
-        // passe ici le seul nom de fichier. On n'envoie PLUS `is_model_asset` :
-        // le TypeScript du plugin le transmet, mais le code Android ne le lit
-        // nulle part (vérifié dans LlamaCpp.java) — il était purement ignoré.
-        model: chemin,
-        // 4096 jetons : la boucle d'agent réinjecte le prompt système, la
-        // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
-        // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
-        n_ctx: opts.nCtx ?? 4096,
-        // Lots de pré-remplissage : jetons traités par passe. C'est le SEUL
-        // levier de vitesse de chargement réellement lu par le natif, et il
-        // compte davantage maintenant que les noyaux dotprod/i8mm sont compilés.
-        n_batch: opts.nBatch ?? 512,
-        // PAS de `n_gpu_layers` : le binaire du plugin ne contient aucun backend
-        // GPU (ni OpenCL ni Vulkan) et llama-model.cpp:1965-1971 met
-        // `act_gpu_layers = 0` quand la liste de devices est vide. L'envoyer ne
-        // déplaçait pas une seule couche — c'était un réglage décoratif.
-        //
-        // `n_threads` : RÉELLEMENT lu par le natif depuis le second patch
-        // (`patches/llama-cpp-capacitor+0.1.5+001+threads.patch`, jni.cpp :
-        // « Extract n_threads »). La valeur vient de `nbThreadsCalcul()` — la
-        // moitié des processeurs logiques, bornée à [1, 6] — parce que ggml
-        // attend TOUS ses threads à la barrière de fin d'étape : un thread sur
-        // un petit cœur ralentit l'étape entière. Le défaut natif, si on
-        // n'envoyait rien, applique exactement la même règle.
-        n_threads: opts.nThreads ?? nbThreadsCalcul(),
-        // use_mmap: false — sur téléphone, le coût de la projection mémoire et
-        // des défauts de page pendant le pré-remplissage pèse plus lourd que le
-        // gain de RAM : le chargement va plus vite jusqu'au premier jeton. C'est
-        // ce que mesurent les retours de terrain sur ce plugin ; c'est aussi ce
-        // qui ramène le modèle entièrement en RAM, cohérent avec le choix de
-        // quant à 8,0 Go.
-        use_mmap: false,
-        use_mlock: false,
+      // 2) LECTURE + INITIALISATION. Un seul appel natif, indivisible depuis
+      //    ici : on le nomme exactement comme ça à l'écran, et on ne fait pas
+      //    croire à deux étapes séparées.
+      onProgres?.({
+        phase: "initialisation",
+        etape: "initialisation_moteur",
+        pct: 100,
+        fichier: `${modele.court} → mémoire`,
+        ecouleMs: Date.now() - debut,
       });
+      await journaliser(
+        `début de la lecture du modèle et de l'initialisation du moteur (${modele.fichier})`,
+      );
+
+      // REPÈRE ANTI-CONFUSION : si l'initialisation dépasse une minute, on écrit
+      // une ligne de plus — l'application est VIVANTE et toujours sur la MÊME
+      // étape. Ce n'est pas une estimation de durée (« ça devrait prendre N s »),
+      // seulement le constat de ce qui dure. La veille est arrêtée dès que
+      // l'appel rend la main.
+      const debutInit = Date.now();
+      let veille: ReturnType<typeof setInterval> | null = setInterval(() => {
+        noter(
+          `toujours en cours : lecture + initialisation du moteur depuis ` +
+            `${Math.round((Date.now() - debutInit) / 1000)} s (constat, pas une estimation)`,
+        );
+      }, 60_000);
+      // `unref` QUAND IL EXISTE (Node, donc les tests) : ce minuteur ne doit
+      // JAMAIS retenir à lui seul le processus en vie. Dans la WebView — le cas
+      // réel — la méthode n'existe pas et le minuteur continue simplement de
+      // tourner : c'est même ce qu'on veut, il écrira « toujours en cours »
+      // toutes les minutes tant que l'étape dure, sans jamais l'interrompre.
+      (veille as unknown as { unref?: () => void }).unref?.();
+
+      try {
+        contexte = await plugin.initLlama({
+          // NOM DE FICHIER SEUL. Sur Android, `LlamaCpp.initContext` ne retient du
+          // chemin que `new File(modelPath).getName()`, puis cherche ce nom dans
+          // ses propres dossiers : getFilesDir()/<nom>, getFilesDir()/Documents/<nom>,
+          // getExternalFilesDir(null)/<nom>, /sdcard/Documents/<nom>, etc. L'appli
+          // pose donc le GGUF dans getFilesDir()/Documents (voir modeleLocal.ts) et
+          // passe ici le seul nom de fichier. On n'envoie PLUS `is_model_asset` :
+          // le TypeScript du plugin le transmet, mais le code Android ne le lit
+          // nulle part (vérifié dans LlamaCpp.java) — il était purement ignoré.
+          model: chemin,
+          // 4096 jetons : la boucle d'agent réinjecte le prompt système, la
+          // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
+          // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
+          n_ctx: opts.nCtx ?? 4096,
+          // Lots de pré-remplissage : jetons traités par passe. C'est le SEUL
+          // levier de vitesse de chargement réellement lu par le natif, et il
+          // compte davantage maintenant que les noyaux dotprod/i8mm sont compilés.
+          n_batch: opts.nBatch ?? 512,
+          // PAS de `n_gpu_layers` : le binaire du plugin ne contient aucun backend
+          // GPU (ni OpenCL ni Vulkan) et llama-model.cpp:1965-1971 met
+          // `act_gpu_layers = 0` quand la liste de devices est vide. L'envoyer ne
+          // déplaçait pas une seule couche — c'était un réglage décoratif.
+          //
+          // `n_threads` : RÉELLEMENT lu par le natif depuis le second patch
+          // (`patches/llama-cpp-capacitor+0.1.5+001+threads.patch`, jni.cpp :
+          // « Extract n_threads »). La valeur vient de `nbThreadsCalcul()` — la
+          // moitié des processeurs logiques, bornée à [1, 6] — parce que ggml
+          // attend TOUS ses threads à la barrière de fin d'étape : un thread sur
+          // un petit cœur ralentit l'étape entière. Le défaut natif, si on
+          // n'envoyait rien, applique exactement la même règle.
+          n_threads: opts.nThreads ?? nbThreadsCalcul(),
+          // use_mmap: true — LE MAPPAGE MÉMOIRE EST RÉTABLI, et c'est le DÉFAUT
+          // de llama.cpp (`common_params::use_mmap = true`, common.h:383 ; le
+          // JNI du plugin écrit la même valeur, jni.cpp:265). On ne l'envoie
+          // « que » pour qu'un lecteur de ce fichier ne se demande pas ce qui a
+          // été décidé.
+          //
+          // POURQUOI ON N'ÉCRIT PLUS `false` (l'erreur qui a été commise, et
+          // corrigée) : `use_mmap: false` fait LIRE les 398 Mo (ou 8 Go pour le
+          // 30B) en mémoire vive AVANT que le contexte existe. Sur un téléphone
+          // déjà chargé, c'est une allocation massive qui peut se mettre à
+          // échanger de la mémoire (thrashing) au lieu d'avancer — exactement le
+          // « ça rame sans finir » qu'on cherche à supprimer. Avec mmap, le
+          // système projette le fichier et n'amène les pages qu'à la demande :
+          // le chargement rend la main vite, et le coût se paie au fil des
+          // jetons, sans pic d'allocation. Le « gain » annoncé (charger plus vite
+          // jusqu'au premier jeton) n'a jamais été mesuré sur l'appareil — et il
+          // ne peut pas compenser un blocage.
+          use_mmap: true,
+          // `use_mlock: false` : verrouiller les pages empêcherait l'OS de
+          // récupérer de la RAM sous pression. Sur un téléphone, c'est une
+          // façon sûre de se faire tuer par le système.
+          use_mlock: false,
+        });
+        if (veille !== null) clearInterval(veille);
+        veille = null;
+        await journaliser("fin de l'initialisation du moteur (contexte créé)");
+      } catch (e) {
+        if (veille !== null) clearInterval(veille);
+        veille = null;
+        // L'ERREUR INTÉGRALE part dans la trace, avec sa pile quand elle existe.
+        noter(`ERREUR pendant la lecture + initialisation du moteur : ${texteErreurComplete(e)}`);
+        throw e;
+      }
+
       charge = id;
-      onProgres?.({ phase: "pret", pct: 100, fichier: "", ecouleMs: Date.now() - debut });
+      await journaliser(`chargement terminé en ${Date.now() - debut} ms`);
+      onProgres?.({
+        phase: "pret",
+        etape: "termine",
+        pct: 100,
+        fichier: "",
+        ecouleMs: Date.now() - debut,
+      });
     },
 
     async generer(options: GenerateOptions): Promise<string> {
@@ -510,6 +736,18 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       // fenêtre de décodage est honnête, et c'est cette fenêtre qu'on divise par
       // le nombre de jetons quand le moteur ne donne pas son propre débit.
       let premierJetonMs = 0;
+
+      // L'ÉTAPE EST ANNONCÉE AVANT LE CALCUL, pas après. Le premier calcul est
+      // celui qu'on guette : c'est là qu'un modèle fraîchement chargé peut
+      // encore se bloquer (pré-remplissage, allocation des buffers de calcul).
+      generations += 1;
+      const premierCalcul = generations === 1;
+      options.onEtape?.("premier_calcul");
+      await journaliser(
+        premierCalcul
+          ? "début du PREMIER calcul (pré-remplissage du prompt, puis décodage)"
+          : `début du calcul n°${generations} (${prompt.length} caractères de prompt)`,
+      );
 
       const resultat = await plugin.completion(
         {
@@ -530,7 +768,14 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         },
         (data) => {
           if (typeof data?.token === "string") {
-            if (!premierJetonMs) premierJetonMs = maintenant();
+            if (!premierJetonMs) {
+              premierJetonMs = maintenant();
+              // NOTÉ, pas attendu : le premier jeton vient d'arriver, on ne
+              // retarde pas l'affichage pour écrire une ligne. La file
+              // d'écriture la garde dans l'ordre.
+              noter(`premier jeton reçu après ${premierJetonMs - debut} ms (pré-remplissage terminé)`);
+              options.onEtape?.("premier_jeton");
+            }
             flux += data.token;
             options.onToken?.(data.token);
           }
@@ -550,6 +795,15 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         dernierTokParSeconde = mesure.tokParSeconde;
         options.onVitesse?.(mesure.tokParSeconde, mesure.jetons, mesure.msDepuisPremier);
       }
+
+      options.onEtape?.("termine");
+      await journaliser(
+        mesure
+          ? `fin de génération : ${mesure.jetons} jetons, ${mesure.tokParSeconde.toFixed(1)} tok/s mesurés, ` +
+              `${flux.length} caractères rendus`
+          : `fin de génération : débit NON MESURABLE (ni débit du moteur, ni couple ` +
+              `« compte de jetons + durée » exploitable), ${flux.length} caractères rendus`,
+      );
 
       // LE TEXTE EST RENDU TEL QUEL — c'est la seule forme qui laisse le
       // préfixe réutilisable. Un simple `.trim()` ici suffit à casser
@@ -599,6 +853,14 @@ export async function moteurNatifParDefaut(
    * téléchargé.
    */
   cheminModele: (m: ModeleGguf) => string,
+  /**
+   * VÉRIFICATION du fichier sur le disque, à des fins de TRACE uniquement. En
+   * pratique `chercherModele(id)` de `modeleLocal.ts`. Facultative : sans elle le
+   * moteur fonctionne exactement pareil, la trace dit juste qu'on n'a pas
+   * regardé. Elle est branchée ici plutôt qu'importée, pour que ce module ne
+   * dépende pas de `@capacitor/filesystem`.
+   */
+  verifierFichier?: (m: ModeleGguf) => Promise<EtatFichierModele>,
 ): Promise<MoteurNatif> {
   // Import dynamique : jamais résolu tant que cette branche n'est pas exécutée.
   // C'est précisément ce qui garde le build navigateur intact.
@@ -625,5 +887,5 @@ export async function moteurNatifParDefaut(
   const libere = mod.releaseAllLlama?.bind(mod);
   if (libere) adaptateur.releaseAllLlama = () => libere();
 
-  return creerMoteurNatif({ cheminModele, chargerPlugin: async () => adaptateur });
+  return creerMoteurNatif({ cheminModele, chargerPlugin: async () => adaptateur, verifierFichier });
 }

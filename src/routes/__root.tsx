@@ -1,6 +1,15 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-router";
 import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
+// La TRACE de démarrage (fichier lisible sur le téléphone) est lancée ici, au
+// tout premier rendu : elle doit exister AVANT qu'on ait besoin d'elle pour
+// diagnostiquer un chargement bloqué. Voir src/ai/journal.ts.
+import { JournalDemarrage } from "@/components/journal-demarrage";
+// LA TRACE NATIVE à l'écran : le fichier écrit par jni.cpp (voir
+// patches/llama-cpp-capacitor+0.1.5+003+diagnostic-natif.patch) vit dans la
+// mémoire privée de l'appli — illisible par un gestionnaire de fichiers, et cet
+// appareil n'a ni `adb` ni rapport de bug. Ce panneau est donc le seul lecteur.
+import { TraceNative } from "@/components/trace-native";
 import appCss from "../styles.css?url";
 
 const APP_NAME = "Studio local";
@@ -34,6 +43,8 @@ export const Route = createRootRoute({
         <HeadContent />
       </head>
       <body className="antialiased">
+        <JournalDemarrage />
+        <TraceNative />
         <PreviewHostBridge />
         <AuthProvider>
           <Outlet />

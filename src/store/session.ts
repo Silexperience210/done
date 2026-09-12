@@ -10,7 +10,14 @@ import {
 } from "@/lib/edge0";
 import { estApplicationNative } from "@/ai/moteur";
 import type { CheminManuel } from "@/ai/modeleLocal";
-import type { GenerateOptions, LocalModelId, PhaseChargement, ProgresChargement } from "@/ai/types";
+import {
+  libelleEtape,
+  type EtapeChargement,
+  type GenerateOptions,
+  type LocalModelId,
+  type PhaseChargement,
+  type ProgresChargement,
+} from "@/ai/types";
 import { resolveLocalTurn } from "@/lib/local-apps";
 
 /**
@@ -61,7 +68,7 @@ function chargerMoteur(): Promise<MoteurActif> {
       // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
       // donc le build web reste intact.
       const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-      const { chargerPuisTelecharger, cheminModele, telechargerModele } =
+      const { chargerPuisTelecharger, cheminModele, chercherModele, telechargerModele } =
         await import("@/ai/modeleLocal");
       // ORDRE : on CHARGE D'ABORD, on ne télécharge qu'en secours. Le plugin
       // natif cherche le GGUF par son nom de fichier dans huit emplacements —
@@ -82,7 +89,15 @@ function chargerMoteur(): Promise<MoteurActif> {
       // La réutilisation du préfixe de prompt, elle, existe déjà et
       // automatiquement, côté natif (`cap-completion.cpp:178`), à condition que
       // le texte réinjecté soit identique : voir `nettoyerPourAffichage`.
-      const natif = await moteurNatifParDefaut((m) => cheminModele(m.id));
+      const natif = await moteurNatifParDefaut(
+        (m) => cheminModele(m.id),
+        // VÉRIFICATION DU FICHIER, branchée pour la TRACE seulement : elle
+        // interroge les huit emplacements où le moteur natif cherchera le GGUF
+        // (voir chercherModele) et écrit dans le journal lequel contient le
+        // fichier, avec sa taille. Elle ne décide de RIEN : le natif reste seul
+        // juge de ce qu'il peut ouvrir, et son échec éventuel ne bloque pas.
+        async (m) => chercherModele(m.id),
+      );
       return {
         nom: "natif",
         // charger → (si échec) télécharger → recharger. Si le modèle est déjà là
@@ -195,9 +210,9 @@ type SessionState = {
 
 export const useSession = create<SessionState>((set, get) => ({
   // MODÈLE PAR DÉFAUT : le 0,5B (398 Mo), PAS le 1,5B (986 Mo).
-  // Le premier lancement impose un téléchargement ; sur le 1,5B il dure
-  // plusieurs minutes sans qu'on puisse vérifier quoi que ce soit d'autre entre
-  // temps. Le 0,5B divise ce temps par ~2,5, ce qui permet de tester la
+  // Le premier lancement impose un téléchargement : 986 Mo pour le 1,5B contre
+  // 398 Mo pour le 0,5B, et rien d'autre ne peut avancer tant qu'il dure. Le
+  // 0,5B est ~2,5 fois plus léger, ce qui permet de tester la
   // MÉCANIQUE (téléchargement → chargement natif → premier jeton) rapidement.
   // Les deux autres modèles restent dans le sélecteur (`MODELS`, edge0.ts) :
   // l'utilisateur monte en qualité quand la chaîne est prouvée. C'est un défaut,
@@ -398,7 +413,19 @@ export const useSession = create<SessionState>((set, get) => ({
       // raison que le reste des modules natifs : ne pas les faire résoudre par le
       // build web au chargement.
       const { tailleLisible } = await import("@/ai/modeleLocal");
+      // LA TRACE (voir journal.ts) : les mêmes étapes que celles affichées, mais
+      // dans un fichier — l'utilisateur n'a que son téléphone, pas de `adb`.
+      const { etatJournal, journaliser: tracer } = await import("@/ai/journal");
       let phase: PhaseChargement = "telechargement";
+      // DERNIÈRE ÉTAPE RÉELLE annoncée par le moteur. C'est elle qu'on affiche
+      // pendant le chargement : « recherche du modèle… », « lecture du modèle et
+      // initialisation du moteur… ». Un nom d'étape ne peut être affiché que si
+      // l'étape tourne vraiment — donc l'écran ne peut pas mentir sur l'avancement.
+      let derniereEtape: EtapeChargement | null = null;
+      await tracer(
+        `demande traitée : modèle « ${get().model} » (${profile.name}), ` +
+          `état du moteur avant chargement : ${get().engine}`,
+      );
       // Dernier état de téléchargement SANS les secondes : l'horloge ci-dessous
       // le réaffiche en rafraîchissant le temps, pour que l'écran bouge même si
       // le plugin cesse d'émettre des octets.
@@ -406,9 +433,9 @@ export const useSession = create<SessionState>((set, get) => ({
       // FERMETURE DU LIBELLÉ. `phaseClose` est la garde qui empêche l'horloge de
       // réécrire quoi que ce soit après une réussite ; `arretHorloge` la
       // supprime pour de bon. Sans cette fermeture, le libellé restait ouvert :
-      // une horloge d'une seconde continuait d'écrire « Préparation du moteur…
-      // N s » alors que le moteur était chargé et que le modèle avait déjà
-      // répondu — jusqu'à afficher des centaines de secondes.
+      // une horloge d'une seconde continuait d'écrire « lecture du modèle… N s »
+      // alors que le moteur était chargé et que le modèle avait déjà répondu —
+      // jusqu'à afficher des centaines de secondes.
       let phaseClose = false;
       let horloge: ReturnType<typeof setInterval> | null = null;
       const arretHorloge = () => {
@@ -443,7 +470,16 @@ export const useSession = create<SessionState>((set, get) => ({
           }
           const sec = Math.round((Date.now() - debutChargement) / 1000);
           if (phase === "initialisation") {
-            thinking = `Préparation du moteur… ${sec} s. La première fois, la compilation du modèle peut prendre plusieurs minutes sur un téléphone.`;
+            // CE QUI SE PASSE VRAIMENT ICI, et rien d'autre : l'appel `initLlama`
+            // — lecture du GGUF PAR PROJECTION MÉMOIRE (`use_mmap: true`, le
+            // défaut de llama.cpp), puis création du contexte et du cache KV.
+            // C'EST UN SEUL APPEL NATIF : on ne le découpe donc pas en deux
+            // étapes à l'écran, ce serait inventer une frontière que le code ne
+            // franchit pas. AUCUNE compilation n'a lieu sur l'appareil : les
+            // noyaux ARM sont compilés au BUILD (CI) et livrés dans
+            // `libllama-cpp-arm64.so`. Le nom de l'étape dit ce qui tourne ; le
+            // nombre de secondes est MESURÉ, jamais estimé.
+            thinking = `${libelleEtape(derniereEtape ?? "initialisation_moteur")} ${sec} s`;
           } else if (phase === "telechargement" && etatTelechargement) {
             // On rappelle le dernier état connu et on remet les SECONDES à jour :
             // un silence du plugin se voit tout de suite, et le délai de garde de
@@ -459,6 +495,7 @@ export const useSession = create<SessionState>((set, get) => ({
       try {
         await moteurActif.charger(get().model, (p) => {
           phase = p.phase;
+          if (p.etape) derniereEtape = p.etape;
           const sec = Math.round(p.ecouleMs / 1000);
           if (p.phase === "telechargement") {
             // Octets réels quand le plugin les donne, repli sur la taille connue
@@ -472,14 +509,30 @@ export const useSession = create<SessionState>((set, get) => ({
             thinking = `${etatTelechargement} — ${sec} s`;
             set({ engineNote: `${etatTelechargement} — ${sec} s` });
           } else if (p.phase === "initialisation") {
-            thinking = `Préparation du moteur… ${sec} s`;
-            set({ engineNote: `préparation du moteur — ${sec} s` });
+            // LE NOM DE L'ÉTAPE RÉELLE, et seulement lui : « recherche du modèle
+            // sur le téléphone… » ou « lecture du modèle et initialisation du
+            // moteur… ». C'est ce qui distingue « occupé » de « bloqué » sans
+            // inventer de durée : le libellé ne peut apparaître que si l'étape
+            // tourne, et les secondes affichées sont mesurées.
+            const libelle = libelleEtape(p.etape ?? "initialisation_moteur");
+            thinking = `${libelle} ${sec} s`;
+            set({ engineNote: `${libelle} — ${sec} s` });
           } else {
             // « pret » : le chargement est RÉELLEMENT terminé. On ferme ICI, sur
             // `p.ecouleMs` — le temps que le moteur lui-même a mesuré —, au lieu
             // d'attendre la fin de la boucle d'agent et de laisser le libellé
             // ouvert entre-temps.
             clorePhase(p.ecouleMs);
+            // OÙ EST LA TRACE, écrit dans la trace elle-même : si l'emplacement
+            // n'est PAS ouvrable par l'utilisateur (repli), c'est dit ici — sans
+            // quoi il chercherait un fichier que son gestionnaire ne montre pas.
+            const journal = etatJournal();
+            if (journal.chemin) {
+              void tracer(
+                `trace de cette session : ${journal.chemin}` +
+                  (journal.visible ? "" : " — emplacement NON ouvrable depuis le téléphone"),
+              );
+            }
           }
           patchAssistant({ memoryGb: profile.idleGb });
         });
@@ -526,23 +579,37 @@ export const useSession = create<SessionState>((set, get) => ({
               onToken?.(t);
               patchAssistant(pulse(true));
             },
+            onEtape: (etape) => {
+              // L'ÉTAPE RÉELLE DU MOTEUR, telle quelle : « premier calcul… »
+              // pendant le pré-remplissage, « premier jeton reçu… » à partir du
+              // premier jeton. C'est ce qui évite un écran muet — donc
+              // indiscernable d'un blocage — pendant le premier calcul, qui est
+              // justement le moment où un modèle fraîchement chargé peut encore
+              // se bloquer. Aucune durée n'est annoncée : elle serait inventée.
+              // « terminé » est ignoré ici : c'est la mesure de débit ci-dessous
+              // qui prend la suite, avec des chiffres réels.
+              if (etape === "termine") return;
+              thinking = libelleEtape(etape);
+              patchAssistant(pulse(true));
+            },
             onVitesse: (tokParSeconde, jetons, ms) => {
-              // MESURE RÉELLE, écrite en clair dans le fil : le nombre de jetons
-              // vient du moteur, la durée de la fenêtre de décodage. On ne
-              // prétend pas que llama.cpp a sorti ce débit — sur Android il ne le
-              // calcule pas — on dit qu'il a été MESURÉ sur cet appareil.
+              // Chiffres rendus par le moteur, écrits tels quels dans le fil. On
+              // n'écrit PLUS « mesuré sur cet appareil » : le compte de jetons du
+              // moteur (`tokens_predicted`) n'est fiable qu'une fois le correctif
+              // natif compilé dans le .so — tant que ce n'est pas prouvé, une
+              // telle mention serait une prétention de plus.
               const morceaux = [
                 jetons > 0 ? `${jetons} jetons` : null,
                 `${tokParSeconde.toFixed(1)} tok/s`,
                 ms > 0 ? `${dureeLisible(ms)} de décodage` : null,
               ].filter((m): m is string => m !== null);
-              thinking = `${morceaux.join(" · ")} — mesuré sur cet appareil`;
+              thinking = morceaux.join(" · ");
               patchAssistant(pulse(true));
-              // APRÈS le rafraîchissement en direct : c'est la mesure qui reste
-              // affichée, pas l'estimation intermédiaire.
+              // APRÈS le rafraîchissement en direct : c'est le chiffre qui reste
+              // affiché, pas l'estimation intermédiaire.
               set({
                 tokPerSec: arrondiVitesse(tokParSeconde),
-                engineNote: `${moteurActif.device()} · ${tokParSeconde.toFixed(1)} tok/s mesurés`,
+                engineNote: `${moteurActif.device()} · ${tokParSeconde.toFixed(1)} tok/s`,
               });
             },
           });
@@ -621,15 +688,16 @@ export const useSession = create<SessionState>((set, get) => ({
         ),
         streaming: false,
         memoryGb: MODELS[s.model].idleGb,
-        // Le débit MESURÉ pendant la génération reste affiché. `null` veut dire
-        // « rien de mesurable » : on laisse 0, et l'interface écrit « — » au lieu
-        // de « 0,0 tok/s », qui se lirait comme une mesure.
+        // Le débit du moteur reste affiché. `null` veut dire « rien à montrer » :
+        // on laisse 0, et l'interface écrit « — » au lieu de « 0,0 tok/s », qui
+        // se lirait comme un chiffre relevé. Aucun mot « mesuré » : le compte de
+        // jetons n'est fiable qu'une fois le correctif natif compilé dans le .so.
         tokPerSec: vitesse === null ? 0 : arrondiVitesse(vitesse),
         engine: "pret",
         engineNote:
           vitesse === null
             ? moteurActif.device()
-            : `${moteurActif.device()} · ${vitesse.toFixed(1)} tok/s mesurés`,
+            : `${moteurActif.device()} · ${vitesse.toFixed(1)} tok/s`,
         // Le modèle est chargé : plus rien à télécharger à la main.
         modeleManuel: null,
       }));
@@ -647,8 +715,37 @@ export const useSession = create<SessionState>((set, get) => ({
       // téléchargement ne progresse plus depuis 60 s »…). La réponse de
       // l'assistant porte l'échec, jamais un faux contenu.
       const { cheminManuel, messageErreurActionnable } = await import("@/ai/modeleLocal");
+      const { etatJournal, journaliser: tracerErreur, texteErreurComplete } = await import(
+        "@/ai/journal"
+      );
       const brut = e instanceof Error ? e.message : "moteur local indisponible";
       const msg = messageErreurActionnable(brut, get().model);
+      // L'ÉCHEC PART DANS LA TRACE, TEXTE INTÉGRAL compris : c'est la seule
+      // forme sous laquelle on saura plus tard pourquoi ça n'a pas démarré, sans
+      // dépendre de ce que l'écran a bien voulu montrer.
+      await tracerErreur(`ÉCHEC du chargement/moteur : ${texteErreurComplete(e)}`);
+      // OÙ LIRE LA TRACE — nommé DANS le message, parce que c'est exactement ce
+      // qu'on demande à l'utilisateur après un échec : aller voir ce fichier.
+      // Quand l'emplacement retenu est un repli que son gestionnaire de fichiers
+      // ne montre PAS, on le dit aussi : le laisser chercher un fichier
+      // invisible serait pire que de ne rien dire.
+      const journal = etatJournal();
+      let mentionTrace = "";
+      if (journal.actif && journal.chemin) {
+        mentionTrace = journal.visible
+          ? ` Trace détaillée : ${journal.chemin} — ouvre-la avec un gestionnaire de fichiers.`
+          : ` Trace détaillée : ${journal.chemin}, emplacement que le gestionnaire de fichiers du téléphone ne montre PAS.`;
+      } else if (journal.refus.length > 0) {
+        // Le journal a été TENTÉ et aucun emplacement n'a accepté l'écriture :
+        // c'est une information à part entière, et il FAUT la donner — sinon
+        // l'utilisateur cherche un fichier qui n'existe pas. Les erreurs brutes
+        // des emplacements refusés sont citées : ce sont elles qui diront
+        // pourquoi (permission, stockage non monté…).
+        mentionTrace = ` Trace indisponible, aucun emplacement du téléphone n'a accepté l'écriture : ${journal.refus
+          .map((r) => `${r.chemin} → ${r.erreur}`)
+          .join(" ; ")}.`;
+      }
+      const msgAffiche = msg + mentionTrace;
       // Le modèle est introuvable : on affiche le chemin MANUEL (nom exact du
       // fichier + URL + dossier Download), qui ne dépend ni du réseau ni de
       // `downloadFile`. C'est ce qui débloque l'utilisateur quand la livraison
@@ -663,12 +760,12 @@ export const useSession = create<SessionState>((set, get) => ({
       // d'ERREUR : le texte dit explicitement que le modèle n'a pas répondu et
       // pourquoi. Ce n'est pas le modèle qui parle, c'est l'appli qui rapporte
       // l'échec réel.
-      thinking = msg;
-      const echec = `Le modèle n'a pas répondu : ${msg}`;
+      thinking = msgAffiche;
+      const echec = `Le modèle n'a pas répondu : ${msgAffiche}`;
       set((s) => ({
         streaming: false,
         engine: "erreur",
-        engineNote: msg,
+        engineNote: msgAffiche,
         modeleManuel: introuvable,
         memoryGb: MODELS[s.model].idleGb,
         tokPerSec: 0,

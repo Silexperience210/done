@@ -17,6 +17,50 @@ export type LocalModelId = "coder3b" | "coder15" | "coder05";
 /** Phases d'un chargement de modèle, dans l'ordre où elles arrivent. */
 export type PhaseChargement = "telechargement" | "initialisation" | "pret";
 
+/**
+ * ÉTAPES RÉELLEMENT TRAVERSÉES par le code pendant un chargement — nommées, pas
+ * chiffrées. Sert à distinguer « occupé » de « bloqué » à l'écran : un
+ * pourcentage qui n'avance plus ne dit pas si le moteur travaille ou s'il est
+ * figé, alors que le nom de l'étape en cours, lui, ne peut être affiché que par
+ * l'étape qui tourne vraiment.
+ *
+ * Chaque valeur correspond à un appel réel, indivisible côté JavaScript :
+ *
+ *  - `recherche_modele` : on interroge le disque (`stat`) aux emplacements où
+ *    le moteur natif cherchera le GGUF (voir `chercherModele`, modeleLocal.ts).
+ *  - `initialisation_moteur` : `initLlama` est en cours. CETTE étape réunit la
+ *    lecture du GGUF ET la création du contexte : c'est UN SEUL appel natif,
+ *    qui ne peut pas être découpé depuis ici. On ne prétend donc pas afficher
+ *    « lecture » séparément d'« initialisation » — ce serait inventer une
+ *    frontière que le code ne franchit pas.
+ *  - `premier_calcul` : la première évaluation de prompt (premier appel de
+ *    `completion`, dans `generer`).
+ *  - `premier_jeton` : le premier jeton réellement rendu par le moteur.
+ *  - `termine` : la génération est finie, la mesure est faite.
+ */
+export type EtapeChargement =
+  | "recherche_modele"
+  | "initialisation_moteur"
+  | "premier_calcul"
+  | "premier_jeton"
+  | "termine";
+
+/** Libellé d'affichage d'une étape — le SEUL endroit qui écrit du texte à l'écran. */
+export function libelleEtape(etape: EtapeChargement): string {
+  switch (etape) {
+    case "recherche_modele":
+      return "recherche du modèle sur le téléphone…";
+    case "initialisation_moteur":
+      return "lecture du modèle et initialisation du moteur…";
+    case "premier_calcul":
+      return "premier calcul…";
+    case "premier_jeton":
+      return "premier jeton reçu…";
+    case "termine":
+      return "terminé";
+  }
+}
+
 export type ProgresChargement = {
   phase: PhaseChargement;
   /** 0-100, pertinent surtout en phase de téléchargement. */
@@ -39,6 +83,13 @@ export type ProgresChargement = {
    * connue du GGUF.
    */
   octetsTotal?: number;
+  /**
+   * ÉTAPE EN COURS, quand le code en est une. Facultative : tout appelant qui
+   * n'en fournit pas reste valide, et l'affichage retombe alors sur la phase.
+   * Voir `libelleEtape` : c'est ce qui permet d'écrire à l'écran « premier
+   * calcul… » plutôt que de laisser un écran muet qui ressemble à un blocage.
+   */
+  etape?: EtapeChargement;
 };
 
 export type GenerateOptions = {
@@ -59,6 +110,14 @@ export type GenerateOptions = {
    * pas de valeur qu'un 0,0 qui se fait passer pour une mesure.
    */
   onVitesse?: (tokParSeconde: number, jetons: number, msDepuisPremier: number) => void;
+  /**
+   * ÉTAPE réelle atteinte pendant la génération (« premier calcul », « premier
+   * jeton », « terminé »). Facultative, purement informative : elle sert à
+   * l'écran, qui peut dire ce que le moteur est en train de faire au lieu de
+   * laisser un bloc vide impossible à distinguer d'un figement. Aucune durée
+   * n'y est jamais annoncée.
+   */
+  onEtape?: (etape: EtapeChargement) => void;
   signal?: AbortSignal;
   /**
    * Schéma JSON (chaîne) contraignant la sortie vers un JSON valide. Le moteur

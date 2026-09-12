@@ -1,0 +1,596 @@
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java b/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java
+index b037159..02e5750 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java
++++ b/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java
+@@ -257,6 +257,39 @@ public class LlamaCpp {
+         this.context = context;
+     }
+ 
++    // ─── FLUX DE JETONS VERS L'ÉCOUTEUR JS (@LlamaCpp_onToken) ───────────────
++    // Côté JS, `LlamaContext.completion(params, callback)` enregistre un
++    // écouteur `@LlamaCpp_onToken` (dist/esm/index.js:8,260) et attend un corps
++    // `{ contextId, tokenResult }`. Rien, avant ce correctif, n'émettait cet
++    // évènement : le natif ne rappelait jamais Java et personne n'appelait
++    // `notifyListeners`. Le flux de jetons était donc définitivement muet.
++    public interface TokenListener {
++        void onToken(int contextId, String tokenText);
++    }
++
++    private volatile TokenListener tokenListener;
++
++    public void setTokenListener(TokenListener listener) {
++        this.tokenListener = listener;
++    }
++
++    // APPELÉE PAR LE NATIF (jni.cpp, completionNative) une fois par jeton
++    // généré, sur le fil JNI de l'appel. Elle retrouve l'identifiant JS du
++    // contexte à partir de son identifiant natif, puis remonte le jeton.
++    public void onTokenFromNative(long nativeContextId, String tokenText) {
++        TokenListener listener = this.tokenListener;
++        if (listener == null) {
++            return;
++        }
++        for (Map.Entry<Integer, LlamaContext> entry : contexts.entrySet()) {
++            LlamaContext ctx = entry.getValue();
++            if (ctx != null && ctx.getNativeContextId() == nativeContextId) {
++                listener.onToken(entry.getKey(), tokenText);
++                return;
++            }
++        }
++    }
++
+     // Native method declarations
+     private native long initContextNative(String modelPath, String[] searchPaths, JSObject params);
+     private native void releaseContextNative(long nativeContextId);
+@@ -569,6 +602,25 @@ public class LlamaCpp {
+     }
+ 
+     public void releaseAllContexts(LlamaCallback<Void> callback) {
++        // Libérer VRAIMENT le natif, contexte par contexte.
++        //
++        // `contexts.clear()` seul ne vidait que la table Java : chaque modèle
++        // restait chargé dans la table C++ de jni.cpp (`contexts`, un
++        // `std::map<long, unique_ptr<llama_cap_context>>`). Un modèle entier —
++        // ses poids, sa KV — fuitait donc à chaque changement de modèle. On
++        // reproduit ici, pour CHAQUE contexte, ce que fait `releaseContext`
++        // (releaseContextNative + retrait), avant de vider la table Java.
++        try {
++            for (Integer key : new ArrayList<>(contexts.keySet())) {
++                LlamaContext context = contexts.get(key);
++                if (context != null && context.getNativeContextId() >= 0) {
++                    releaseContextNative(context.getNativeContextId());
++                }
++            }
++        } catch (Exception e) {
++            callback.onResult(LlamaResult.failure(new LlamaError("Failed to release all contexts: " + e.getMessage())));
++            return;
++        }
+         contexts.clear();
+         callback.onResult(LlamaResult.success(null));
+     }
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCppPlugin.java b/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCppPlugin.java
+index f2d7628..7e3c5c0 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCppPlugin.java
++++ b/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCppPlugin.java
+@@ -28,6 +28,21 @@ public class LlamaCppPlugin extends Plugin {
+         super.load();
+         // Initialize implementation with context
+         implementation = new LlamaCpp(getContext());
++        // Relier le flux de jetons natif à l'évènement JS `@LlamaCpp_onToken`.
++        // C'est ICI que le pont se ferme : le natif (jni.cpp) appelle
++        // `LlamaCpp.onTokenFromNative`, qui remonte ici, et `notifyListeners`
++        // émet l'évènement que le JS écoute. Le corps attendu est
++        // `{ contextId, tokenResult }`, avec `tokenResult.token`
++        // (dist/esm/index.js:260-265 ; consommé par src/ai/moteurNatif.ts).
++        // Sans cette liaison, l'écouteur JS ne recevait jamais rien.
++        implementation.setTokenListener((contextId, tokenText) -> {
++            JSObject tokenResult = new JSObject();
++            tokenResult.put("token", tokenText);
++            JSObject data = new JSObject();
++            data.put("contextId", contextId);
++            data.put("tokenResult", tokenResult);
++            notifyListeners("@LlamaCpp_onToken", data);
++        });
+         Log.i(TAG, "LlamaCppPlugin loaded successfully");
+     }
+ 
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+index 8db565e..c08a266 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
++++ b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+@@ -1,6 +1,12 @@
+ #include "jni-utils.h"
+ #include "cap-llama.h"
+ #include "cap-completion.h"
++// `json_schema_to_grammar(...)` vient de json-schema-to-grammar.h ; `json`
++// (= nlohmann::ordered_json) est déjà tiré par cap-completion.h:7-10. Sert à
++// convertir le `json_schema` reçu du JS en grammaire GBNF. L'en-tête est dans le
++// dossier include (CMakeLists.txt:8-11) et le .cpp correspondant est compilé
++// (CMakeLists.txt:100).
++#include "json-schema-to-grammar.h"
+ #include <android/log.h>
+ #include <cstring>
+ #include <memory>
+@@ -288,8 +294,18 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+         cparams.n_ctx = 2048;
+         cparams.n_batch = 512;
+         cparams.n_gpu_layers = 0;
+-        cparams.rope_freq_base = 10000.0f;
+-        cparams.rope_freq_scale = 1.0f;
++        // RoPE : NE PAS écrire de valeur en dur ici.
++        //
++        // `cparams.rope_freq_base = 10000.0f` était codé en dur. Qwen2.5 déclare
++        // pourtant `rope_freq_base = 1 000 000` dans son GGUF (contexte long) :
++        // cette ligne écrasait donc la valeur du modèle par celle, dix fois plus
++        // petite, de la génération précédente.
++        //
++        // La valeur par DÉFAUT de `common_params` est 0.0 pour les deux champs
++        // (common.h:285-286), et 0 signifie précisément « prends celle du GGUF »
++        // dans llama.cpp. On les laisse donc à 0 : le modèle décide.
++        // (L'ancien `rope_freq_scale = 1.0f` avait le même défaut : 1.0 désactive
++        // tout étirement de RoPE déclaré par le modèle.)
+         cparams.use_mmap = true;
+         cparams.use_mlock = false;
+         cparams.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
+@@ -333,7 +349,13 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+                 jmethodID getStringMethod = nullptr;
+                 
+                 try {
+-                    getBooleanMethod = env->GetMethodID(jsObjectClass, "getBoolean", "(Ljava/lang/String;)Ljava/lang/Boolean;");
++                    // `JSObject.getBoolean(String) -> Boolean` N'EXISTE PAS : la
++                    // classe ne déclare que `getBool(String) -> Boolean` et
++                    // `getBoolean(String, Boolean)` à DEUX arguments
++                    // (JSObject.java:74-87). `GetMethodID` renvoyait donc NULL,
++                    // et `embedding`, `use_mmap` et `use_mlock` n'étaient JAMAIS
++                    // lus : ils gardaient le défaut de `common_params`.
++                    getBooleanMethod = env->GetMethodID(jsObjectClass, "getBool", "(Ljava/lang/String;)Ljava/lang/Boolean;");
+                     if (env->ExceptionCheck()) {
+                         env->ExceptionClear();
+                         getBooleanMethod = nullptr;
+@@ -345,7 +367,10 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+                         getIntegerMethod = nullptr;
+                     }
+                     
+-                    getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)Ljava/lang/Double;");
++                    // `getDouble(String)` rend un `double` PRIMITIF (hérité de
++                    // JSONObject) : la signature est `)D`, pas
++                    // `)Ljava/lang/Double;` (cette surcharge objet n'existe pas).
++                    getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)D");
+                     if (env->ExceptionCheck()) {
+                         env->ExceptionClear();
+                         getDoubleMethod = nullptr;
+@@ -653,102 +678,178 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
+             return nullptr;
+         }
+         
+-        // Extract parameters from JSObject using compatible API
++        // ─── MÉTHODES DE LECTURE DES PARAMÈTRES — SIGNATURES VÉRIFIÉES ───────
++        // Contre `com/getcapacitor/JSObject.java` (extends org.json.JSONObject) :
++        //   getString(String)      -> String      (JSObject.java:45)
++        //   getInteger(String)     -> Integer     (JSObject.java:61)
++        //   getBool(String)        -> Boolean     (JSObject.java:85)
++        //   getDouble(String)      -> double      (PRIMITIF, hérité de JSONObject)
++        //   optJSONArray(String)   -> JSONArray   (hérité de JSONObject)
++        //
++        // CE QUI ÉTAIT FAUX, et pourquoi la lecture échouait EN SILENCE :
++        //   - `getDouble` était cherché en version OBJET
++        //     `(Ljava/lang/String;)Ljava/lang/Double;` : cette surcharge n'existe
++        //     pas. `GetMethodID` rendait NULL, donc `temperature` n'était JAMAIS
++        //     lu (le code retombait sur 0.7 sans rien dire).
++        //   - les booléens passaient par `getBoolean(String) -> Boolean`, qui
++        //     n'existe pas non plus dans JSObject — seule `getBool(String)` (un
++        //     argument) existe — d'où un identifiant NULL et des paramètres muets.
++        // Aucune de ces clés n'était signalée : elles gardaient simplement leurs
++        // valeurs par défaut.
+         jclass jsObjectClass = env->GetObjectClass(params);
+-        
+-        // Try to get method IDs and handle exceptions
+-        jmethodID getStringMethod = nullptr;
+-        jmethodID getIntegerMethod = nullptr; 
+-        jmethodID getDoubleMethod = nullptr;
+-        
+-        // Clear any pending exceptions first
++
+         if (env->ExceptionCheck()) {
+             env->ExceptionClear();
+         }
+-        
+-        try {
+-            getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+-            if (env->ExceptionCheck()) {
+-                env->ExceptionClear();
+-                getStringMethod = nullptr;
+-            }
+-            
+-            getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;)Ljava/lang/Integer;");
+-            if (env->ExceptionCheck()) {
+-                env->ExceptionClear();
+-                getIntegerMethod = nullptr;
+-            }
+-            
+-            getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)Ljava/lang/Double;");
+-            if (env->ExceptionCheck()) {
+-                env->ExceptionClear();
+-                getDoubleMethod = nullptr;
+-            }
+-        } catch (...) {
+-            LOGE("Exception getting JSObject method IDs");
+-            if (env->ExceptionCheck()) {
++
++        jmethodID getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
++        if (env->ExceptionCheck()) { env->ExceptionClear(); getStringMethod = nullptr; }
++        jmethodID getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;)Ljava/lang/Integer;");
++        if (env->ExceptionCheck()) { env->ExceptionClear(); getIntegerMethod = nullptr; }
++        jmethodID getBoolMethod = env->GetMethodID(jsObjectClass, "getBool", "(Ljava/lang/String;)Ljava/lang/Boolean;");
++        if (env->ExceptionCheck()) { env->ExceptionClear(); getBoolMethod = nullptr; }
++        jmethodID getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)D");
++        if (env->ExceptionCheck()) { env->ExceptionClear(); getDoubleMethod = nullptr; }
++        jmethodID optJSONArrayMethod = env->GetMethodID(jsObjectClass, "optJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
++        if (env->ExceptionCheck()) { env->ExceptionClear(); optJSONArrayMethod = nullptr; }
++
++        // Lecteurs sûrs : exception JNI nettoyée, valeur par défaut rendue.
++        auto lireString = [&](const char* cle, const std::string& defaut) -> std::string {
++            if (getStringMethod == nullptr) return defaut;
++            jstring k = jni_utils::string_to_jstring(env, cle);
++            jstring v = (jstring) env->CallObjectMethod(params, getStringMethod, k);
++            std::string out = defaut;
++            if (v != nullptr && !env->ExceptionCheck()) {
++                out = jni_utils::jstring_to_string(env, v);
++                env->DeleteLocalRef(v);
++            } else if (env->ExceptionCheck()) {
+                 env->ExceptionClear();
+             }
+-        }
+-        
+-        // Get prompt with safe method calls
+-        std::string prompt_str = "Once upon a time";
+-        jint n_predict = 50;
+-        jdouble temperature = 0.7;
+-        
+-        if (getStringMethod) {
+-            jstring promptKey = jni_utils::string_to_jstring(env, "prompt");
+-            jstring promptObj = (jstring)env->CallObjectMethod(params, getStringMethod, promptKey);
+-            if (promptObj && !env->ExceptionCheck()) {
+-                prompt_str = jni_utils::jstring_to_string(env, promptObj);
++            env->DeleteLocalRef(k);
++            return out;
++        };
++
++        auto lireInt = [&](const char* cle, jint defaut) -> jint {
++            if (getIntegerMethod == nullptr) return defaut;
++            jstring k = jni_utils::string_to_jstring(env, cle);
++            jobject v = env->CallObjectMethod(params, getIntegerMethod, k);
++            jint out = defaut;
++            if (v != nullptr && !env->ExceptionCheck()) {
++                jclass integerClass = env->FindClass("java/lang/Integer");
++                jmethodID intValueMethod = env->GetMethodID(integerClass, "intValue", "()I");
++                if (intValueMethod != nullptr && !env->ExceptionCheck()) {
++                    out = env->CallIntMethod(v, intValueMethod);
++                }
++                if (env->ExceptionCheck()) { env->ExceptionClear(); out = defaut; }
++                env->DeleteLocalRef(v);
+             } else if (env->ExceptionCheck()) {
+                 env->ExceptionClear();
+             }
+-        }
+-        
+-        // Get n_predict with safe method calls
+-        if (getIntegerMethod) {
+-            jstring nPredictKey = jni_utils::string_to_jstring(env, "n_predict");
+-            jobject nPredictObj = env->CallObjectMethod(params, getIntegerMethod, nPredictKey);
+-            if (nPredictObj && !env->ExceptionCheck()) {
+-                n_predict = env->CallIntMethod(nPredictObj, env->GetMethodID(env->FindClass("java/lang/Integer"), "intValue", "()I"));
+-                if (env->ExceptionCheck()) {
+-                    env->ExceptionClear();
+-                    n_predict = 50; // fallback
++            env->DeleteLocalRef(k);
++            return out;
++        };
++
++        auto lireBool = [&](const char* cle, bool defaut) -> bool {
++            if (getBoolMethod == nullptr) return defaut;
++            jstring k = jni_utils::string_to_jstring(env, cle);
++            jobject v = env->CallObjectMethod(params, getBoolMethod, k);
++            bool out = defaut;
++            if (v != nullptr && !env->ExceptionCheck()) {
++                jclass booleanClass = env->FindClass("java/lang/Boolean");
++                jmethodID booleanValueMethod = env->GetMethodID(booleanClass, "booleanValue", "()Z");
++                if (booleanValueMethod != nullptr && !env->ExceptionCheck()) {
++                    out = (env->CallBooleanMethod(v, booleanValueMethod) == JNI_TRUE);
+                 }
++                if (env->ExceptionCheck()) { env->ExceptionClear(); out = defaut; }
++                env->DeleteLocalRef(v);
+             } else if (env->ExceptionCheck()) {
+                 env->ExceptionClear();
+             }
+-        }
+-        
+-        // Get temperature with safe method calls
+-        if (getDoubleMethod) {
+-            jstring temperatureKey = jni_utils::string_to_jstring(env, "temperature");
+-            jobject tempObj = env->CallObjectMethod(params, getDoubleMethod, temperatureKey);
+-            if (tempObj && !env->ExceptionCheck()) {
+-                temperature = env->CallDoubleMethod(tempObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+-                if (env->ExceptionCheck()) {
+-                    env->ExceptionClear();
+-                    temperature = 0.7; // fallback
++            env->DeleteLocalRef(k);
++            return out;
++        };
++
++        auto lireDouble = [&](const char* cle, jdouble defaut) -> jdouble {
++            if (getDoubleMethod == nullptr) return defaut;
++            jstring k = jni_utils::string_to_jstring(env, cle);
++            jdouble out = env->CallDoubleMethod(params, getDoubleMethod, k);
++            if (env->ExceptionCheck()) { env->ExceptionClear(); out = defaut; }
++            env->DeleteLocalRef(k);
++            return out;
++        };
++
++        // `stop` : tableau de chaînes. `optJSONArray` rend NULL si la clé est
++        // absente, ce qui évite l'exception de `getJSONArray`.
++        std::vector<std::string> arrets;
++        if (optJSONArrayMethod != nullptr) {
++            jstring stopKey = jni_utils::string_to_jstring(env, "stop");
++            jobject stopArr = env->CallObjectMethod(params, optJSONArrayMethod, stopKey);
++            if (stopArr != nullptr && !env->ExceptionCheck()) {
++                jclass jsonArrayClass = env->FindClass("org/json/JSONArray");
++                jmethodID lengthMethod = env->GetMethodID(jsonArrayClass, "length", "()I");
++                jmethodID getArrayStringMethod = env->GetMethodID(jsonArrayClass, "getString", "(I)Ljava/lang/String;");
++                if (lengthMethod != nullptr && getArrayStringMethod != nullptr && !env->ExceptionCheck()) {
++                    const jint n = env->CallIntMethod(stopArr, lengthMethod);
++                    for (jint i = 0; i < n; ++i) {
++                        jstring item = (jstring) env->CallObjectMethod(stopArr, getArrayStringMethod, i);
++                        if (item != nullptr && !env->ExceptionCheck()) {
++                            arrets.push_back(jni_utils::jstring_to_string(env, item));
++                            env->DeleteLocalRef(item);
++                        } else if (env->ExceptionCheck()) {
++                            env->ExceptionClear();
++                        }
++                    }
+                 }
++                if (env->ExceptionCheck()) { env->ExceptionClear(); }
++                env->DeleteLocalRef(stopArr);
+             } else if (env->ExceptionCheck()) {
+                 env->ExceptionClear();
+             }
++            env->DeleteLocalRef(stopKey);
++        }
++
++        // ─── Paramètres de génération ────────────────────────────────────────
++        const std::string prompt_str = lireString("prompt", "Once upon a time");
++        const jint n_predict = lireInt("n_predict", 50);
++        const jdouble temperature = lireDouble("temperature", 0.7);
++        const jdouble top_p = lireDouble("top_p", 0.95);
++        const jint top_k = lireInt("top_k", 40);
++        const jint n_probs = lireInt("n_probs", 0);
++        const std::string grammar = lireString("grammar", "");
++        const std::string json_schema = lireString("json_schema", "");
++        const bool emit_partial_completion = lireBool("emit_partial_completion", false);
++
++        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f, top_p: %.2f, top_k: %d, stop: %zu",
++             prompt_str.c_str(), n_predict, temperature, top_p, top_k, arrets.size());
++
++        // `ctx->params` est la structure lue par le moteur (cap-completion.cpp).
++        ctx->params.sampling.temp = (float) temperature;
++        ctx->params.sampling.top_k = top_k;
++        ctx->params.sampling.top_p = (float) top_p;
++        ctx->params.sampling.n_probs = n_probs;
++        ctx->params.sampling.penalty_repeat = 1.1f;
++        // Contrainte de sortie : `grammar` (GBNF) prime ; sinon `json_schema` est
++        // converti en GBNF. Ni l'un ni l'autre fourni : aucune grammaire posée.
++        if (!grammar.empty()) {
++            ctx->params.sampling.grammar = grammar;
++        } else if (!json_schema.empty()) {
++            try {
++                ctx->params.sampling.grammar = json_schema_to_grammar(json::parse(json_schema));
++            } catch (const std::exception& e) {
++                LOGE("json_schema ignoré (conversion en grammaire impossible) : %s", e.what());
++            }
+         }
+-        
+-        LOGI("Completion params - prompt: %s, n_predict: %d, temperature: %.2f", 
+-             prompt_str.c_str(), n_predict, temperature);
+-        
+-        // Set sampling parameters based on extracted values
+-        ctx->params.sampling.temp = temperature;
+-        ctx->params.sampling.top_k = 40;  // Default value
+-        ctx->params.sampling.top_p = 0.95f; // Default value
+-        ctx->params.sampling.penalty_repeat = 1.1f; // Default value (correct field name)
+         ctx->params.n_predict = n_predict;
+         ctx->params.prompt = prompt_str;
+-        
+-        LOGI("Updated context sampling params - temp: %.2f, top_k: %d, top_p: %.2f", 
+-             ctx->params.sampling.temp, ctx->params.sampling.top_k, ctx->params.sampling.top_p);
++        // Les chaînes d'arrêt du JS. `antiprompt` est LA clé lue par
++        // `findStoppingStrings` (common.h:334, cap-completion.cpp:352) ; elle
++        // était vidée à l'init et jamais réécrite, donc `stop` n'était jamais
++        // honoré.
++        ctx->params.antiprompt = arrets;
++
++        LOGI("Updated context sampling params - temp: %.2f, top_k: %d, top_p: %.2f, n_probs: %d, grammar: %zu octets",
++             ctx->params.sampling.temp, ctx->params.sampling.top_k, ctx->params.sampling.top_p,
++             ctx->params.sampling.n_probs, ctx->params.sampling.grammar.size());
+         
+         // Tokenize the prompt
+         capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
+@@ -891,35 +992,82 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
+                 throw;
+             }
+             
++            // ─── RAPPEL JAVA DU FLUX DE JETONS (@LlamaCpp_onToken) ───────────
++            // `thiz` est l'instance LlamaCpp qui a déclenché cet appel natif :
++            // elle reste valide pendant TOUTE la durée de l'appel, et on est déjà
++            // sur son fil JNI. `LlamaCpp.onTokenFromNative(long, String)` remonte
++            // le jeton au Plugin, qui appelle
++            // `notifyListeners("@LlamaCpp_onToken", …)`. Sans ce rappel,
++            // l'écouteur enregistré côté JS (dist/esm/index.js:8) ne recevait
++            // JAMAIS rien : `emit_partial_completion` était purement ignoré.
++            jmethodID onTokenMethod = nullptr;
++            if (emit_partial_completion) {
++                jclass thizClass = env->GetObjectClass(thiz);
++                onTokenMethod = env->GetMethodID(thizClass, "onTokenFromNative", "(JLjava/lang/String;)V");
++                if (env->ExceptionCheck()) {
++                    env->ExceptionClear();
++                    onTokenMethod = nullptr;
++                }
++                if (onTokenMethod == nullptr) {
++                    LOGE("onTokenFromNative introuvable : le flux de jetons sera muet");
++                }
++            }
++
+             LOGI("Starting token generation loop (max tokens: %d)...", n_predict);
+-            
+-            while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
+-                try {
+-                    LOGI("Generating token %d...", tokens_generated + 1);
+-                    auto token_output = ctx->completion->nextToken();
+-                    
+-                    // Check for end-of-sequence (simplified check)
+-                    if (token_output.tok == 2) { // Most models use 2 as EOS token
+-                        LOGI("Reached EOS token, stopping generation");
++
++            while (ctx->completion->has_next_token
++                   && !ctx->completion->is_interrupted
++                   && (n_predict <= 0 || tokens_generated < n_predict)) {
++                auto token_output = ctx->completion->nextToken();
++
++                // ─── LA CONDITION DE SORTIE ─────────────────────────────────
++                // `nextToken()` est le SEUL endroit qui sait s'arrêter : fin de
++                // flux (EOS), limite `n_predict` atteinte, contexte plein,
++                // interruption — tous posent `has_next_token = false`. La boucle
++                // d'origine ne regardait JAMAIS ce drapeau et ne sortait que sur
++                // `n_predict`, donc `tokens_predicted` valait toujours `n_predict`
++                // et le débit affiché était faux.
++                if (!ctx->completion->has_next_token || ctx->completion->is_interrupted) {
++                    break;
++                }
++                if (token_output.tok < 0) {
++                    break; // aucun jeton échantillonné : rien à convertir
++                }
++
++                std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
++                generated_text += token_text;
++                tokens_generated++;
++
++                // ─── CHAÎNES D'ARRÊT (`stop`) ───────────────────────────────
++                // `findStoppingStrings` était DÉFINI mais JAMAIS APPELÉ : les
++                // `stop` du JS n'étaient donc jamais honorés. Il pose
++                // `has_next_token = false` et `stopped_word = true` ; on tronque
++                // ensuite le texte au point de coupure.
++                if (!ctx->params.antiprompt.empty()) {
++                    const size_t stop_pos = ctx->completion->findStoppingStrings(
++                        generated_text, token_text.size(), capllama::STOP_FULL);
++                    if (stop_pos != std::string::npos) {
++                        LOGI("Chaîne d'arrêt atteinte : « %s »", ctx->completion->stopping_word.c_str());
++                        generated_text.resize(stop_pos);
+                         break;
+                     }
+-                    
+-                    // Convert token to text
+-                    std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+-                    generated_text += token_text;
+-                    tokens_generated++;
+-                    
+-                    LOGI("Generated token %d (ID: %d): %s", tokens_generated, token_output.tok, token_text.c_str());
+-                    
+-                } catch (const std::exception& e) {
+-                    LOGE("Exception during token generation %d: %s", tokens_generated + 1, e.what());
+-                    break;
+-                } catch (...) {
+-                    LOGE("Unknown exception during token generation %d", tokens_generated + 1);
+-                    break;
++                }
++
++                // Un jeton vient d'arriver : on le remonte SI l'appelant l'a
++                // demandé. `onTokenMethod` peut être annulé au premier échec.
++                if (onTokenMethod != nullptr) {
++                    jstring jeton = jni_utils::string_to_jstring(env, token_text);
++                    env->CallVoidMethod(thiz, onTokenMethod, (jlong) context_id, jeton);
++                    if (env->ExceptionCheck()) {
++                        env->ExceptionClear();
++                        onTokenMethod = nullptr;
++                    }
++                    if (jeton != nullptr) {
++                        env->DeleteLocalRef(jeton);
++                    }
+                 }
+             }
+-            
++
+             LOGI("Token generation completed. Generated %d tokens.", tokens_generated);
+             
+             // End completion
+@@ -981,29 +1129,39 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_completionNative(
+             env->NewObject(env->FindClass("java/lang/Integer"), 
+                 env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), (jint)prompt_tokens.size()));
+         
+-        // Add completion status flags
++        // Add completion status flags — VALEURS RÉELLES du moteur.
++        // Avant : `truncated` et `context_full` étaient écrits `JNI_FALSE` en
++        // dur, et `stopped_eos`/`stopped_limit` déduits du seul compte
++        // `tokens_generated` — qui valait toujours `n_predict`. On lit maintenant
++        // les drapeaux réellement posés par la boucle de génération
++        // (cap-completion.cpp:nextToken).
++        const bool drapeau_truncated  = ctx->completion != nullptr && ctx->completion->truncated;
++        const bool drapeau_eos        = ctx->completion != nullptr && ctx->completion->stopped_eos;
++        const bool drapeau_limit      = ctx->completion != nullptr && ctx->completion->stopped_limit;
++        const bool drapeau_ctx_full   = ctx->completion != nullptr && ctx->completion->context_full;
++        const bool drapeau_interrompu = ctx->completion != nullptr && ctx->completion->is_interrupted;
+         env->CallObjectMethod(resultMap, putMethod,
+             jni_utils::string_to_jstring(env, "truncated"), 
+             env->NewObject(env->FindClass("java/lang/Boolean"), 
+-                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
++                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), drapeau_truncated ? JNI_TRUE : JNI_FALSE));
+         env->CallObjectMethod(resultMap, putMethod,
+             jni_utils::string_to_jstring(env, "stopped_eos"), 
+             env->NewObject(env->FindClass("java/lang/Boolean"), 
+                 env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+-                tokens_generated < n_predict ? JNI_TRUE : JNI_FALSE));
++                drapeau_eos ? JNI_TRUE : JNI_FALSE));
+         env->CallObjectMethod(resultMap, putMethod,
+             jni_utils::string_to_jstring(env, "stopped_limit"), 
+             env->NewObject(env->FindClass("java/lang/Boolean"), 
+                 env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+-                tokens_generated >= n_predict ? JNI_TRUE : JNI_FALSE));
++                drapeau_limit ? JNI_TRUE : JNI_FALSE));
+         env->CallObjectMethod(resultMap, putMethod,
+             jni_utils::string_to_jstring(env, "context_full"), 
+             env->NewObject(env->FindClass("java/lang/Boolean"), 
+-                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
++                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), drapeau_ctx_full ? JNI_TRUE : JNI_FALSE));
+         env->CallObjectMethod(resultMap, putMethod,
+             jni_utils::string_to_jstring(env, "interrupted"), 
+             env->NewObject(env->FindClass("java/lang/Boolean"), 
+-                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
++                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), drapeau_interrompu ? JNI_TRUE : JNI_FALSE));
+         
+         // Add empty strings for stop reasons
+         env->CallObjectMethod(resultMap, putMethod,
+@@ -1040,9 +1198,23 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_stopCompletionNative(
+     
+     try {
+         auto it = contexts.find(context_id);
+-        if (it != contexts.end()) {
+-            // Stop completion logic would go here
+-            LOGI("Stopped completion for context %ld", context_id);
++        if (it == contexts.end()) {
++            LOGE("stopCompletion : contexte inconnu %ld", context_id);
++            throw_java_exception(env, "java/lang/IllegalArgumentException", "Invalid context ID");
++            return;
++        }
++        // LE DRAPEAU QUE LIT LA BOUCLE. `completionNative` teste
++        // `ctx->completion->is_interrupted` à chaque tour (voir la boucle
++        // ci-dessus) : le poser suffit à arrêter proprement le décodage au jeton
++        // suivant. La version précédente ne faisait RIEN (« Stop completion logic
++        // would go here ») : `is_interrupted` restait false pour toujours, donc
++        // `stopCompletion` était un appel sans aucun effet.
++        auto& ctx = it->second;
++        if (ctx && ctx->completion) {
++            ctx->completion->is_interrupted = true;
++            LOGI("Interruption demandée pour le contexte %ld", context_id);
++        } else {
++            LOGI("stopCompletion : contexte %ld sans complétion active", context_id);
+         }
+     } catch (const std::exception& e) {
+         LOGE("Exception in stopCompletion: %s", e.what());

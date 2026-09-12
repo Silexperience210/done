@@ -31,7 +31,17 @@
  *    ses dossiers, dont getFilesDir()/Documents) et AUCUN `is_model_asset` n'est
  *    transmis : ce paramètre n'est lu nulle part côté Android (vérifié dans
  *    LlamaCpp.java), l'envoyer trompait sur sa prise en charge ;
- *  - le quant du 30B tient dans la RAM du téléphone (8,005 Go, pas 8,914).
+ *  - le quant du 30B tient dans la RAM du téléphone (8,005 Go, pas 8,914) ;
+ *  - LE MAPPAGE MÉMOIRE EST ACTIVÉ (`use_mmap: true`) : c'est le défaut de
+ *    llama.cpp. Le passer à `false` faisait lire les 398 Mo (ou 8 Go) en mémoire
+ *    vive avant que le contexte existe — sur un téléphone, c'est le genre de pic
+ *    qui n'avance plus. Le test échoue si on remet `false` ;
+ *  - AUCUN POOL DE THREADS PERSISTANT côté natif : il a été retiré du patch
+ *    (`patches/llama-cpp-capacitor+0.1.5+001+threads.patch`). Le nombre de
+ *    threads, lui, continue d'être transmis ;
+ *  - LA TRACE NOMME LES ÉTAPES, ET LA DERNIÈRE LIGNE ÉCRITE DÉSIGNE CELLE QUI A
+ *    BLOQUÉ. C'est testé de bout en bout ici, avec un moteur simulé qui ne rend
+ *    jamais la main : c'est exactement le cas réel qu'on cherche à diagnostiquer.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -44,6 +54,12 @@ import {
   nettoyerPourAffichage,
   type PluginLlama,
 } from "./moteurNatif.ts";
+import {
+  demarrerJournal,
+  reinitialiserJournal,
+  type CandidatJournal,
+  type PluginJournal,
+} from "./journal.ts";
 
 /**
  * Plugin SIMULÉ, calqué sur ce que le natif ANDROID rend VRAIMENT — pas sur la
@@ -121,7 +137,12 @@ test("on n'envoie QUE les paramètres que le JNI lit vraiment, sans rien pour le
   const init = journal[0];
   assert.equal(init.n_ctx, 4096, "4096 : la boucle d'agent a besoin de place");
   assert.equal(init.n_batch, 512, "lot de pré-remplissage");
-  assert.equal(init.use_mmap, false, "sans mmap : plus rapide jusqu'au premier jeton");
+  // LE MAPPAGE MÉMOIRE EST ACTIVÉ, et c'est le défaut de llama.cpp. Le passer à
+  // `false` faisait LIRE tout le GGUF en mémoire vive AVANT que le contexte
+  // existe : sur un téléphone, c'est un pic d'allocation qui peut se mettre à
+  // échanger de la mémoire au lieu d'avancer — le « ça rame sans finir ».
+  // Ce test échoue si quelqu'un remet `false`.
+  assert.equal(init.use_mmap, true, "mmap activé : le fichier est projeté, pas lu d'un bloc");
   assert.equal(init.use_mlock, false);
   assert.ok(!("n_gpu_layers" in init), "aucun déport GPU : le binaire n'a aucun backend GPU");
   // Le patch AJOUTE `n_threads` au lecteur JNI : la valeur part, et c'est un
@@ -551,4 +572,207 @@ test("le moteur n'expose plus d'API de cache, et le nettoyage d'affichage est à
   // moteur : c'est l'appelant (couche écran) qui décide quand l'appliquer.
   assert.equal(nettoyerPourAffichage("  <|im_end|>Bonjour<|im_start|> "), "Bonjour");
   assert.equal(await m.generer({ system: "s", history: [] }), "ok", "le moteur, lui, ne nettoie pas");
+});
+
+/* ------------------------------------------------------------------------- */
+/* LA TRACE, de bout en bout : c'est ce qui dira OÙ le chargement a bloqué.   */
+/* ------------------------------------------------------------------------- */
+
+/** Un seul emplacement, en mémoire : les tests ne dépendent d'aucun plugin natif. */
+const CANDIDAT_TEST: CandidatJournal = {
+  directory: "EXTERNAL_STORAGE",
+  path: "Download/journal-studio.txt",
+  cheminLisible: "/sdcard/Download/journal-studio.txt",
+  visible: true,
+};
+
+/**
+ * Trace SIMULÉE : on capture exactement ce qui aurait été écrit dans le
+ * fichier. Sert à vérifier qu'une étape est écrite AVANT d'être exécutée.
+ */
+function traceFactice() {
+  const ecrit = new Map<string, string>();
+  const plugin: PluginJournal = {
+    writeFile: async ({ directory, path, data }) => {
+      ecrit.set(`${directory}:${path}`, data);
+      return {};
+    },
+    appendFile: async ({ directory, path, data }) => {
+      const cle = `${directory}:${path}`;
+      const avant = ecrit.get(cle);
+      if (avant === undefined) throw new Error("no such file or directory");
+      ecrit.set(cle, avant + data);
+    },
+    mkdir: async () => ({}),
+    stat: async () => {
+      throw new Error("no such file or directory");
+    },
+    deleteFile: async () => {},
+  };
+  return {
+    plugin,
+    contenu: () => ecrit.get(`${CANDIDAT_TEST.directory}:${CANDIDAT_TEST.path}`) ?? "",
+    lignes: () =>
+      (ecrit.get(`${CANDIDAT_TEST.directory}:${CANDIDAT_TEST.path}`) ?? "")
+        .split("\n")
+        .filter((l) => /^\[/.test(l)),
+  };
+}
+
+test("les étapes réelles du chargement sont annoncées, dans l'ordre, à l'écran", async () => {
+  // Ce qu'on protège : l'écran ne peut PAS mentir sur l'avancement, parce que
+  // chaque libellé n'est émis qu'au moment où l'étape correspondante tourne
+  // vraiment. Aucune durée n'est jamais inventée.
+  const journal: Record<string, unknown>[] = [];
+  const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice(journal) });
+  const etapes: string[] = [];
+  await m.charger("coder05", (p) => {
+    if (p.etape) etapes.push(p.etape);
+  });
+  assert.deepEqual(
+    etapes,
+    ["recherche_modele", "initialisation_moteur", "termine"],
+    "vérification du fichier → lecture + initialisation → terminé",
+  );
+});
+
+test("la trace nomme le chemin, la taille du fichier, et les étapes; la DERNIÈRE LIGNE désigne l'étape bloquée", async () => {
+  // LE TEST QUI COMPTE : un moteur qui ne rend JAMAIS la main (le cas réel de
+  // l'utilisateur, « ça rame sans avancer »). La dernière ligne écrite doit être
+  // celle de l'étape en cours — « début de la lecture du modèle et de
+  // l'initialisation du moteur » — et non la suivante, qui n'a jamais eu lieu.
+  reinitialiserJournal();
+  const trace = traceFactice();
+  await demarrerJournal({ plugin: trace.plugin, candidats: [CANDIDAT_TEST] });
+
+  const plugin: PluginLlama = {
+    // Ne rend JAMAIS la main : aucun `resolve`, aucune erreur. C'est un blocage.
+    initLlama: () => new Promise<never>(() => {}),
+    completion: async () => ({}),
+  };
+  const m = creerMoteurNatif({
+    ...base,
+    cheminModele: () => "Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+    chargerPlugin: async () => plugin,
+    verifierFichier: async () => ({
+      emplacements: [
+        {
+          chemin: "/sdcard/Download/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+          directory: "EXTERNAL_STORAGE",
+          path: "Download/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+          octets: 397_808_288,
+          etat: "present",
+          erreur: null,
+        },
+      ],
+      trouves: [
+        {
+          chemin: "/sdcard/Download/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+          directory: "EXTERNAL_STORAGE",
+          path: "Download/Qwen2.5-Coder-0.5B-Instruct-Q4_K_M.gguf",
+          octets: 397_808_288,
+          etat: "present",
+          erreur: null,
+        },
+      ],
+    }),
+  });
+
+  // On abandonne au bout de 50 ms : le moteur, lui, ne rendra jamais.
+  await Promise.race([
+    m.charger("coder05"),
+    new Promise((r) => setTimeout(r, 50)),
+  ]);
+
+  const contenu = trace.contenu();
+  const lignes = trace.lignes();
+  assert.match(contenu, /démarrage de l'application/, "la ligne de démarrage est présente");
+  assert.match(
+    contenu,
+    /chemin du modèle transmis au moteur : Qwen2\.5-Coder-0\.5B-Instruct-Q4_K_M\.gguf/,
+    "le chemin RÉSOLU est tracé",
+  );
+  assert.match(
+    contenu,
+    /fichier trouvé : \/sdcard\/Download\/Qwen2\.5-Coder-0\.5B-Instruct-Q4_K_M\.gguf — 397808288 octets/,
+    "l'existence et la TAILLE du fichier sont tracées",
+  );
+  assert.match(
+    lignes[lignes.length - 1],
+    /début de la lecture du modèle et de l'initialisation du moteur/,
+    "LA DERNIÈRE LIGNE dit exactement où ça s'est arrêté",
+  );
+  assert.ok(
+    !contenu.includes("fin de l'initialisation"),
+    "aucune ligne « fin » n'a été écrite, puisqu'il n'y a pas eu de fin",
+  );
+});
+
+test("la trace couvre aussi la génération : premier calcul, premier jeton, fin", async () => {
+  reinitialiserJournal();
+  const trace = traceFactice();
+  await demarrerJournal({ plugin: trace.plugin, candidats: [CANDIDAT_TEST] });
+  // Horloge injectée : sans elle, la génération simulée dure 0 ms et le débit
+  // n'est pas mesurable (ce qui est correct, mais ne teste pas la ligne « fin de
+  // génération » avec un compte de jetons).
+  const m = creerMoteurNatif({
+    ...base,
+    maintenant: horlogeValeurs([0, 1000, 6000]),
+    chargerPlugin: pluginFactice([], { jetons: 12 }),
+  });
+  await m.charger("coder05");
+  const etapes: string[] = [];
+  await m.generer({
+    system: "s",
+    history: [],
+    onEtape: (e) => etapes.push(e),
+  });
+
+  assert.deepEqual(etapes, ["premier_calcul", "premier_jeton", "termine"]);
+  const contenu = trace.contenu();
+  assert.match(contenu, /début du PREMIER calcul/, "le premier calcul est annoncé AVANT d'être lancé");
+  assert.match(contenu, /premier jeton reçu après \d+ ms/, "le premier jeton est horodaté");
+  assert.match(contenu, /fin de génération : 12 jetons/, "la fin porte le compte RÉEL de jetons");
+  assert.ok(
+    contenu.indexOf("début du PREMIER calcul") < contenu.indexOf("premier jeton reçu"),
+    "l'ordre du fichier est celui des étapes",
+  );
+});
+
+test("aucune trace disponible : le chargement n'en dépend pas et aboutit quand même", async () => {
+  // Le journal n'est pas démarré ici (aucun emplacement). Le moteur doit
+  // fonctionner EXACTEMENT pareil : une trace indisponible est un problème de
+  // trace, jamais une raison d'empêcher le modèle de tourner.
+  reinitialiserJournal();
+  const journal: Record<string, unknown>[] = [];
+  const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice(journal) });
+  await m.charger("coder15");
+  assert.equal(m.pret(), true);
+  assert.equal(journal.filter((j) => j.n_ctx).length, 1);
+});
+
+test("une vérification de fichier qui ne répond JAMAIS ne bloque pas le chargement", async () => {
+  // Le diagnostic ne doit pas devenir la panne : au-delà du délai, il est
+  // abandonné, c'est écrit dans la trace, et le moteur est chargé quand même.
+  reinitialiserJournal();
+  const trace = traceFactice();
+  await demarrerJournal({ plugin: trace.plugin, candidats: [CANDIDAT_TEST] });
+  const m = creerMoteurNatif({
+    ...base,
+    delaiDiagnosticMs: 30,
+    // Ne rend jamais la main.
+    verifierFichier: () => new Promise<never>(() => {}),
+    chargerPlugin: pluginFactice([]),
+  });
+  const debut = Date.now();
+  await m.charger("coder05");
+  const duree = Date.now() - debut;
+  assert.equal(m.pret(), true, "le moteur est chargé malgré le diagnostic muet");
+  assert.ok(duree < 1_000, `chargement non retardé par le diagnostic (${duree} ms)`);
+  assert.match(
+    trace.contenu(),
+    /vérification du fichier ABANDONNÉE \(aucun retour en 30 ms\)/,
+    "et c'est DIT dans la trace, au lieu d'être avalé",
+  );
+  assert.match(trace.contenu(), /fin de l'initialisation du moteur/, "le chargement est allé au bout");
 });

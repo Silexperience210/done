@@ -66,6 +66,10 @@
  */
 import { modeleGguf, type ModeleGguf } from "./moteurNatif.ts";
 import type { LocalModelId, ProgresChargement } from "./types.ts";
+// LA TRACE (voir journal.ts) : les étapes de livraison y sont écrites AVANT
+// d'être tentées, pour qu'un téléchargement qui ne rend jamais la main laisse
+// une dernière ligne utilisable.
+import { journaliser, noter } from "./journal.ts";
 
 /**
  * `Directory.Data` de @capacitor/filesystem vaut la chaîne « DATA » ; sur Android
@@ -173,6 +177,159 @@ const TOLERANCE_TAILLE = 0.02;
  */
 export function cheminModele(id: LocalModelId): string {
   return modeleGguf(id).fichier;
+}
+
+/**
+ * OÙ LE MOTEUR NATIF CHERCHE LE GGUF — la liste RÉELLE, lue dans le plugin
+ * (`LlamaCpp.java:1095-1122`, `getModelSearchPaths`) et pas devinée. Les huit
+ * entrées, dans l'ordre où le natif les essaie et s'arrête au premier fichier
+ * existant (`jni.cpp:185-200`) :
+ *
+ *  1. getFilesDir()/<fichier>                    → `Directory.DATA`
+ *  2. getFilesDir()/Documents/<fichier>          → `Directory.DATA` + Documents/
+ *  3. getExternalFilesDir(null)/<fichier>        → `Directory.EXTERNAL`
+ *  4. getExternalFilesDir(null)/Documents/<fichier>
+ *  5. /sdcard/Documents/<fichier>                → `Directory.DOCUMENTS`
+ *  6. /sdcard/Download/<fichier>                 → `Directory.EXTERNAL_STORAGE`
+ *  7. /sdcard/Downloads/<fichier>
+ *  8. /sdcard/Downloads/models/<fichier>
+ *
+ * ON VÉRIFIE LES HUIT, avec `stat`, parce que c'est le seul moyen de répondre à
+ * la question qui compte quand le moteur dit « Failed to initialize native
+ * context » : le fichier est-il LÀ, où, et de quelle taille ? Le natif, lui, ne
+ * dit jamais lequel des huit il a pris.
+ */
+export type EmplacementModele = {
+  /** Chemin tel qu'on l'écrirait à la main sur le téléphone. */
+  chemin: string;
+  /** Valeur du `Directory` du plugin, pour refaire l'appel `stat`. */
+  directory: string;
+  /** Chemin passé au plugin, relatif à `directory`. */
+  path: string;
+  /** Taille vue par `stat` ; `null` si le fichier n'est pas là. */
+  octets: number | null;
+  /**
+   * TROIS ÉTATS, pas deux — et la distinction est utile : « absent » se comble
+   * en téléchargeant le fichier, « refusé » (permission, stockage non monté) ne
+   * se comble PAS en téléchargeant. Les confondre ferait chercher au mauvais
+   * endroit.
+   */
+  etat: "present" | "absent" | "refuse";
+  /** Erreur BRUTE du `stat` quand il a échoué autrement que par « absent ». */
+  erreur: string | null;
+};
+
+export type EtatFichierModele = {
+  /** Les huit emplacements, dans l'ordre du moteur, avec leur état. */
+  emplacements: EmplacementModele[];
+  /** Ceux où un fichier existe réellement (au moins un là où il doit être). */
+  trouves: EmplacementModele[];
+};
+
+/**
+ * `EXTERNAL` n'est pas une valeur de `Directory` documentée comme publique mais
+ * elle EST reconnue par le plugin (`LegacyFilesystemImplementation.getDirectory`
+ * : `"EXTERNAL" -> context.getExternalFilesDir(null)`), et c'est exactement
+ * getExternalFilesDir(null) — l'emplacement 3 des chemins du natif.
+ */
+export const EMPLACEMENTS_MODELE: readonly {
+  directory: string;
+  prefixe: string;
+  dossier: string;
+}[] = [
+  { directory: DOSSIER_DATA, prefixe: "", dossier: "mémoire de l'appli" },
+  { directory: DOSSIER_DATA, prefixe: `${SOUS_DOSSIER}/`, dossier: "mémoire de l'appli / Documents" },
+  { directory: "EXTERNAL", prefixe: "", dossier: "mémoire externe de l'appli" },
+  {
+    directory: "EXTERNAL",
+    prefixe: `${SOUS_DOSSIER}/`,
+    dossier: "mémoire externe de l'appli / Documents",
+  },
+  { directory: "DOCUMENTS", prefixe: "", dossier: "/sdcard/Documents" },
+  { directory: "EXTERNAL_STORAGE", prefixe: "Download/", dossier: "/sdcard/Download" },
+  { directory: "EXTERNAL_STORAGE", prefixe: "Downloads/", dossier: "/sdcard/Downloads" },
+  {
+    directory: "EXTERNAL_STORAGE",
+    prefixe: "Downloads/models/",
+    dossier: "/sdcard/Downloads/models",
+  },
+];
+
+/** Le `stat` a répondu « pas là » (et non « je n'ai pas le droit »). */
+function estAbsence(message: string): boolean {
+  // « OS-PLUG-FILE-0008 » est le code RÉEL du plugin pour ce cas, et son message
+  // est « 'stat' failed because file at '…' does not exist. »
+  // (`FilesystemErrors.kt`, `doesNotExist`) : c'est le cas NORMAL quand le
+  // fichier n'a pas encore été téléchargé, pas une erreur.
+  return (
+    /OS-PLUG-FILE-0008/.test(message) ||
+    /no such file|does not exist|not exist|ENOENT|not found|introuvable|absent|cannot find|no files/i.test(
+      message,
+    )
+  );
+}
+
+/**
+ * DEMANDE OÙ EST LE FICHIER, AUX HUIT EMPLACEMENTS DU MOTEUR, ET DE QUELLE
+ * TAILLE. C'est un DIAGNOSTIC : rien ici ne décide du chargement, et aucun de
+ * ces `stat` ne peut faire échouer quoi que ce soit (chacun est encapsulé).
+ *
+ * Ne lève jamais : si le plugin fichiers lui-même est indisponible, on le rend
+ * sous forme de refus explicites — une trace qui dit « je n'ai pas pu vérifier »
+ * vaut mieux qu'une trace muette.
+ */
+export async function chercherModele(
+  id: LocalModelId,
+  plugin?: PluginFichiers,
+): Promise<EtatFichierModele> {
+  const modele = modeleGguf(id);
+  const emplacements: EmplacementModele[] = [];
+  let dep: PluginFichiers;
+  try {
+    dep = plugin ?? (await pluginFichiersParDefaut());
+  } catch (e) {
+    const erreur = `plugin fichiers indisponible : ${texteErreur(e)}`;
+    return {
+      emplacements: EMPLACEMENTS_MODELE.map((e) => ({
+        chemin: `${e.dossier}/${modele.fichier}`,
+        directory: e.directory,
+        path: `${e.prefixe}${modele.fichier}`,
+        octets: null,
+        etat: "refuse" as const,
+        erreur,
+      })),
+      trouves: [],
+    };
+  }
+
+  for (const emplacement of EMPLACEMENTS_MODELE) {
+    const path = `${emplacement.prefixe}${modele.fichier}`;
+    const chemin = `${emplacement.dossier}/${modele.fichier}`;
+    try {
+      const info = await dep.stat({ path, directory: emplacement.directory });
+      const octets = typeof info?.size === "number" ? info.size : null;
+      emplacements.push({
+        chemin,
+        directory: emplacement.directory,
+        path,
+        octets,
+        etat: octets === null ? "refuse" : "present",
+        erreur: octets === null ? "stat a répondu sans taille" : null,
+      });
+    } catch (e) {
+      const message = texteErreur(e);
+      emplacements.push({
+        chemin,
+        directory: emplacement.directory,
+        path,
+        octets: null,
+        etat: estAbsence(message) ? "absent" : "refuse",
+        erreur: estAbsence(message) ? null : message,
+      });
+    }
+  }
+
+  return { emplacements, trouves: emplacements.filter((e) => e.etat === "present") };
 }
 
 /**
@@ -320,20 +477,26 @@ export async function chargerPuisTelecharger(
 ): Promise<ResultatLivraison> {
   // 1) CHARGER. Si le plugin trouve le fichier (Download, Documents, mémoire de
   //    l'appli…), c'est fini : zéro requête réseau, zéro écriture disque.
+  await journaliser(`livraison : on CHARGE d'abord (« ${livraison.id} »), sans réseau`);
   try {
     await livraison.charger(onProgres);
+    await journaliser("livraison : le chargement direct a suffi (aucun téléchargement)");
     return { dejaLa: true, erreurChargement: null, erreurTelechargement: null };
   } catch (e) {
     const erreurChargement = texteErreur(e);
     // Ce n'est PAS une erreur à afficher tout de suite : c'est le cas nominal du
     // premier lancement. On journalise pour le diagnostic, et on continue.
     console.warn("chargement direct du modèle impossible, on tente le secours :", erreurChargement);
+    await journaliser(`chargement direct impossible : ${erreurChargement}`);
 
     // 2) TÉLÉCHARGER — confort, pas prérequis.
+    await journaliser("livraison : on tente le téléchargement de secours (réseau)");
     try {
       await livraison.telecharger(onProgres);
+      await journaliser("livraison : téléchargement de secours terminé");
     } catch (e2) {
       const erreurTelechargement = texteErreur(e2);
+      await journaliser(`téléchargement de secours échoué : ${erreurTelechargement}`);
       throw new Error(
         messageLivraisonRatee(livraison.id, { erreurChargement, erreurTelechargement }),
       );
@@ -341,9 +504,11 @@ export async function chargerPuisTelecharger(
 
     // 3) RECHARGER, une seule fois : le téléchargement a peut-être livré le
     //    fichier. S'il échoue encore, on ne le cache pas non plus.
+    await journaliser("livraison : on RECHARGE après le téléchargement");
     try {
       await livraison.charger(onProgres);
     } catch (e3) {
+      await journaliser(`rechargement après téléchargement échoué : ${texteErreur(e3)}`);
       throw new Error(
         messageLivraisonRatee(livraison.id, {
           erreurChargement: erreurChargement,
@@ -491,10 +656,27 @@ function diagnosticDemarrage(detail?: { ecouleMs?: number; octetsRecus?: number 
  * pas `@capacitor/filesystem`. Le contrat du plugin est plus large que
  * `PluginFichiers` ; on le restreint volontairement (même approche que pour le
  * plugin llama.cpp dans `moteurNatif.ts`).
+ *
+ * ON NE REND PAS L'OBJET DU PLUGIN TEL QUEL : le proxy de Capacitor expose un
+ * `then` qui LÈVE sur la plateforme web (« "Filesystem.then()" is not
+ * implemented on web »), et le simple fait de le faire passer dans une promesse
+ * le déclenche — donc le seul fait de l'attendre, ici. Le rejet ainsi produit
+ * échappait à l'appelant et remontait en « unhandled rejection ». On rend donc
+ * un objet PLAT de fonctions : jamais un thenable.
  */
 export async function pluginFichiersParDefaut(): Promise<PluginFichiers> {
   const { Filesystem } = await import("@capacitor/filesystem");
-  return Filesystem as unknown as PluginFichiers;
+  const f = Filesystem as unknown as PluginFichiers;
+  const adaptateur: PluginFichiers = {
+    mkdir: (o) => f.mkdir(o),
+    stat: (o) => f.stat(o),
+    downloadFile: (o) => f.downloadFile(o),
+    addListener: (e, cb) => f.addListener(e, cb),
+  };
+  // FACULTATIVE dans le contrat : on ne l'expose que si le plugin la fournit.
+  const supprimer = f.deleteFile?.bind(f);
+  if (supprimer) adaptateur.deleteFile = (o) => supprimer(o);
+  return adaptateur;
 }
 
 /** Taille du fichier s'il existe, `null` sinon. `stat` rejette sur un absent :
@@ -582,6 +764,9 @@ export async function telechargerModele(
 ): Promise<string> {
   const modele: ModeleGguf = modeleGguf(id);
   const relatif = cheminRelatif(id);
+  await journaliser(
+    `téléchargement : cible ${relatif} (${modele.fichier}, ${modele.octets} octets attendus)`,
+  );
   const dep = plugin ?? (await pluginFichiersParDefaut());
   const debut = Date.now();
   const maintenant = options.maintenant ?? (() => Date.now());
@@ -659,6 +844,7 @@ export async function telechargerModele(
   //    absent et re-téléchargé.
   const present = await taillePresente(dep, relatif);
   if (present !== null && taillePlausible(present, modele.octets)) {
+    noter(`téléchargement inutile : le fichier est déjà là (${present} octets)`);
     onProgres?.({
       phase: "pret",
       pct: 100,
@@ -669,6 +855,11 @@ export async function telechargerModele(
     });
     return cheminModele(id);
   }
+  noter(
+    present === null
+      ? "le fichier n'est pas dans la mémoire de l'appli : téléchargement nécessaire"
+      : `fichier présent mais de taille incohérente (${present} octets vus, ${modele.octets} attendus) : re-téléchargement`,
+  );
 
   // 2) CRÉER LE DOSSIER. `getFileObject` du plugin ne crée pas les dossiers
   //    parents et `downloadFile` ignore `recursive` : sans ce mkdir, le
@@ -711,6 +902,10 @@ export async function telechargerModele(
   // `downloadFile` rejette tout de suite — c'est-à-dire quand il n'a jamais
   // démarré. Sans ce chiffre, on ne peut pas distinguer les deux.
   const debutAppel = maintenant();
+  // LA LIGNE EST ÉCRITE AVANT L'APPEL : si `downloadFile` ne rend jamais la
+  // main (c'est arrivé sur l'appareil visé), la trace montre que c'est LUI qui
+  // est en cause — et non la suite du chargement.
+  await journaliser("téléchargement : appel de `downloadFile` (le natif doit rendre la main)");
   arreter = planifier(() => {
     void surveiller();
   }, 1000);
@@ -742,6 +937,10 @@ export async function telechargerModele(
     // L'ERREUR BRUTE EST TOUJOURS MONTRÉE (dans le message), et journalisée :
     // c'est la seule façon de savoir pourquoi un téléchargement ne démarre pas.
     console.warn("téléchargement du modèle échoué :", detail);
+    noter(
+      `téléchargement ÉCHOUÉ en ${maintenant() - debutAppel} ms ` +
+        `(${octetsRecus} octets reçus) : ${detail}`,
+    );
     // Le garde a DÉJÀ rédigé son message (il nomme les secondes et les octets) ;
     // sinon on cite l'erreur réelle, le temps écoulé et les octets reçus.
     throw (

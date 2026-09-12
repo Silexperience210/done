@@ -78,7 +78,7 @@ export const MODELS: Record<
     diskGb: 8.005,
     idleGb: 8.005,
     repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-    note: "Le plus capable des trois, pour un téléphone avec 12 Go de RAM. 30B de connaissances, 3B activés par jeton.",
+    note: "8,0 Go de poids — 30 Md de paramètres dont 3 Md activés par jeton. Le plus gros des trois fichiers.",
   },
   coder15: {
     id: "coder15",
@@ -89,7 +89,7 @@ export const MODELS: Record<
     diskGb: 0.986,
     idleGb: 0.986,
     repo: "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF",
-    note: "Le meilleur modèle de code embarquable : HTML/CSS/JS, et il écrit un français correct.",
+    note: "0,99 Go de poids — 1,5 Md de paramètres en Q4_K_M. Le fichier intermédiaire.",
   },
   coder05: {
     id: "coder05",
@@ -100,7 +100,7 @@ export const MODELS: Record<
     diskGb: 0.398,
     idleGb: 0.398,
     repo: "bartowski/Qwen2.5-Coder-0.5B-Instruct-GGUF",
-    note: "Le léger, pour les téléphones anciens : il démarre partout, plus approximatif.",
+    note: "0,40 Go de poids — 0,5 Md de paramètres en Q4_K_M. Le plus petit des trois fichiers.",
   },
 };
 
@@ -211,7 +211,7 @@ export function toolLabel(name: string) {
 export function systemPrompt(model: ModelId) {
   const m = MODELS[model];
   return [
-    `Tu es ${m.name}, un petit modèle d'IA exécuté directement sur l'appareil de l'utilisateur (${m.params} paramètres, quantification 4 bits).`,
+    `Tu es ${m.name}, un petit modèle d'IA exécuté directement sur l'appareil de l'utilisateur (${m.params} paramètres, fichier GGUF quantifié).`,
     "Tu fonctionnes entièrement hors ligne : aucun accès à Internet, à un serveur ou à une API.",
     "Par défaut, tu RÉPONDS à l'utilisateur en texte clair, brièvement, dans sa langue. C'est ce qu'on attend de toi.",
     "Tu n'écris du code dans la conversation que si on te le demande explicitement.",

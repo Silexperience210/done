@@ -1,0 +1,201 @@
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java b/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java
+index 02e5750..94062d9 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java
++++ b/node_modules/llama-cpp-capacitor/android/src/main/java/ai/annadata/plugin/capacitor/LlamaCpp.java
+@@ -1161,15 +1161,28 @@ public class LlamaCpp {
+             paths.add(externalFilesDir.getAbsolutePath() + "/Documents/" + filename);
+         }
+         
+-        // External storage (requires permissions, may not be available)
+-        if (Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
+-            File externalStorage = Environment.getExternalStorageDirectory();
+-            paths.add(externalStorage.getAbsolutePath() + "/Documents/" + filename);
+-            paths.add(externalStorage.getAbsolutePath() + "/Download/" + filename);
+-            paths.add(externalStorage.getAbsolutePath() + "/Downloads/" + filename);
+-            paths.add(externalStorage.getAbsolutePath() + "/Downloads/models/" + filename);
+-        }
+-        
++        // STOCKAGE ÉMULÉ PUBLIC : VOLONTAIREMENT RETIRÉ.
++        //
++        // Le manifeste de l'appli ne déclare QUE `INTERNET` (aucune permission de
++        // stockage) : ces quatre chemins (/sdcard/Documents, /sdcard/Download,
++        // /sdcard/Downloads, /sdcard/Downloads/models) ne sont donc PAS lisibles,
++        // quoi qu'il arrive. Les sonder était au mieux inutile, au pire nuisible,
++        // et deux appels le font ici :
++        //   - `Environment.getExternalStorageState()` — un appel système sur le
++        //     volume émulé, qui peut se bloquer quand le service de stockage est
++        //     occupé ;
++        //   - les `exists()` que le natif fait ensuite sur les mêmes chemins, en
++        //     passant par le démon FUSE (chaque stat y coûte un aller-retour ;
++        //     quand il ne répond pas, il ne répond pas).
++        // Le chargement du modèle n'en a jamais eu besoin : le GGUF de l'appli est
++        // téléchargé dans getFilesDir()/Documents (voir modeleLocal.ts), et les
++        // deux premiers chemins ci-dessus suffisent. Les deux emplacements
++        // app-spécifiques ci-dessus restent, eux : ils ne demandent aucune
++        // permission (Android 10+) et servent de secours.
++        //
++        // CE QUI SE PERD, ET C'EST ASSUMÉ : un GGUF posé à la main dans Download
++        // n'était de toute façon jamais lisible par cette appli — la consigne qui
++        // l'affichait était une fausse piste (l'audit l'a relevée).
+         return paths.toArray(new String[0]);
+     }
+ }
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+index c08a266..e3cb644 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
++++ b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+@@ -17,6 +17,13 @@
+ #include <atomic> // For thread-safe progress tracking
+ #include <filesystem> // For file operations
+ #include <mutex> // For thread synchronization
++// Requis par la trace native (voir `diag` plus bas) : va_list/vfprintf, l'heure
++// et la mesure de durée. Inclus explicitement — les en-têtes transitifs changent
++// d'une version de NDK à l'autre.
++#include <cstdarg>
++#include <cstdio>
++#include <ctime>
++#include <chrono>
+ 
+ // Add missing symbol
+ // namespace rnllama {
+@@ -27,6 +34,60 @@
+ #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+ #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+ 
++// ─── TRACE NATIVE, LISIBLE SANS `adb` ────────────────────────────────────────
++// POURQUOI CE BLOC EXISTE : le seul canal du plugin vers l'appli est logcat, et
++// logcat est inaccessible sans `adb` (pas de câble sur l'appareil visé, pas de
++// débogage sans fil). Conséquence mesurée sur cet appareil : un chargement qui
++// ne rend jamais la main ne laissait AUCUNE trace exploitable — ni à l'écran, ni
++// dans un fichier — donc aucune façon de distinguer « bloqué dans la recherche
++// du fichier », « bloqué dans la lecture du GGUF » et « bloqué dans le warmup ».
++//
++// CE QUE ÇA ÉCRIT, ET OÙ : `journal-natif.txt` dans la mémoire privée de
++// l'appli (getFilesDir()), une ligne horodatée par étape, écrites AVANT chaque
++// étape. La dernière ligne du fichier nomme donc l'étape en cours. L'appli relit
++// ce fichier et l'affiche (`src/ai/traceNatif.ts`) : la trace est lisible sur le
++// téléphone, sans outil externe.
++//
++// Coût réel : une ouverture/écriture/fermeture par étape, une dizaine par
++// chargement. Négligeable devant une lecture de 400 Mo, et c'est le prix d'un
++// diagnostic qu'on ne peut pas obtenir autrement.
++static std::string g_diag_dir;
++
++static void diag_preparer(const std::string & dossier) {
++    g_diag_dir = dossier;
++    const std::string chemin = g_diag_dir + "/journal-natif.txt";
++    FILE * f = fopen(chemin.c_str(), "w"); // un chargement = une trace, pas un cumul
++    if (f != nullptr) {
++        fclose(f);
++    }
++}
++
++static void diag(const char * fmt, ...) {
++    if (g_diag_dir.empty()) {
++        return;
++    }
++    const std::string chemin = g_diag_dir + "/journal-natif.txt";
++    FILE * f = fopen(chemin.c_str(), "a");
++    if (f == nullptr) {
++        return;
++    }
++    const auto maintenant = std::chrono::system_clock::now();
++    const std::time_t t = std::chrono::system_clock::to_time_t(maintenant);
++    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                        maintenant.time_since_epoch()) % 1000;
++    struct tm tm_buf;
++    localtime_r(&t, &tm_buf);
++    char h[32];
++    strftime(h, sizeof(h), "%H:%M:%S", &tm_buf);
++    fprintf(f, "[%s.%03d] ", h, static_cast<int>(ms.count()));
++    va_list ap;
++    va_start(ap, fmt);
++    vfprintf(f, fmt, ap);
++    va_end(ap);
++    fputc('\n', f);
++    fclose(f);
++}
++
+ // ─── Threads de calcul ───────────────────────────────────────────────────────
+ // Nombre de threads par défaut, utilisé seulement quand l'appelant ne fournit
+ // pas la clé `n_threads`.
+@@ -247,10 +308,31 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+         // Rest of the existing logic remains the same...
+         std::string full_model_path;
+         bool file_found = false;
+-        
++
++        // TRACE : dossier de l'appli = parent du premier chemin ABSOLU proposé
++        // par Java (c'est getFilesDir()/<fichier>). Sert de destination à
++        // `journal-natif.txt`. Puis on note l'entrée : si le fichier de trace
++        // n'existe pas du tout, c'est que le blocage est AVANT le natif, côté
++        // Java (getModelSearchPaths).
++        for (const auto& p : paths_to_check) {
++            if (!p.empty() && p[0] == '/') {
++                diag_preparer(std::filesystem::path(p).parent_path().string());
++                break;
++            }
++        }
++        diag("initContextNative : entrée — modèle demandé « %s », %zu emplacement(s)",
++             model_path_str.c_str(), paths_to_check.size());
++
+         for (const auto& path : paths_to_check) {
+             LOGI("Checking path: %s", path.c_str());
+-            if (std::filesystem::exists(path)) {
++            bool existe = false;
++            try {
++                existe = std::filesystem::exists(path);
++            } catch (const std::exception& e) {
++                diag("  « %s » : exception %s", path.c_str(), e.what());
++            }
++            diag("  « %s » : %s", path.c_str(), existe ? "PRÉSENT" : "absent");
++            if (existe) {
+                 full_model_path = path;
+                 file_found = true;
+                 LOGI("Found model file at: %s", path.c_str());
+@@ -262,8 +344,10 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+         
+         if (!file_found) {
+             LOGE("Model file not found in any of the search paths");
++            diag("AUCUN fichier trouvé : le natif ne peut pas charger (pas un blocage, un échec)");
+             return -1;
+         }
++        diag("fichier retenu : %s", full_model_path.c_str());
+         
+         // Additional model validation
+         LOGI("Performing additional model validation...");
+@@ -528,6 +612,14 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+         LOGI("Model parameters: n_ctx=%d, n_batch=%d, n_gpu_layers=%d, n_threads=%d, embedding=%s", 
+              cparams.n_ctx, cparams.n_batch, cparams.n_gpu_layers, cparams.cpuparams.n_threads, cparams.embedding ? "true" : "false");
+         
++        // LA TRACE DU CHARGEMENT : c'est ici que le temps se passe (lecture du
++        // GGUF, contexte, cache KV, warmup). Les paramètres sont écrits APRÈS
++        // l'extraction depuis le JS : ce sont donc bien ceux qui seront utilisés.
++        const auto diag_debut_chargement = std::chrono::steady_clock::now();
++        diag("chargement : n_ctx=%d n_batch=%d n_threads=%d mmap=%d mlock=%d — appel de loadModel",
++             cparams.n_ctx, cparams.n_batch, cparams.cpuparams.n_threads,
++             cparams.use_mmap ? 1 : 0, cparams.use_mlock ? 1 : 0);
++
+         // Try to load the model with error handling and signal protection
+         bool load_success = false;
+         
+@@ -618,6 +710,9 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+             
+             if (!load_success) {
+                 LOGE("Model loading failed even with ultra-minimal parameters");
++                diag("chargement ÉCHOUÉ (même en paramètres minimaux) après %lld ms",
++                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                         std::chrono::steady_clock::now() - diag_debut_chargement).count()));
+                 throw_java_exception(env, "java/lang/RuntimeException", 
+                     "Failed to load model - model appears to be corrupted or incompatible with this llama.cpp version. "
+                     "Try downloading a fresh copy of the model file.");
+@@ -625,6 +720,9 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+             }
+         }
+         
++        diag("chargement TERMINÉ (contexte prêt, warmup compris) en %lld ms",
++             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                 std::chrono::steady_clock::now() - diag_debut_chargement).count()));
+         LOGI("Model loaded successfully!");
+         
+         // Store context

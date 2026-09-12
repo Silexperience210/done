@@ -91,7 +91,11 @@ export function EnginePanel({
           <dd className="text-right font-mono text-stat">
             {engineNote ? engineNote.split(" · ")[0] : "—"}
           </dd>
-          <dt className="text-muted">Débit mesuré</dt>
+          {/* Étiqueté « Débit », PAS « Débit mesuré » : le compte de jetons
+              remonté par le moteur n'est pas fiable tant que le correctif natif
+              n'est pas compilé dans le .so. Tant que ce n'est pas prouvé,
+              afficher le mot « mesuré » serait une prétention de plus. */}
+          <dt className="text-muted">Débit</dt>
           <dd className="text-right font-mono tabular-nums text-stat">
             {tokPerSec > 0 ? `${tokPerSec.toFixed(1)} tok/s` : "—"}
           </dd>

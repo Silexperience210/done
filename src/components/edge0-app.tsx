@@ -315,8 +315,11 @@ function Composer({
             mesure de la RAM vive de l'appareil (qu'on ne sait pas lire). */}
         <span>{memoryGb.toFixed(2)} GB de poids</span>
         {/*
-          Le débit affiché est celui qui a été MESURÉ pendant la génération. Tant
-          qu'aucune mesure n'existe, on écrit « — » : « 0.0 tok/s » se lirait
+          Le débit affiché vient du moteur, mais le COMPTE DE JETONS qu'il remonte
+          n'est pas fiable tant que le correctif natif de `completionNative`
+          (jni.cpp) n'est pas compilé dans le .so : `tokens_predicted` y valait
+          toujours `n_predict`. On n'écrit donc plus le mot « mesuré ». Tant
+          qu'aucune valeur n'existe, on écrit « — » : « 0.0 tok/s » se lirait
           comme un débit réellement relevé, et c'est exactement l'affichage qui
           trompait alors que le moteur tournait.
         */}

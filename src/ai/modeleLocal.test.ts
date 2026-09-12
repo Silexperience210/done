@@ -20,8 +20,10 @@ import {
   cheminManuel,
   cheminModele,
   cheminRelatif,
+  chercherModele,
   DELAI_GARDE_MS,
   DELAIS_HTTP,
+  EMPLACEMENTS_MODELE,
   DOSSIER_PUBLIC,
   estMessageLivraison,
   gardeDepassee,
@@ -690,3 +692,119 @@ test("un échec immédiat est DIT : erreur brute du plugin + zéro octet reçu",
   );
 });
 
+
+/* ------------------------------------------------------------------------- */
+/* OÙ EST LE FICHIER — le diagnostic écrit dans la trace (voir journal.ts).   */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Simulacre qui répond SELON LE CHEMIN demandé : c'est ce qui permet de
+ * distinguer « présent ici », « absent là » et « refusé pour permission ».
+ */
+function pluginParChemin(reponses: Record<string, number | Error>): PluginFichiers {
+  return {
+    mkdir: async () => ({}),
+    stat: async (x) => {
+      const reponse = reponses[`${x.directory}:${x.path}`];
+      if (reponse === undefined) {
+        // Message RÉEL du plugin pour un fichier absent (FilesystemErrors.kt).
+        throw new Error("'stat' failed because file does not exist. (OS-PLUG-FILE-0008)");
+      }
+      if (reponse instanceof Error) throw reponse;
+      return { size: reponse };
+    },
+    deleteFile: async () => {},
+    downloadFile: async () => ({}),
+    addListener: async () => ({ remove: async () => {} }),
+  };
+}
+
+test("chercherModele interroge les HUIT emplacements du moteur, dans SON ordre", async () => {
+  // L'ordre et les chemins sont ceux de `LlamaCpp.getModelSearchPaths`
+  // (LlamaCpp.java:1095-1122), pas une invention : le natif s'arrête au premier
+  // fichier existant, donc savoir LEQUEL des huit il a pris est tout le
+  // diagnostic.
+  const fichier = modeleGguf("coder05").fichier;
+  const etat = await chercherModele("coder05", pluginParChemin({}));
+  assert.deepEqual(
+    etat.emplacements.map((e) => `${e.directory}:${e.path}`),
+    [
+      `DATA:${fichier}`,
+      `DATA:Documents/${fichier}`,
+      `EXTERNAL:${fichier}`,
+      `EXTERNAL:Documents/${fichier}`,
+      `DOCUMENTS:${fichier}`,
+      `EXTERNAL_STORAGE:Download/${fichier}`,
+      `EXTERNAL_STORAGE:Downloads/${fichier}`,
+      `EXTERNAL_STORAGE:Downloads/models/${fichier}`,
+    ],
+  );
+  assert.equal(etat.trouves.length, 0, "aucun fichier trouvé : rien n'est inventé");
+  assert.ok(
+    etat.emplacements.every((e) => e.etat === "absent"),
+    "« pas encore téléchargé » est un ÉTAT, pas une erreur",
+  );
+  assert.ok(
+    etat.emplacements.every((e) => e.erreur === null),
+    "et on n'affiche donc aucune erreur brute pour une simple absence",
+  );
+});
+
+test("un fichier présent est rapporté avec sa TAILLE EXACTE ; un refus de permission n'est pas une absence", async () => {
+  const fichier = modeleGguf("coder05").fichier;
+  const etat = await chercherModele(
+    "coder05",
+    pluginParChemin({
+      [`EXTERNAL_STORAGE:Download/${fichier}`]: TAILLE_05,
+      // EACCES : le dossier existe mais l'appli n'a pas le droit d'y regarder.
+      [`DOCUMENTS:${fichier}`]: new Error("EACCES (Permission denied)"),
+    }),
+  );
+  assert.equal(etat.trouves.length, 1, "un seul fichier réellement là");
+  assert.equal(etat.trouves[0].octets, TAILLE_05, "taille exacte, à comparer à celle attendue");
+  assert.equal(etat.trouves[0].etat, "present");
+  assert.equal(
+    etat.trouves[0].chemin,
+    `/sdcard/Download/${fichier}`,
+    "le chemin est celui qu'on montrerait à l'utilisateur",
+  );
+  const refuse = etat.emplacements.find((e) => e.directory === "DOCUMENTS");
+  assert.equal(refuse?.etat, "refuse", "un refus n'est PAS une absence : on ne comble pas ça en téléchargeant");
+  assert.match(refuse?.erreur ?? "", /EACCES/, "l'erreur brute est conservée telle quelle");
+  const absent = etat.emplacements.find((e) => e.directory === "DATA" && e.path === fichier);
+  assert.equal(absent?.etat, "absent");
+});
+
+test("chercherModele ne lève JAMAIS : un plugin en panne est rapporté, jamais subi", async () => {
+  // Un diagnostic qui échoue ne doit pas casser le chargement : c'est la
+  // propriété la plus importante de cette fonction, avec « ne bloque rien ».
+  const etat = await chercherModele(
+    "coder05",
+    pluginParChemin(
+      Object.fromEntries(
+        EMPLACEMENTS_MODELE.map((e) => [
+          `${e.directory}:${e.prefixe}${modeleGguf("coder05").fichier}`,
+          new Error("stockage non monté"),
+        ]),
+      ),
+    ),
+  );
+  assert.equal(etat.trouves.length, 0);
+  assert.equal(etat.emplacements.length, 8);
+  assert.ok(
+    etat.emplacements.every((e) => e.etat === "refuse"),
+    "aucun emplacement ne répond : tout est « refusé », pas « absent »",
+  );
+});
+
+test("sans plugin fichiers du tout, chercherModele rend un refus explicite au lieu de lever", async () => {
+  const etat = await chercherModele("coder05", undefined);
+  // En Node, `@capacitor/filesystem` se résout sur l'implémentation web : aucun
+  // `stat` ne peut aboutir. Le résultat doit être lisible, pas une exception.
+  assert.equal(etat.trouves.length, 0);
+  assert.ok(etat.emplacements.length > 0);
+  assert.ok(
+    etat.emplacements.every((e) => e.etat === "refuse" && e.erreur !== null),
+    "chaque emplacement porte la raison de son échec",
+  );
+});

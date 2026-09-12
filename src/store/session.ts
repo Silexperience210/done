@@ -10,10 +10,22 @@ import {
 } from "@/lib/edge0";
 import { estApplicationNative } from "@/ai/moteur";
 import type { CheminManuel } from "@/ai/modeleLocal";
+import { creerVerificateur, resumeAchevement, type EtatAchevement } from "@/ai/achevement";
+import type { PasAgent } from "@/ai/agent";
+import { injecterPont, type EntreeConsole } from "@/ai/pontApercu";
+import { criteresLisibles, enregistrerApp, listerApps, type AppEnregistree } from "@/ai/historique";
+import {
+  apercuDisponible,
+  evaluerDansApercu,
+  installerEcouteApercu,
+  preparerVersion,
+  verdictApercu,
+} from "./apercu";
 // RÉGLAGES DU MOTEUR (contexte, lot, threads) : réglables par l'utilisateur.
 import { ecrireReglages, lireReglages, type ReglagesMoteur } from "@/ai/reglages";
 import {
   libelleEtape,
+  type BilanGeneration,
   type EtapeChargement,
   type GenerateOptions,
   type LocalModelId,
@@ -179,12 +191,37 @@ function chargerHarnais(): Promise<Harnais> {
   return harnaisEnCours;
 }
 
-export type StudioTab = "preview" | "code";
+export type StudioTab = "preview" | "code" | "console" | "historique";
+
+/** Une version de l'app produite pendant un tour (une par `write_app`). */
+export type VersionStudio = {
+  pas: number;
+  html: string;
+  /** Vrai si la production a été coupée par le budget : affichée telle quelle, marquée. */
+  tronque: boolean;
+  jetons: number | null;
+  date: number;
+};
 
 export type StudioState = {
   title: string;
+  /** L'HTML BRUT du modèle : c'est lui qu'on lit dans l'onglet Code, qu'on compare, qu'on exporte. */
   html: string;
+  /** L'HTML rendu dans l'iframe : enveloppé (fond, police) et muni du pont d'écoute. */
+  htmlApercu: string;
+  /** Numéro de version de l'aperçu : la clé des messages du pont (voir pontApercu.ts). */
+  version: number;
+  versions: VersionStudio[];
+  /** Production en cours (HTML en flux) : l'onglet Code la montre arriver ; `null` hors production. */
+  enCours: string | null;
+  tronque: boolean;
+  /** Question qui a produit cette app, et modèle : pour l'historique. */
+  question: string;
+  modele: ModelId;
 };
+
+/** Compteur GLOBAL de versions d'aperçu : deux versions ne partagent jamais un numéro dans la session. */
+let versionApercu = 0;
 
 type SessionState = {
   model: ModelId;
@@ -223,6 +260,14 @@ type SessionState = {
   studio: StudioState | null;
   studioTab: StudioTab;
   studioOpen: boolean;
+  /**
+   * La console RÉELLE de l'aperçu : erreurs, avertissements et logs émis par
+   * l'app dans son iframe, remontés par le pont, avec ligne et colonne quand le
+   * moteur JS les donne. Toutes versions confondues ; l'onglet filtre.
+   */
+  console: EntreeConsole[];
+  /** Apps conservées sur l'appareil (IndexedDB), les plus récentes d'abord. */
+  historique: AppEnregistree[];
   setModel: (id: ModelId) => void;
   /** Enregistre les réglages et JETTE le moteur en mémoire (reconstruit au message suivant). */
   setReglages: (r: ReglagesMoteur) => void;
@@ -233,6 +278,13 @@ type SessionState = {
   openStudio: (tab?: StudioTab) => void;
   closeStudio: () => void;
   setStudioTab: (tab: StudioTab) => void;
+  /** Recharge l'aperçu (nouvelle version du même HTML) : réessai après une erreur. */
+  rechargerApercu: () => void;
+  /** Relit la galerie depuis le stockage. */
+  rafraichirHistorique: () => Promise<void>;
+  /** Rouvre une app de l'historique dans le studio, sans modèle chargé. */
+  ouvrirAppHistorique: (app: AppEnregistree) => void;
+  supprimerAppHistorique: (id: string) => Promise<void>;
 };
 
 // seedMessages SUPPRIMÉ : voir la note sur SEED_PROMPT/SEED_REPLY dans edge0.ts.
@@ -242,7 +294,14 @@ type SessionState = {
 // des coefficients inventés (0,42). La mémoire affichée est maintenant
 // directement le poids réel du modèle (`MODELS[…].idleGb`).
 
-export const useSession = create<SessionState>((set, get) => ({
+export const useSession = create<SessionState>((set, get) => {
+  // Le pont de l'aperçu remonte la console RÉELLE de l'app : chaque entrée est
+  // gardée dans le store (l'onglet Console l'affiche, le verdict de write_app
+  // la lit). Branché à la création du store — un seul écouteur, borné à 500
+  // lignes ; sans fenêtre (rendu serveur), c'est un non-événement.
+  installerEcouteApercu((entree) => set((s) => ({ console: [...s.console.slice(-499), entree] })));
+
+  return {
   // MODÈLE PAR DÉFAUT : le 0,5B (398 Mo), PAS le 1,5B (986 Mo).
   // Le premier lancement impose un téléchargement : 986 Mo pour le 1,5B contre
   // 398 Mo pour le 0,5B, et rien d'autre ne peut avancer tant qu'il dure. Le
@@ -268,6 +327,8 @@ export const useSession = create<SessionState>((set, get) => ({
   studio: null,
   studioTab: "preview",
   studioOpen: false,
+  console: [],
+  historique: [],
 
   setModel: (id) => {
     if (get().streaming) return;
@@ -330,6 +391,7 @@ export const useSession = create<SessionState>((set, get) => ({
       error: null,
       studio: null,
       studioOpen: false,
+      console: [],
       tokPerSec: 0,
       memoryGb: MODELS[get().model].idleGb,
     });
@@ -342,6 +404,50 @@ export const useSession = create<SessionState>((set, get) => ({
     })),
   closeStudio: () => set({ studioOpen: false }),
   setStudioTab: (tab) => set({ studioTab: tab }),
+
+  rechargerApercu: () => {
+    const studio = get().studio;
+    if (!studio) return;
+    // Nouvelle version du MÊME HTML : l'iframe se recharge, le pont repart avec
+    // un numéro neuf, et la console de cette version repart de zéro — les
+    // anciennes lignes restent, datées, sous leur version.
+    const version = ++versionApercu;
+    preparerVersion(version);
+    set({ studio: { ...studio, version, htmlApercu: injecterPont(wrapHtml(studio.html), version) } });
+  },
+
+  rafraichirHistorique: async () => {
+    set({ historique: await listerApps() });
+  },
+
+  ouvrirAppHistorique: (app) => {
+    if (get().streaming) return;
+    const version = ++versionApercu;
+    preparerVersion(version);
+    set({
+      studio: {
+        title: app.titre,
+        html: app.html,
+        htmlApercu: injecterPont(wrapHtml(app.html), version),
+        version,
+        versions: app.versions.map((v) => ({ ...v })),
+        enCours: null,
+        tronque: app.metriques.tronque,
+        question: app.question,
+        modele: (["coder3b", "coder15", "coder05"] as const).includes(app.modele as ModelId)
+          ? (app.modele as ModelId)
+          : get().model,
+      },
+      studioTab: "preview",
+      studioOpen: true,
+    });
+  },
+
+  supprimerAppHistorique: async (id) => {
+    const { supprimerApp } = await import("@/ai/historique");
+    await supprimerApp(id);
+    set({ historique: await listerApps() });
+  },
 
   // tickIdle() SUPPRIMÉE.
   // Elle faisait « respirer » la mémoire affichée avec deux sinusoïdes
@@ -375,15 +481,24 @@ export const useSession = create<SessionState>((set, get) => ({
     let content = "";
     let thinking = "";
     const tools: ToolEvent[] = [];
+    /** Sortie BRUTE du pas en cours (contrat, décision), en flux — jamais mise dans `content`. */
+    let brouillon = "";
+    /** Les appels au moteur de ce tour, dans l'ordre (`id`), tels que la boucle les clôt. */
+    let pasDuTour: PasAgent[] = [];
+    let achevement: EtatAchevement | undefined;
+    const debutTour = Date.now();
 
     const patchAssistant = (extra?: Partial<SessionState>) => {
       set((s) => ({
         ...extra,
         messages: s.messages.map((m) =>
-          m.id === assistant.id ? { ...m, content, thinking, tools: [...tools] } : m,
+          m.id === assistant.id
+            ? { ...m, content, thinking, tools: [...tools], brouillon, pas: pasDuTour, achevement }
+            : m,
         ),
       }));
     };
+
 
     /**
      * Débit et poids RÉELS pendant la génération.
@@ -430,7 +545,9 @@ export const useSession = create<SessionState>((set, get) => ({
       const flushTokens = () => {
         raf = 0;
         if (!pending) return;
-        content += pending;
+        // Dans le BROUILLON, pas dans `content` : la sortie brute d'un pas
+        // (contrat, décision) n'est pas la réponse. C'était le défaut C4.
+        brouillon += pending;
         // Plus de `tokens += pending.length / 4` : on ne déduit plus un nombre de
         // jetons de la longueur du texte (voir `pulse`). Le débit affiché est
         // celui, mesuré, que rend le moteur natif.
@@ -594,59 +711,101 @@ export const useSession = create<SessionState>((set, get) => ({
         arretHorloge();
       }
 
-      // Boucle d'agent : le modèle décide d'appeler des outils, un pas à la
-      // fois, et le résultat de chaque outil lui est renvoyé. C'est ce qui fait
-      // la différence avec un simple « question → réponse ».
+      // Boucle d'agent : le modèle énonce un CONTRAT, décide d'appeler des
+      // outils (décision minuscule sous grammaire), produit le contenu long en
+      // texte libre, et ne conclut que sur un `done` RECOUPÉ par l'exécution.
+      // Chaque appel au moteur remonte ici avec son bilan réel (`onPas`), et
+      // l'état d'achèvement à chaque changement (`onAchevement`).
+      let rafProduction = 0;
+      let productionEnCours = "";
+      const flushProduction = () => {
+        rafProduction = 0;
+        const studio = get().studio;
+        // L'HTML arrive EN FLUX dans l'onglet Code, sans toucher à l'iframe
+        // (qui ne se recharge qu'une fois, à la fin, sur le document complet).
+        set({
+          studio: studio
+            ? { ...studio, enCours: productionEnCours }
+            : {
+                title: "App en cours d'écriture",
+                html: "",
+                htmlApercu: "",
+                version: 0,
+                versions: [],
+                enCours: productionEnCours,
+                tronque: false,
+                question: text,
+                modele: get().model,
+              },
+          studioOpen: true,
+          studioTab: get().studio ? get().studioTab : "code",
+        });
+      };
+      const libellePhase = (phase: string, outil: string | undefined) => {
+        if (phase === "contrat") return "contrat : le modèle énonce les critères…";
+        if (phase === "decision") return "décision : choix de l'outil…";
+        if (outil === "write_app") return "production : le modèle écrit l'app…";
+        if (outil === "run_js") return "production : le modèle écrit le code à exécuter…";
+        return "production : rédaction de la réponse…";
+      };
+
       const resultat = await harnais.boucleAgent({
         question: text,
         system: systemPrompt(get().model),
-        maxPas: 4,
-        onToken: (t) => {
-          pending += t;
-          if (!raf) raf = requestAnimationFrame(flushTokens);
-        },
-        generate: async (prompt, onToken, contraintes) => {
-          thinking = "analyse de la demande…";
+        generate: async (demande) => {
+          // Un nouvel appel : le brouillon repart de zéro, la phase est nommée.
+          if (raf) cancelAnimationFrame(raf);
+          raf = 0;
+          pending = "";
+          brouillon = "";
+          if (demande.phase === "production" && demande.outil === "write_app") productionEnCours = "";
+          thinking = libellePhase(demande.phase, demande.outil);
           patchAssistant(pulse(true));
           let premier = true;
-          return moteurActif.generer({
-            system: prompt,
-            history: [{ role: "user", content: text }],
-            // Court volontairement : sur un téléphone, chaque jeton coûte. Les
-            // appels d'outils et les réponses utiles tiennent largement là-dedans.
-            maxNewTokens: 160,
-            // Contrainte de sortie structurée : le schéma JSON (converti en
-            // grammaire par llama.cpp) empêche un petit modèle de déverser du
-            // texte à la place d'un appel.
-            jsonSchema: contraintes?.jsonSchema,
-            grammar: contraintes?.grammar,
+          let bilan: BilanGeneration | null = null;
+          const texte = await moteurActif.generer({
+            system: demande.system,
+            history: demande.history,
+            // BUDGET PAR PHASE ET PAR OUTIL (agent.ts, `BUDGETS`) : plus un
+            // chiffre unique. La décision tient en 48 jetons ; l'HTML d'une
+            // app en a 1500, et s'arrête sur </html>.
+            maxNewTokens: demande.budget,
+            stop: demande.stop,
+            // Contrainte de sortie structurée : la grammaire GBNF du contrat ou
+            // de la décision. La production n'en a jamais.
+            grammar: demande.contraintes?.grammar,
+            jsonSchema: demande.contraintes?.jsonSchema,
             onToken: (t) => {
               if (premier) {
                 premier = false;
-                thinking = "";
+                thinking = libellePhase(demande.phase, demande.outil).replace("…", " (en cours)");
               }
-              onToken?.(t);
-              patchAssistant(pulse(true));
+              // ROUTAGE DU FLUX : l'HTML d'une app arrive dans l'onglet Code ;
+              // tout le reste (contrat, décision, code, réponse) dans le
+              // brouillon du bloc de travail — jamais dans `content`.
+              if (demande.phase === "production" && demande.outil === "write_app") {
+                productionEnCours += t;
+                if (!rafProduction) rafProduction = requestAnimationFrame(flushProduction);
+                return;
+              }
+              pending += t;
+              if (!raf) raf = requestAnimationFrame(flushTokens);
+            },
+            onBilan: (b) => {
+              bilan = b;
             },
             onEtape: (etape) => {
               // L'ÉTAPE RÉELLE DU MOTEUR, telle quelle : « premier calcul… »
-              // pendant le pré-remplissage, « premier jeton reçu… » à partir du
-              // premier jeton. C'est ce qui évite un écran muet — donc
-              // indiscernable d'un blocage — pendant le premier calcul, qui est
-              // justement le moment où un modèle fraîchement chargé peut encore
-              // se bloquer. Aucune durée n'est annoncée : elle serait inventée.
-              // « terminé » est ignoré ici : c'est la mesure de débit ci-dessous
-              // qui prend la suite, avec des chiffres réels.
+              // pendant le pré-remplissage. « terminé » est ignoré ici : c'est la
+              // mesure de débit ci-dessous qui prend la suite, avec des chiffres.
               if (etape === "termine") return;
-              thinking = libelleEtape(etape);
-              patchAssistant(pulse(true));
+              if (etape === "premier_calcul") {
+                thinking = `${libellePhase(demande.phase, demande.outil)} ${libelleEtape(etape)}`;
+                patchAssistant(pulse(true));
+              }
             },
             onVitesse: (tokParSeconde, jetons, ms) => {
-              // Chiffres rendus par le moteur, écrits tels quels dans le fil. On
-              // n'écrit PLUS « mesuré sur cet appareil » : le compte de jetons du
-              // moteur (`tokens_predicted`) n'est fiable qu'une fois le correctif
-              // natif compilé dans le .so — tant que ce n'est pas prouvé, une
-              // telle mention serait une prétention de plus.
+              // Chiffres rendus par le moteur, écrits tels quels dans le fil.
               const morceaux = [
                 jetons > 0 ? `${jetons} jetons` : null,
                 `${tokParSeconde.toFixed(1)} tok/s`,
@@ -654,14 +813,23 @@ export const useSession = create<SessionState>((set, get) => ({
               ].filter((m): m is string => m !== null);
               thinking = morceaux.join(" · ");
               patchAssistant(pulse(true));
-              // APRÈS le rafraîchissement en direct : c'est le chiffre qui reste
-              // affiché, pas l'estimation intermédiaire.
               set({
                 tokPerSec: arrondiVitesse(tokParSeconde),
                 engineNote: `${moteurActif.device()} · ${tokParSeconde.toFixed(1)} tok/s`,
               });
             },
           });
+          return { texte, bilan };
+        },
+        onPas: (p) => {
+          // La frise : une ligne par appel au moteur, la même donnée que la
+          // ligne de trace écrite par la boucle (`ligneTracePas`).
+          pasDuTour = [...pasDuTour.filter((x) => x.id !== p.id), p].sort((a, b) => a.id - b.id);
+          patchAssistant(pulse(true));
+        },
+        onAchevement: (etat) => {
+          achevement = etat;
+          patchAssistant(pulse(true));
         },
         onEtape: (etape) => {
           const t: ToolEvent = {
@@ -674,6 +842,18 @@ export const useSession = create<SessionState>((set, get) => ({
           tools.push(t);
           patchAssistant(pulse(true));
         },
+        // VÉRIFICATION LÀ OÙ LE CODE TOURNE : Worker pour un calcul pur ; pour
+        // une app, exécution DANS l'aperçu et verdict de l'aperçu réel. Sans
+        // aperçu monté, le critère est « non vérifié » — jamais une erreur
+        // fabriquée par un environnement où le code ne tourne pas.
+        verifier: creerVerificateur({
+          executerJs: harnais.executerJsStructure,
+          executerDansApercu: (code) => (apercuDisponible() ? evaluerDansApercu(code) : Promise.resolve(null)),
+          verdictApercu: () => {
+            const version = get().studio?.version ?? 0;
+            return version > 0 ? verdictApercu(version, () => get().console) : Promise.resolve(null);
+          },
+        }),
         executer: async (outil) => {
           if (outil.nom === "run_js") {
             return harnais.executerJs(String(outil.args.code ?? ""));
@@ -681,19 +861,52 @@ export const useSession = create<SessionState>((set, get) => ({
           if (outil.nom === "write_app") {
             const titre = String(outil.args.title ?? "App");
             const html = String(outil.args.html ?? "");
+            const tronque = outil.args.tronque === true;
+            const jetons = typeof outil.args.jetons === "number" ? outil.args.jetons : null;
+            const pas = typeof outil.args.pas === "number" ? outil.args.pas : 0;
             if (!html.trim()) return "erreur : html vide, rien n'a été écrit";
+            if (rafProduction) cancelAnimationFrame(rafProduction);
+            rafProduction = 0;
+            // NOUVELLE VERSION de l'aperçu : le pont porte son numéro, donc les
+            // messages tardifs de la version précédente ne comptent pas.
+            const version = ++versionApercu;
+            preparerVersion(version);
+            const precedent = get().studio;
+            const versions: VersionStudio[] = [
+              ...(precedent?.question === text ? precedent.versions : []),
+              { pas, html, tronque, jetons, date: Date.now() },
+            ];
             set({
-              studio: { title: titre, html: wrapHtml(html) },
+              studio: {
+                title: titre,
+                html,
+                htmlApercu: injecterPont(wrapHtml(html), version),
+                version,
+                versions,
+                enCours: null,
+                tronque,
+                question: text,
+                modele: get().model,
+              },
               studioTab: "preview",
               studioOpen: true,
             });
-            // VÉRIFICATION : on exécute le JavaScript de l'app écrite et on
-            // renvoie l'éventuelle erreur au modèle, qui corrigera au pas suivant.
-            const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
-            if (!script)
-              return `application « ${titre} » écrite dans le studio (aucun script à vérifier)`;
-            const verdict = await harnais.executerJs(script);
-            return `application « ${titre} » écrite dans le studio. Vérification du script : ${verdict}`;
+            // VÉRIFICATION DANS L'IFRAME, plus dans un Worker : on attend le
+            // signal de chargement du pont, puis une garde (les erreurs d'une
+            // app arrivent souvent au premier requestAnimationFrame), et on
+            // renvoie au modèle les erreurs RÉELLES, avec ligne et colonne.
+            const entete = `application « ${titre} » écrite dans le studio (version ${versions.length})`;
+            const verdict = await verdictApercu(version, () => get().console);
+            if (verdict === null) {
+              return `${entete}. Aperçu NON monté : le rendu n'a pas pu être vérifié.`;
+            }
+            const erreurs = verdict.erreurs.length
+              ? ` — ${verdict.erreurs.length} erreur(s) console : ${verdict.erreurs.slice(0, 3).join(" | ")}`
+              : " — aucune erreur console";
+            if (!verdict.charge) {
+              return `${entete}. Aperçu réel : la fin du chargement n'a PAS été signalée en 4 s${erreurs}`;
+            }
+            return `${entete}. Aperçu réel : chargée${erreurs}`;
           }
           if (outil.nom === "remember") {
             const notes = harnais.ajouterMemoire(String(outil.args.note ?? ""));
@@ -704,43 +917,77 @@ export const useSession = create<SessionState>((set, get) => ({
       });
 
       if (raf) cancelAnimationFrame(raf);
-      if (pending) flushTokens();
-      // Le moteur rend le texte BRUT (c'est ce qui garde le préfixe du cache KV
-      // réutilisable, cap-completion.cpp:178). On ne nettoie donc QUE pour
-      // l'affichage, et seulement au moment où le texte part à l'écran : les
-      // jetons déjà diffusés le sont tels quels.
+      raf = 0;
+      if (rafProduction) cancelAnimationFrame(rafProduction);
+      rafProduction = 0;
+      pending = "";
+      brouillon = "";
+      // C4 CORRIGÉ : la réponse affichée est la réponse ANALYSÉE par le
+      // harnais (`resultat.reponse`), plus la concaténation des sorties brutes de
+      // chaque pas. Le nettoyage d'affichage ne touche que ce qui part à l'écran.
       const { nettoyerPourAffichage } = await import("@/ai/moteurNatif");
-      content = content || nettoyerPourAffichage(resultat.reponse);
+      content = nettoyerPourAffichage(resultat.reponse);
+      achevement = resultat.achevement;
+      // Le bloc de travail affiche l'état d'achèvement complet (critères, pas,
+      // tronqué) : la ligne de résumé y figure déjà, on ne la répète pas ici.
+      thinking = "";
+      void import("@/ai/journal").then(({ noter }) => noter(`tour terminé · ${resumeAchevement(resultat.achevement)}`));
+      const studioFinal = get().studio;
+      if (studioFinal && studioFinal.enCours !== null) set({ studio: { ...studioFinal, enCours: null } });
 
-      const fence = extractHtmlBlock(content);
-      if (fence) {
-        // Le modèle a écrit une app : on la pousse dans le studio.
-        tools.push({
+      // HISTORIQUE : l'app produite est conservée sur l'appareil, avec ses
+      // versions (dont les tronquées, marquées) et les métriques MESURÉES du
+      // tour. `null` là où rien n'a été mesuré.
+      const studioProduit = get().studio;
+      if (resultat.html && studioProduit && studioProduit.question === text) {
+        const bilans = pasDuTour.map((p) => p.bilan).filter((b): b is BilanGeneration => b !== null);
+        const jetonsProduits = bilans.reduce<number | null>(
+          (acc, b) => (b.jetonsPredits === null ? acc : (acc ?? 0) + b.jetonsPredits),
+          null,
+        );
+        const vitesse = moteurActif.tokPerSec();
+        const reglages = get().reglages;
+        const app: AppEnregistree = {
           id: newId(),
-          name: "write_app",
-          status: "done",
-          result: "bloc HTML du modèle local",
-        });
-        set({
-          studio: { title: "App générée", html: wrapHtml(fence) },
-          studioTab: "preview",
-          studioOpen: true,
-        });
+          date: Date.now(),
+          titre: studioProduit.title,
+          question: text,
+          modele: get().model,
+          reglages: { nCtx: reglages.nCtx, nBatch: reglages.nBatch, nThreads: reglages.nThreads },
+          html: studioProduit.html,
+          versions: studioProduit.versions.map((v) => ({ ...v })),
+          metriques: {
+            tokParSeconde: vitesse,
+            jetonsProduits,
+            dureeMs: Date.now() - debutTour,
+            pasUtilises: resultat.achevement.pasUtilises,
+            criteres: criteresLisibles(resultat.achevement),
+            conclu: resultat.achevement.conclu,
+            tronque: resultat.achevement.tronque,
+          },
+        };
+        void enregistrerApp(app)
+          .then(() => listerApps())
+          .then((historique) => set({ historique }))
+          .catch((e) => {
+            void import("@/ai/journal").then(({ noter }) =>
+              noter(`historique : enregistrement impossible — ${e instanceof Error ? e.message : String(e)}`),
+            );
+          });
       }
 
       const vitesse = moteurActif.tokPerSec();
       set((s) => ({
         messages: s.messages.map((msg) =>
           msg.id === assistant.id
-            ? { ...msg, content: content || msg.content, thinking, tools: [...tools] }
+            ? { ...msg, content, thinking, tools: [...tools], brouillon: "", pas: pasDuTour, achevement }
             : msg,
         ),
         streaming: false,
         memoryGb: MODELS[s.model].idleGb,
         // Le débit du moteur reste affiché. `null` veut dire « rien à montrer » :
         // on laisse 0, et l'interface écrit « — » au lieu de « 0,0 tok/s », qui
-        // se lirait comme un chiffre relevé. Aucun mot « mesuré » : le compte de
-        // jetons n'est fiable qu'une fois le correctif natif compilé dans le .so.
+        // se lirait comme un chiffre relevé.
         tokPerSec: vitesse === null ? 0 : arrondiVitesse(vitesse),
         engine: "pret",
         engineNote:
@@ -820,12 +1067,15 @@ export const useSession = create<SessionState>((set, get) => ({
         tokPerSec: 0,
         error: echec,
         messages: s.messages.map((m) =>
-          m.id === assistant.id ? { ...m, thinking, tools: [...tools], content: echec } : m,
+          m.id === assistant.id
+            ? { ...m, thinking, tools: [...tools], content: echec, brouillon: "", pas: pasDuTour, achevement }
+            : m,
         ),
       }));
     }
   },
-}));
+  };
+});
 
 function wrapHtml(html: string) {
   if (/<html/i.test(html)) return html;

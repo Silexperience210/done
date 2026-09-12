@@ -13,6 +13,9 @@
  * `src/ai/moteurNatif.ts`) ; les performances affichées sont MESURÉES sur
  * l'appareil, jamais écrites en dur.
  */
+import type { EtatAchevement } from "@/ai/achevement";
+import type { PasAgent } from "@/ai/agent";
+
 export type ModelId = "coder3b" | "coder15" | "coder05";
 
 export type ChatRole = "user" | "assistant";
@@ -30,9 +33,21 @@ export type ToolEvent = {
 export type ChatMessage = {
   id: string;
   role: ChatRole;
+  /**
+   * La réponse ANALYSÉE du harnais — jamais la concaténation des sorties brutes
+   * de chaque pas (c'était le défaut C4 : `content` accumulait les JSON de tous
+   * les pas et la vraie réponse était ignorée). La sortie brute en cours vit
+   * dans `brouillon`, le temps de la génération.
+   */
   content: string;
   thinking?: string;
   tools?: ToolEvent[];
+  /** Sortie brute du pas en cours, en flux (contrat, décision) : affichée dans le bloc de travail. */
+  brouillon?: string;
+  /** Chaque appel au moteur du tour, avec son bilan réel : la donnée de la frise. */
+  pas?: PasAgent[];
+  /** État d'achèvement du tour : critères ✓/✗, pas, tronqué, conclu. */
+  achevement?: EtatAchevement;
 };
 
 /**

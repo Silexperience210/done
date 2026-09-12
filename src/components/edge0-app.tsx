@@ -226,7 +226,13 @@ function Transcript() {
           }
           return (
             <li key={m.id} className="max-w-[94%] text-sm leading-relaxed text-fg/95 text-pretty">
-              <ThinkingBlock thinking={m.thinking} tools={m.tools} live={live} />
+              <ThinkingBlock
+                thinking={m.thinking}
+                brouillon={m.brouillon}
+                pas={m.pas}
+                achevement={m.achevement}
+                live={live}
+              />
               <AssistantBody text={m.content} caret={live && Boolean(m.content)} />
             </li>
           );
@@ -362,7 +368,7 @@ function Composer({
             className="flex items-center gap-1.5 rounded-full bg-elevated px-3 py-1.5 text-xs font-medium text-fg"
           >
             <Play className="size-3" strokeWidth={2} />
-            Run
+            Aperçu
           </button>
           <button
             type="button"

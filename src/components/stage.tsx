@@ -41,12 +41,13 @@ export function Stage() {
               tokPerSec={tokPerSec}
             />
           </div>
-          {last?.role === "assistant" && (last.tools?.length || last.thinking) ? (
+          {last?.role === "assistant" && (last.pas?.length || last.thinking) ? (
             <p className="mt-4 font-mono text-xs text-muted">
               {streaming ? "tour en cours" : "dernier tour"}
-              {last.tools?.length
-                ? ` · ${last.tools.length} tool call${last.tools.length > 1 ? "s" : ""}`
+              {last.pas?.length
+                ? ` · ${last.pas.length} appel${last.pas.length > 1 ? "s" : ""} au moteur`
                 : ""}
+              {last.achevement ? ` · ${last.achevement.criteres.filter((c) => c.etat === "ok").length}/${last.achevement.criteres.length} critères` : ""}
             </p>
           ) : null}
         </div>

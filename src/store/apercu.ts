@@ -50,6 +50,11 @@ export function installerEcouteApercu(onEntree: (e: EntreeConsole) => void): voi
   window.addEventListener("message", (e: MessageEvent) => {
     const m = lireMessageApercu(e.data);
     if (!m) return;
+    // SEULE l'iframe enregistrée compte : la page monte deux arbres dont un seul
+    // est affiché (voir `Apercu` dans studio.tsx). Un message d'une autre
+    // fenêtre — ou arrivé après le démontage — ne doit ni doubler une ligne de
+    // console, ni répondre à une évaluation à la place de l'aperçu réel.
+    if (fenetreApercu === null || e.source !== fenetreApercu) return;
     if (m.type === "console") {
       surEntree?.(m.entree);
       return;

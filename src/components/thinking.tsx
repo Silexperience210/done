@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
-import { Check, ChevronDown, LoaderCircle, Terminal, Wrench } from "lucide-react";
-import { toolLabel, type ToolEvent } from "@/lib/edge0";
+import { Check, ChevronDown, LoaderCircle } from "lucide-react";
+import type { PasAgent } from "@/ai/agent";
+import type { EtatAchevement } from "@/ai/achevement";
 import { cn } from "@/lib/utils";
+import { Timeline } from "./timeline";
 
 // PLACEHOLDERS SUPPRIMÉS.
 //
@@ -11,29 +13,41 @@ import { cn } from "@/lib/utils";
 // par un routeur maison, et « Prefill on UFS » n'était lu nulle part. C'était de
 // l'instrumentation décorative qui se faisait passer pour l'activité réelle du
 // moteur. À la place, une ligne VRAIE : on attend le premier jeton.
+//
+// LISTE D'OUTILS REMPLACÉE PAR LA FRISE (timeline.tsx). L'ancienne liste ne
+// montrait que les outils exécutés, avec un résultat coupé à 200 caractères :
+// un pas coupé par n_predict, un contrat refusé, un `done` sans preuve n'y
+// apparaissaient pas. La frise montre CHAQUE appel au moteur avec ses chiffres
+// réels et sa raison d'arrêt — la même donnée que la ligne de trace.
 
 const ATTENTE = "en attente du premier jeton…";
 
 export function ThinkingBlock({
   thinking,
-  tools,
+  brouillon,
+  pas,
+  achevement,
   live,
 }: {
   thinking?: string;
-  tools?: ToolEvent[];
+  /** Sortie brute du pas en cours (contrat, décision), en flux. */
+  brouillon?: string;
+  pas?: PasAgent[];
+  achevement?: EtatAchevement;
   live: boolean;
 }) {
-  const hasTools = (tools?.length ?? 0) > 0;
+  const hasPas = (pas?.length ?? 0) > 0;
   const hasText = Boolean(thinking?.trim());
+  const hasBrouillon = live && Boolean(brouillon?.trim());
   const [open, setOpen] = useState(true);
 
   useEffect(() => {
     if (live) setOpen(true);
   }, [live]);
 
-  if (!live && !hasText && !hasTools) return null;
+  if (!live && !hasText && !hasPas && !achevement) return null;
 
-  const label = live ? "Thinking" : hasTools ? "Tools" : "Thought";
+  const label = live ? "Travail en cours" : hasPas ? `${pas!.length} appel${pas!.length > 1 ? "s" : ""} au moteur` : "Travail";
 
   return (
     <div className="mb-3 overflow-hidden rounded-lg border border-border bg-elevated">
@@ -45,7 +59,7 @@ export function ThinkingBlock({
         {live ? (
           <LoaderCircle className="size-3.5 animate-spin text-muted" strokeWidth={2} />
         ) : (
-          <Check className="size-3.5 text-ok" strokeWidth={2} />
+          <Check className={cn("size-3.5", achevement && !achevement.conclu ? "text-hot" : "text-ok")} strokeWidth={2} />
         )}
         <span className={cn("flex-1 text-xs font-medium", live ? "think-shimmer" : "text-muted")}>
           {label}
@@ -59,8 +73,8 @@ export function ThinkingBlock({
         />
       </button>
       {open && (
-        <div className="border-t border-border px-3 py-2">
-          {live && !hasText && !hasTools && (
+        <div className="flex flex-col gap-2 border-t border-border px-3 py-2">
+          {live && !hasText && !hasPas && !hasBrouillon && (
             <p className="font-mono text-xs text-muted">{ATTENTE}</p>
           )}
           {hasText && (
@@ -68,32 +82,12 @@ export function ThinkingBlock({
               {thinking}
             </p>
           )}
-          {hasTools && (
-            <ul className={cn("flex flex-col gap-1.5", hasText && "mt-2")}>
-              {tools!.map((t) => (
-                <li key={t.id} className="flex items-start gap-2 font-mono text-xs">
-                  {t.name === "run_js" ? (
-                    <Terminal className="mt-0.5 size-3 shrink-0 text-stat" strokeWidth={2} />
-                  ) : (
-                    <Wrench className="mt-0.5 size-3 shrink-0 text-stat" strokeWidth={2} />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <p className="text-fg/90">
-                      {toolLabel(t.name)}
-                      {t.status === "start" && live ? (
-                        <span className="text-muted"> · running</span>
-                      ) : (
-                        <span className="text-ok"> · done</span>
-                      )}
-                    </p>
-                    {t.name === "run_js" && t.status === "done" && t.result && (
-                      <p className="mt-0.5 truncate text-muted">{t.result}</p>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ul>
+          {hasBrouillon && (
+            <pre className="max-h-24 overflow-hidden whitespace-pre-wrap break-all font-mono text-[11px] leading-snug text-stat/80">
+              {brouillon!.slice(-600)}
+            </pre>
           )}
+          {(hasPas || achevement) && <Timeline pas={pas ?? []} achevement={achevement} live={live} />}
         </div>
       )}
     </div>

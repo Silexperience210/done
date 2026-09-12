@@ -494,3 +494,77 @@ test("Python · l'outil est déclaré, budgété et contraint par les grammaires
   // Le format d'appel reste UNIQUE : c'est lui que le modèle connaît.
   assert.match(GRAMMAIRE_DECISION, /<tool_call>/);
 });
+
+/* ============================================================================
+ * SALUTATION — « est-ce qu'il lance des outils si je dis bonjour ? »
+ *
+ * Question posée par le propriétaire, et la réponse doit être NON : une demande
+ * qui ne produit rien d'exécutable se répond en UN appel. Avant, le contrat était
+ * obligatoire pour tout : même « bonjour » coûtait un contrat, une décision et une
+ * vérification, et forçait le modèle à INVENTER un critère pour dire bonjour.
+ *
+ * Ce que ces tests protègent : le chemin direct doit rester UN appel, sans aucun
+ * outil exécuté — et il ne doit rien déclarer comme vérifié, puisqu'il n'y a rien
+ * à vérifier.
+ * ==========================================================================*/
+
+test("Salutation · « [] » est un contrat VIDE, pas un format cassé", () => {
+  const vide = analyserContrat("[]");
+  assert.equal(vide.sansCritere, true, "le modèle a dit : rien à vérifier");
+  assert.equal(vide.acceptes.length, 0);
+  assert.equal(vide.vide, true);
+
+  const illisible = analyserContrat("blabla sans aucun JSON");
+  assert.equal(illisible.sansCritere, false, "ce qui n'est pas « [] » reste illisible");
+  assert.equal(illisible.vide, true);
+
+  const normal = analyserContrat(CONTRAT_RUN);
+  assert.equal(normal.sansCritere, false, "un vrai contrat n'est pas « sans critère »");
+  assert.equal(normal.acceptes.length, 1);
+});
+
+test("Salutation · la boucle s'arrête en DEUX appels, sans exécuter le moindre outil", async () => {
+  let executions = 0;
+  const m = moteurScripte(["[]", "Bonjour ! Dis-moi ce dont tu as besoin."]);
+  const r = await boucleAgent({
+    question: "bonjour",
+    system: "s",
+    maxPas: 4,
+    generate: m.generate,
+    executer: async () => {
+      executions += 1;
+      return "outil exécuté";
+    },
+    journal: muet,
+  });
+
+  assert.equal(executions, 0, "AUCUN outil n'est exécuté pour une salutation");
+  assert.equal(m.demandes.length, 2, "un contrat (vide) puis la réponse — pas quatre appels");
+  assert.equal(m.demandes[0].phase, "contrat");
+  assert.equal(m.demandes[1].phase, "production");
+  assert.equal(m.demandes[1].outil, "done");
+  assert.equal(r.reponse, "Bonjour ! Dis-moi ce dont tu as besoin.");
+  assert.equal(r.termine, true);
+  assert.equal(r.achevement.criteres.length, 0, "rien n'est déclaré vérifié (il n'y avait rien à vérifier)");
+  assert.equal(r.achevement.conclu, true);
+  assert.match(
+    resumeAchevement(r.achevement),
+    /aucune vérification demandée/,
+    "l'écran dit que rien n'a été vérifié, il ne prétend pas avoir vérifié",
+  );
+});
+
+test("Salutation · une demande qui EXIGE un contrat le demande toujours", async () => {
+  // Rien n'a changé pour les vraies tâches : le contrat reste la première étape.
+  const m = moteurScripte([CONTRAT_RUN, APPEL_APP]);
+  const r = await boucleAgent({
+    question: "écris une app",
+    system: "s",
+    maxPas: 3,
+    generate: m.generate,
+    executer: async () => "ok",
+    journal: muet,
+  });
+  assert.equal(m.demandes[0].phase, "contrat", "le contrat est toujours demandé");
+  assert.ok(r.achevement.criteres.length > 0, "un vrai contrat a des critères à vérifier");
+});

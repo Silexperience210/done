@@ -312,10 +312,18 @@ export function analyserContrat(texte: string): {
   acceptes: Critere[];
   refuses: CritereRefuse[];
   vide: boolean;
+  /**
+   * Vrai quand le modèle a répondu un tableau VIDE — c'est-à-dire « rien à
+   * vérifier ici ». Ce n'est PAS un format cassé : confondre les deux obligeait
+   * le harnais à redemander un contrat pour une simple salutation, et à forcer le
+   * modèle à inventer un critère pour dire bonjour.
+   */
+  sansCritere: boolean;
 } {
   const candidats: unknown[] = [];
   const tableau = tableauEquilibre(texte);
   const lu = tableau ? lireJson(tableau) : undefined;
+  const sansCritere = Array.isArray(lu) && lu.length === 0;
   if (Array.isArray(lu)) candidats.push(...lu);
   else if (lu && typeof lu === "object") candidats.push(lu);
   else {
@@ -324,7 +332,7 @@ export function analyserContrat(texte: string): {
       if (o && typeof o === "object") candidats.push(o);
     }
   }
-  if (candidats.length === 0) return { acceptes: [], refuses: [], vide: true };
+  if (candidats.length === 0) return { acceptes: [], refuses: [], vide: true, sansCritere };
 
   const acceptes: Critere[] = [];
   const refuses: CritereRefuse[] = [];
@@ -337,7 +345,7 @@ export function analyserContrat(texte: string): {
     if ("critere" in v) acceptes.push(v.critere);
     else refuses.push(v.refus);
   }
-  return { acceptes, refuses, vide: false };
+  return { acceptes, refuses, vide: false, sansCritere };
 }
 
 /** Les états initiaux (« non vérifié ») d'un contrat accepté. */
@@ -680,7 +688,11 @@ export function rapportFinal(etat: EtatAchevement): string {
 export function resumeAchevement(etat: EtatAchevement): string {
   const { ok, total } = compteVerifies(etat.criteres);
   const morceaux = [
-    total === 0 ? "aucun critère" : `${ok}/${total} critère${total > 1 ? "s" : ""} ✓`,
+    total === 0
+      ? etat.conclu
+        ? "réponse directe · aucune vérification demandée"
+        : "aucun critère"
+      : `${ok}/${total} critère${total > 1 ? "s" : ""} ✓`,
     `pas ${etat.pasUtilises}/${etat.plafond}`,
     etat.conclu ? "conclu" : "non conclu",
   ];

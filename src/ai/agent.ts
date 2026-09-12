@@ -663,6 +663,7 @@ export function consigneContrat(): string {
     '  {"type":"app_sans_erreur"}                      (l\'app s\'affiche sans erreur console)',
     '  {"type":"contient","texte":"requestAnimationFrame"}   (l\'app ou la réponse contient ce texte)',
     "Un critère invérifiable (« ça marche », « le code est propre ») est refusé.",
+    "SI ET SEULEMENT SI la demande ne demande RIEN à exécuter ni à écrire (une salutation, une question de culture générale, une explication courte), réponds exactement [] : il n'y a alors rien à vérifier et tu répondras directement, en un seul appel.",
   ].join("\n");
 }
 
@@ -881,7 +882,7 @@ export async function boucleAgent(ctx: ContexteAgent): Promise<ResultatAgent> {
         { phase: "contrat", budget: budgetContrat, contraintes: contraintesHarnais(mode, "contrat") },
         (t, b) => {
           const lu = analyserContrat(t);
-          if (lu.acceptes.length > 0) return { verdict: "contrat", outil: null };
+          if (lu.acceptes.length > 0 || lu.sansCritere) return { verdict: "contrat", outil: null };
           if (coupe(b)) return { verdict: "tronque", outil: null };
           return { verdict: lu.vide ? "illisible" : "refuse", outil: null };
         },
@@ -906,6 +907,38 @@ export async function boucleAgent(ctx: ContexteAgent): Promise<ResultatAgent> {
         ctx.onAchevement?.(achevement(false, null));
         continue;
       }
+
+      /* ─── RIEN À VÉRIFIER : réponse DIRECTE, en un seul appel ─────────
+       * Le modèle a répondu `[]` : la demande ne produit rien d'exécutable (une
+       * salutation, une explication). Exiger un contrat ici coûtait trois appels
+       * au moteur et obligeait le modèle à INVENTER un critère pour dire
+       * « bonjour ». Comme il n'y a rien à vérifier, il n'y a rien à déclarer
+       * comme vérifié : l'état d'achèvement le dit (« réponse directe · aucune
+       * vérification demandée »), et aucune réussite n'est fabriquée.
+       */
+      if (lu.sansCritere) {
+        contratAccepte = true;
+        criteres = [];
+        ctx.onAchevement?.(achevement(false, null));
+        history.push({ role: "user", content: consigneProduction("done", {}) });
+        const reponse = await appeler(
+          { phase: "production", budget: budgets.production.done, outil: "done" },
+          (t, b) => ({
+            verdict: coupe(b) ? "tronque" : t.trim() ? "outil" : "illisible",
+            outil: "done",
+          }),
+        );
+        history.push({ role: "assistant", content: reponse.texte });
+        artefacts.reponse = reponse.texte.trim();
+        clore(
+          reponse.pasAgent,
+          reponse.pasAgent.verdict === "tronque"
+            ? `réponse coupée à ${ouTiret(reponse.bilan?.jetonsPredits)} jetons (limite ${budgets.production.done})`
+            : "réponse directe : aucune vérification demandée",
+        );
+        return finir(artefacts.reponse, true, reponse.pasAgent.verdict === "tronque", null);
+      }
+
       // Aucun critère accepté : on redemande, en disant POURQUOI — coupé (plus de
       // budget), refusé (les raisons, une par critère), ou rien de lisible.
       let consigne: string;

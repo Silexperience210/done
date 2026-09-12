@@ -40,75 +40,15 @@ export function AndroidPhone({
   );
 }
 
-export function AndroidStatusBar() {
-  return (
-    <div className="relative z-20 flex h-10 shrink-0 items-end px-5 pb-1 text-fg">
-      <time className="flex-1 font-android text-xs font-medium tabular-nums">9:41</time>
-      <div className="flex items-center gap-1.5">
-        <SignalIcon />
-        <span className="text-xs font-medium tracking-wide">5G</span>
-        <WifiIcon />
-        <BatteryIcon />
-      </div>
-    </div>
-  );
-}
-
-function SignalIcon() {
-  return (
-    <svg viewBox="0 0 14 12" className="h-3 w-3.5" aria-hidden>
-      <rect x="0" y="8" width="2.2" height="4" rx="0.4" fill="currentColor" opacity="0.45" />
-      <rect x="3.6" y="5.5" width="2.2" height="6.5" rx="0.4" fill="currentColor" opacity="0.7" />
-      <rect x="7.2" y="3" width="2.2" height="9" rx="0.4" fill="currentColor" />
-      <rect x="10.8" y="0.5" width="2.2" height="11.5" rx="0.4" fill="currentColor" />
-    </svg>
-  );
-}
-
-function WifiIcon() {
-  return (
-    <svg viewBox="0 0 16 12" className="h-3 w-4" fill="none" aria-hidden>
-      <path
-        d="M1 4.2c4-3.6 10-3.6 14 0"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-      <path
-        d="M3.6 6.6c2.6-2.2 6.2-2.2 8.8 0"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-      <path
-        d="M6.3 9c1-0.9 2.4-0.9 3.4 0"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
-      <circle cx="8" cy="11" r="0.9" fill="currentColor" />
-    </svg>
-  );
-}
-
-function BatteryIcon() {
-  return (
-    <svg viewBox="0 0 24 12" className="h-3 w-6" aria-hidden>
-      <rect
-        x="0.6"
-        y="1"
-        width="20"
-        height="10"
-        rx="2.2"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.2"
-      />
-      <rect x="2" y="2.6" width="15.5" height="6.8" rx="1.2" fill="currentColor" />
-      <rect x="21.4" y="4" width="1.8" height="4" rx="0.6" fill="currentColor" opacity="0.7" />
-    </svg>
-  );
-}
+// AndroidStatusBar (et les icônes SignalIcon / WifiIcon / BatteryIcon) SUPPRIMÉS.
+//
+// C'était un faux masque de barre d'état de téléphone : il PEIGNAIT une heure
+// figée (« 9:41 », qui n'est jamais l'heure réelle), un réseau (« 5G », qui
+// n'est pas mesuré — et qui n'existe même pas forcément), et une batterie pleine
+// inventée. Rien de tout cela n'était lu sur l'appareil : c'était un décor de
+// maquette, exactement ce que l'utilisateur a signalé comme « fake ».
+// Aucun de ces éléments n'est remplacé : une vraie barre d'état est déjà dessinée
+// par Android au-dessus de l'appli. On ne redessine pas des chiffres faux.
 
 export function AndroidNav() {
   return (

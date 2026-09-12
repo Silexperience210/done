@@ -1,5 +1,10 @@
-// Prouve, en exécutant le VRAI code du projet, quelles questions sont traitées
-// en local et lesquelles dépendent de l'API xAI (donc échouent sans clé).
+// Prouve, en exécutant le VRAI code du projet, quelles demandes sont traitées
+// en LOCAL et lesquelles passent par le modèle.
+//
+// `resolveLocalTurn` ne renvoie plus jamais de réponse pré-écrite : soit une
+// fonctionnalité locale déterministe (mini-app écrite à la main, calcul
+// réellement exécuté), soit `null` — et c'est alors au modèle local de
+// répondre. Il n'existe plus de branche « texte de remplacement ».
 import { resolveLocalTurn } from "./src/lib/local-apps";
 
 const questions = [
@@ -13,17 +18,15 @@ const questions = [
   "Quelle est la capitale de la France ?",
   "explique-moi la photosynthèse",
   "écris un poème sur la mer",
-  "qui a inventé le bitcoin ?",
-  "traduis 'bonjour' en anglais",
 ];
 
 for (const q of questions) {
   const t = resolveLocalTurn(q);
   const ou =
-    t.kind === "app"
-      ? `LOCAL (mini-app : ${t.app.title})`
-      : t.kind === "calc"
-        ? `LOCAL (calcul : ${t.value})`
-        : `API xAI requise → ${t.content.slice(0, 46)}…`;
+    t === null
+      ? "modèle local requis"
+      : t.kind === "app"
+        ? `LOCAL (mini-app : ${t.app.title})`
+        : `LOCAL (calcul : ${t.value})`;
   console.log(`  ${q.padEnd(38)} → ${ou}`);
 }

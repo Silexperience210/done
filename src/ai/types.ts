@@ -46,7 +46,18 @@ export type GenerateOptions = {
   history: { role: string; content: string }[];
   maxNewTokens?: number;
   onToken?: (text: string) => void;
-  /** Appelé à chaque jeton avec la vitesse instantanée mesurée, en tok/s. */
+  /**
+   * Appelé UNE fois, à la fin de la génération, avec la mesure du débit.
+   *
+   * `jetons` est le COMPTE RÉEL rendu par le moteur (0 s'il ne le fournit pas),
+   * jamais une estimation déduite d'une longueur de texte. `msDepuisPremier` est
+   * la durée de décodage retenue : celle du moteur quand il la donne
+   * (`timings.predicted_ms`), sinon la fenêtre relevée dans l'appli entre le
+   * premier jeton et la fin de l'appel.
+   *
+   * Aucun appel n'a lieu quand rien de fiable n'a pu être mesuré : mieux vaut
+   * pas de valeur qu'un 0,0 qui se fait passer pour une mesure.
+   */
   onVitesse?: (tokParSeconde: number, jetons: number, msDepuisPremier: number) => void;
   signal?: AbortSignal;
   /**

@@ -36,10 +36,17 @@ export type ChatMessage = {
 };
 
 /**
- * Chiffres RÉELS :
- * - `diskGb`  : taille du téléchargement du GGUF (depuis le Hugging Face Hub).
- * - `idleGb`  : poids du modèle résidents une fois chargé.
- * - `peakGb`  : majoré du cache KV pendant la génération.
+ * Chiffres RÉELS, alignés sur `MODELES_GGUF` (`src/ai/moteurNatif.ts`), la seule
+ * liste dont les octets ont été relevés sur l'API du Hugging Face Hub :
+ * - `diskGb` : taille du téléchargement du GGUF.
+ * - `idleGb` : poids résidents une fois le modèle chargé (≈ la taille du fichier).
+ *
+ * PAS de `peakGb` : ce champ annonçait « poids + cache KV pendant la génération »
+ * avec une réserve de KV INVENTÉE (0,4 Go pour le 1,5B comme pour le 0,5B et le
+ * 30B — la même constante pour trois architectures). Aucun de ces octets n'était
+ * mesuré. La mémoire affichée est donc désormais le seul chiffre réel dont on
+ * dispose : le poids du fichier chargé, étiqueté comme tel à l'écran.
+ *
  * Les débits (tok/s) ne sont PAS ici : ils dépendent de l'appareil et sont
  * mesurés à l'exécution.
  */
@@ -53,53 +60,57 @@ export const MODELS: Record<
     params: string;
     diskGb: number;
     idleGb: number;
-    peakGb: number;
     repo: string;
     note: string;
   }
 > = {
   coder3b: {
     id: "coder3b",
-    name: "Qwen2.5-Coder-3B-Instruct",
-    short: "Coder 3B",
+    // NOM CORRIGÉ : ce n'est pas « Qwen2.5-Coder-3B-Instruct ». Le fichier
+    // réellement téléchargé est `Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf`
+    // (voir MODELES_GGUF), un 30B à experts dont 3B sont activés par jeton.
+    // L'ancien libellé (« 3B », 3 Md de paramètres, 8,9 Go) désignait un modèle
+    // qui n'existe pas dans l'appli.
+    name: "Qwen3-Coder-30B-A3B-Instruct",
+    short: "30B-A3B",
     subtitle: "GGUF · llama.cpp · sur l'appareil",
-    params: "3 Md",
-    diskGb: 8.9,
-    idleGb: 8.9,
-    peakGb: 9.3,
+    params: "30 Md (3 activés)",
+    diskGb: 8.005,
+    idleGb: 8.005,
     repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
-    note: "Le plus capable des trois, pour un téléphone avec 8-12 Go de RAM ou du swap.",
+    note: "Le plus capable des trois, pour un téléphone avec 12 Go de RAM. 30B de connaissances, 3B activés par jeton.",
   },
   coder15: {
     id: "coder15",
     name: "Qwen2.5-Coder-1.5B-Instruct",
-    short: "Coder 1.5B",
+    short: "1.5B",
     subtitle: "GGUF · llama.cpp · sur l'appareil",
     params: "1,5 Md",
-    diskGb: 1.0,
-    idleGb: 1.0,
-    peakGb: 1.4,
+    diskGb: 0.986,
+    idleGb: 0.986,
     repo: "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF",
     note: "Le meilleur modèle de code embarquable : HTML/CSS/JS, et il écrit un français correct.",
   },
   coder05: {
     id: "coder05",
     name: "Qwen2.5-Coder-0.5B-Instruct",
-    short: "Coder 0.5B",
+    short: "0.5B",
     subtitle: "GGUF · llama.cpp · sur l'appareil",
     params: "0,5 Md",
-    diskGb: 0.4,
-    idleGb: 0.4,
-    peakGb: 0.7,
+    diskGb: 0.398,
+    idleGb: 0.398,
     repo: "bartowski/Qwen2.5-Coder-0.5B-Instruct-GGUF",
     note: "Le léger, pour les téléphones anciens : il démarre partout, plus approximatif.",
   },
 };
 
-export const SEED_PROMPT = "Explique l'inférence en flux en une phrase.";
-
-export const SEED_REPLY =
-  "En inférence en flux, le modèle produit les tokens un par un et les envoie au fur et à mesure, au lieu d'attendre d'avoir tout calculé avant de répondre.";
+// SEED_PROMPT / SEED_REPLY SUPPRIMÉS.
+// C'était une fausse conversation : une question écrite en dur ET sa réponse
+// écrite en dur, affichées au premier lancement comme si le modèle les avait
+// produites (« En inférence en flux, le modèle produit les tokens un par un… »).
+// L'utilisateur l'a reconnue. Aucun modèle n'a jamais tourné pour l'écrire.
+// La conversation démarre désormais VIDE : l'écran d'accueil propose des
+// suggestions, et toute réponse affichée vient réellement du moteur local.
 
 export const SUGGESTIONS = [
   "Un mini-jeu ping-pong que je peux lancer ici.",
@@ -149,7 +160,10 @@ export function wantsTools(text: string) {
 }
 
 export function isFrench(text: string) {
-  return /[éèêëàâùûçîïœ]/i.test(text) || /\b(le|la|les|un|une|des|écris|calcule|comment|avec|pour|que|je)\b/i.test(text);
+  return (
+    /[éèêëàâùûçîïœ]/i.test(text) ||
+    /\b(le|la|les|un|une|des|écris|calcule|comment|avec|pour|que|je)\b/i.test(text)
+  );
 }
 
 export function newId() {

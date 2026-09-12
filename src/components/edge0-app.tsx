@@ -3,7 +3,7 @@ import { ArrowUp, Code2, Play, Plus, RotateCcw } from "lucide-react";
 import { MODELS, SUGGESTIONS, type ModelId } from "@/lib/edge0";
 import { useSession } from "@/store/session";
 import { cn } from "@/lib/utils";
-import { AndroidNav, AndroidStatusBar } from "./android-phone";
+import { AndroidNav } from "./android-phone";
 import { StudioOverlay } from "./studio";
 import { ThinkingBlock } from "./thinking";
 
@@ -21,22 +21,14 @@ export function Edge0App({ overlay = false }: { overlay?: boolean }) {
     setModel,
     openStudio,
     setStudioTab,
-    tickIdle,
   } = useSession();
 
-  useEffect(() => {
-    let frame = 0;
-    const loop = (now: number) => {
-      tickIdle(now);
-      frame = requestAnimationFrame(loop);
-    };
-    frame = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(frame);
-  }, [tickIdle]);
+  // La boucle requestAnimationFrame + tickIdle ont été RETIRÉES : elles ne
+  // servaient qu'à faire osciller un chiffre de mémoire fabriqué (voir la note
+  // sur tickIdle dans store/session.ts). Il n'y a plus rien à animer en continu.
 
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-screen">
-      <AndroidStatusBar />
       <Header model={model} onModel={setModel} onClear={clear} streaming={streaming} />
       <Transcript />
       <ModeleManuelCard />
@@ -77,8 +69,8 @@ function ModeleManuelCard() {
       <p className="text-xs font-medium text-fg">Modèle introuvable — mode manuel</p>
       <p className="mt-1 text-xs leading-relaxed text-muted text-pretty">
         Télécharge ce fichier avec Chrome, puis laisse-le dans le dossier{" "}
-        <span className="font-mono text-stat">{chemin.dossier}</span> : le moteur le
-        trouve tout seul au prochain essai, sans passer par l&apos;appli.
+        <span className="font-mono text-stat">{chemin.dossier}</span> : le moteur le trouve tout
+        seul au prochain essai, sans passer par l&apos;appli.
       </p>
       <dl className="mt-2 flex flex-col gap-1 text-xs">
         <dt className="text-muted">Nom exact du fichier</dt>
@@ -112,6 +104,8 @@ function Header({
   onClear: () => void;
   streaming: boolean;
 }) {
+  // L'état RÉEL du moteur : le témoin ci-dessous n'est plus vert par défaut.
+  const engine = useSession((s) => s.engine);
   return (
     <header className="flex shrink-0 flex-col items-center gap-1 px-3 pt-1 pb-2">
       <div className="flex w-full items-center justify-between">
@@ -128,11 +122,25 @@ function Header({
         <ModelToggle model={model} onModel={onModel} disabled={streaming} />
       </div>
       <p className="flex items-center gap-1.5 text-xs text-muted">
-        <span className="size-1.5 rounded-full bg-ok" />
+        <span className={cn("size-1.5 rounded-full", pointEtat(engine))} />
         {MODELS[model].name} · on-device
       </p>
     </header>
   );
+}
+
+/**
+ * Couleur du témoin d'état du moteur.
+ *
+ * AVANT : ce point était TOUJOURS vert, même moteur au repos ou en erreur — un
+ * voyant « tout va bien » posé à côté de « on-device » alors que rien ne
+ * tournait. Il suit maintenant l'état réel renvoyé par le moteur.
+ */
+function pointEtat(engine: "repos" | "chargement" | "pret" | "erreur") {
+  if (engine === "erreur") return "bg-hot";
+  if (engine === "pret") return "bg-ok";
+  if (engine === "chargement") return "bg-primary";
+  return "bg-subtle";
 }
 
 function ModelToggle({
@@ -238,17 +246,18 @@ function AssistantBody({ text, caret }: { text: string; caret: boolean }) {
   );
 }
 
-function EmptyState({
-  onPick,
-  disabled,
-}: {
-  onPick: (t: string) => void;
-  disabled: boolean;
-}) {
+function EmptyState({ onPick, disabled }: { onPick: (t: string) => void; disabled: boolean }) {
+  // Chiffres RÉELS du modèle sélectionné (params et poids tirés de `MODELS`).
+  // AVANT : « 1,5 Md de paramètres. 1,1 Go en mémoire. » était écrit en dur —
+  // faux dès que le modèle par défaut est le 0,5B (0,4 Go), et « 1,1 Go » ne
+  // correspondait à aucune valeur connue.
+  const model = useSession((s) => s.model);
+  const profile = MODELS[model];
   return (
     <div className="flex h-full flex-col justify-end gap-3 pb-2">
       <p className="text-sm text-muted text-pretty">
-        1,5 Md de paramètres. 1,1 Go en mémoire. Tout sur l'appareil.
+        {profile.name} — {profile.params} de paramètres, {profile.idleGb.toFixed(2)} Go de poids.
+        Tout sur l&apos;appareil.
       </p>
       <ul className="flex flex-col gap-2">
         {SUGGESTIONS.map((s) => (
@@ -302,8 +311,16 @@ function Composer({
   return (
     <div className="shrink-0 px-3 pt-1 pb-1">
       <div className="mb-2 flex items-center justify-center gap-6 font-android text-xs text-muted tabular-nums">
-        <span>{memoryGb.toFixed(2)} GB</span>
-        <span>{tokPerSec.toFixed(1)} tok/s</span>
+        {/* Étiqueté « de poids » : c'est la taille RÉELLE du GGUF, pas une
+            mesure de la RAM vive de l'appareil (qu'on ne sait pas lire). */}
+        <span>{memoryGb.toFixed(2)} GB de poids</span>
+        {/*
+          Le débit affiché est celui qui a été MESURÉ pendant la génération. Tant
+          qu'aucune mesure n'existe, on écrit « — » : « 0.0 tok/s » se lirait
+          comme un débit réellement relevé, et c'est exactement l'affichage qui
+          trompait alors que le moteur tournait.
+        */}
+        <span>{tokPerSec > 0 ? `${tokPerSec.toFixed(1)} tok/s` : "— tok/s"}</span>
       </div>
       {error && !/403|inference error|credits|quota/i.test(error) && (
         <p className="mb-2 text-center text-xs text-hot">{error}</p>

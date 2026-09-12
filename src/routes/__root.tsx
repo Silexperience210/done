@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "Un petit modèle de langage exécuté dans la page, sans aucune requête sortante. Rien ne quitte l'appareil.",
+          "Un petit modèle de langage exécuté sur l'appareil, hors ligne. Une seule requête sortante : le téléchargement du modèle.",
       },
       { name: "theme-color", content: "#070708" },
     ],

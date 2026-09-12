@@ -3,11 +3,16 @@ import { Check, ChevronDown, LoaderCircle, Terminal, Wrench } from "lucide-react
 import { toolLabel, type ToolEvent } from "@/lib/edge0";
 import { cn } from "@/lib/utils";
 
-const PLACEHOLDERS = [
-  "Prefill on UFS…",
-  "Prerouter selecting experts…",
-  "Planning tool calls…",
-];
+// PLACEHOLDERS SUPPRIMÉS.
+//
+// Le bloc affichait en boucle des étapes techniques INVENTÉES pendant l'attente :
+// « Prefill on UFS… », « Prerouter selecting experts… », « Planning tool calls… ».
+// Aucune n'a lieu : il n'y a pas de « prerouter », pas de sélection d'experts
+// par un routeur maison, et « Prefill on UFS » n'était lu nulle part. C'était de
+// l'instrumentation décorative qui se faisait passer pour l'activité réelle du
+// moteur. À la place, une ligne VRAIE : on attend le premier jeton.
+
+const ATTENTE = "en attente du premier jeton…";
 
 export function ThinkingBlock({
   thinking,
@@ -21,21 +26,10 @@ export function ThinkingBlock({
   const hasTools = (tools?.length ?? 0) > 0;
   const hasText = Boolean(thinking?.trim());
   const [open, setOpen] = useState(true);
-  const [placeholder, setPlaceholder] = useState(PLACEHOLDERS[0]);
 
   useEffect(() => {
     if (live) setOpen(true);
   }, [live]);
-
-  useEffect(() => {
-    if (!live || hasText || hasTools) return;
-    let i = 0;
-    const id = setInterval(() => {
-      i = (i + 1) % PLACEHOLDERS.length;
-      setPlaceholder(PLACEHOLDERS[i]);
-    }, 520);
-    return () => clearInterval(id);
-  }, [live, hasText, hasTools]);
 
   if (!live && !hasText && !hasTools) return null;
 
@@ -53,12 +47,7 @@ export function ThinkingBlock({
         ) : (
           <Check className="size-3.5 text-ok" strokeWidth={2} />
         )}
-        <span
-          className={cn(
-            "flex-1 text-xs font-medium",
-            live ? "think-shimmer" : "text-muted",
-          )}
-        >
+        <span className={cn("flex-1 text-xs font-medium", live ? "think-shimmer" : "text-muted")}>
           {label}
         </span>
         <ChevronDown
@@ -72,7 +61,7 @@ export function ThinkingBlock({
       {open && (
         <div className="border-t border-border px-3 py-2">
           {live && !hasText && !hasTools && (
-            <p className="font-mono text-xs text-muted">{placeholder}</p>
+            <p className="font-mono text-xs text-muted">{ATTENTE}</p>
           )}
           {hasText && (
             <p className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-muted">

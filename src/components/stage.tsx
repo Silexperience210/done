@@ -25,7 +25,7 @@ export function Stage() {
           <p className="mt-3 text-2xl font-medium tracking-tight text-balance xl:text-3xl">
             Un modèle {profile.short} qui tourne sur ton téléphone.
             <span className="mt-2 block text-muted">
-              {profile.peakGb.toFixed(1)} Go en mémoire. Aucune requête sortante.
+              {profile.idleGb.toFixed(2)} Go de poids, exécutés par llama.cpp sur l&apos;appareil.
             </span>
           </p>
           <p className="mt-4 max-w-sm text-sm leading-relaxed text-muted text-pretty">
@@ -44,7 +44,9 @@ export function Stage() {
           {last?.role === "assistant" && (last.tools?.length || last.thinking) ? (
             <p className="mt-4 font-mono text-xs text-muted">
               {streaming ? "decode / tools live" : "last turn"}
-              {last.tools?.length ? ` · ${last.tools.length} tool call${last.tools.length > 1 ? "s" : ""}` : ""}
+              {last.tools?.length
+                ? ` · ${last.tools.length} tool call${last.tools.length > 1 ? "s" : ""}`
+                : ""}
             </p>
           ) : null}
         </div>

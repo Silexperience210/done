@@ -18,34 +18,33 @@ export function matchLocalApp(text: string): LocalApp | null {
   return null;
 }
 
-export function fallbackApp(text: string): LocalApp {
-  return pingPong(isFrench(text));
-}
+// fallbackApp() SUPPRIMÉ. Elle fabriquait une app ping-pong « par-dessus » un
+// échec du moteur : quand le modèle ne répondait pas, on servait quand même une
+// application générée par un gabarit et on la présentait comme la réponse. Un
+// échec doit rester un échec, pas se déguiser en réussite.
 
-export function localChat(text: string): string {
-  const fr = isFrench(text);
-  const t = text.toLowerCase();
-  if (/stream/.test(t)) {
-    return fr
-      ? "L’inférence streamée émet les tokens un par un, dès qu’ils sont calculés, au lieu d’attendre la séquence entière."
-      : "Streaming inference emits tokens one by one as they are computed, instead of waiting for the full sequence.";
-  }
-  if (/ram|mémoire|memory|working set|modèle|model|local/.test(t)) {
-    return fr
-      ? "Tout tient dans la mémoire de l'appareil : environ 0,9 Go pour Qwen2.5-Coder-1.5B en 4 bits (1,0 Go à télécharger une fois). Rien ne part sur le réseau."
-      : "Everything fits in the device's memory: about 0.9 GB for Qwen2.5-Coder-1.5B at 4 bits (1.0 GB downloaded once). Nothing goes over the network.";
-  }
-  return fr
-    ? "Les mini-apps locales (ping-pong, snake, particules, calculs) fonctionnent sans réseau ni modèle. Pour une vraie conversation, le petit modèle local — Qwen2.5-Coder-1.5B, exécuté dans la page — prend le relais."
-    : "Local mini-apps (ping pong, snake, particles, math) run without network or model. For real conversation, the small local model — Qwen2.5-Coder-1.5B, running in the page — takes over.";
-}
+// localChat() SUPPRIMÉE ENTIÈREMENT.
+// C'était un routeur à mots-clés qui RÉDIGEAIT des réponses, sans aucun modèle :
+// « stream » → un paragraphe sur l'inférence streamée ; « ram|mémoire|modèle » →
+// « environ 0,9 Go pour Qwen2.5-Coder-1.5B en 4 bits… ». Ces phrases étaient
+// écrites en dur dans le code et affichées dans la conversation comme des
+// réponses du modèle. C'est exactement le « fake » signalé par l'utilisateur.
+// Il n'existe plus : seule la branche d'ERREUR honnête subsiste (voir session.ts).
 
 export type LocalTurn =
   | { kind: "app"; app: LocalApp }
-  | { kind: "calc"; expression: string; value: string; note: string }
-  | { kind: "chat"; content: string };
+  | { kind: "calc"; expression: string; value: string; note: string };
 
-export function resolveLocalTurn(text: string, force = false): LocalTurn {
+/**
+ * Détermine si une demande correspond à une fonctionnalité LOCALE et
+ * déterministe (mini-app écrite à la main, ou calcul réellement exécuté).
+ *
+ * Renvoie `null` sinon : c'est alors au modèle local de répondre, et s'il
+ * échoue, l'appli affiche l'erreur RÉELLE — jamais un texte de remplacement.
+ * Le paramètre `force` a été retiré : il servait à fabriquer une app de gabarit
+ * après un échec du moteur.
+ */
+export function resolveLocalTurn(text: string): LocalTurn | null {
   const app = matchLocalApp(text);
   if (app) return { kind: "app", app };
   const calc = matchLocalCalc(text);
@@ -57,10 +56,7 @@ export function resolveLocalTurn(text: string, force = false): LocalTurn {
       note: isFrench(text) ? `Résultat : ${calc.value}` : `Result: ${calc.value}`,
     };
   }
-  if (force && /jeu|game|html|canvas|code|widget|app|playable/.test(text.toLowerCase())) {
-    return { kind: "app", app: fallbackApp(text) };
-  }
-  return { kind: "chat", content: localChat(text) };
+  return null;
 }
 
 export function matchLocalCalc(text: string): { expression: string; value: string } | null {

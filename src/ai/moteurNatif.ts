@@ -58,6 +58,16 @@
  *
  * Le module n'importe PAS le plugin : on le lui passe. C'est ce qui permet de le
  * tester sans Android, avec un simulacre.
+ *
+ * CE QUE LE NATIF ANDROID NE DONNE PAS — et qui a fait afficher « 0.0 tok/s »
+ * pendant que le moteur tournait : la réponse de `completion` ne contient AUCUN
+ * débit. `jni.cpp:986-997` ne remplit `timings` qu'avec `prompt_n` et
+ * `predicted_n` (« Add timing information (basic) ») ; `predicted_per_second`
+ * n'existe que côté iOS (`LlamaCpp.swift:406`) et dans les définitions
+ * partagées. Le compte de jetons, lui, est réel et présent sur Android
+ * (`tokens_predicted`, jni.cpp:948) : c'est sur LUI que repose la mesure, la
+ * durée étant relevée dans l'appli. Les détails et l'ordre de priorité sont
+ * dans `debitMesure`.
  */
 import type { GenerateOptions, LocalModelId, ProgresChargement } from "./types.ts";
 import type { Moteur } from "./moteur.ts";
@@ -201,6 +211,34 @@ export function nbThreadsCalcul(logiques: number = nbProcesseursLogiques()): num
 }
 
 /**
+ * Ce qu'une RÉPONSE de completion peut porter — forme réelle du plugin, pas
+ * forme rêvée (voir `debitMesure` pour ce qui arrive vraiment sur Android).
+ */
+export type ReponseCompletion = {
+  text?: string;
+  content?: string;
+  /**
+   * COMPTEUR RÉEL de jetons générés. Présent sur Android
+   * (`jni.cpp:948`, clé `tokens_predicted`) ET sur iOS. C'est la seule donnée
+   * de débit réellement exploitable en production.
+   */
+  tokens_predicted?: number;
+  tokens_evaluated?: number;
+  /**
+   * Bloc de mesure du moteur. Sur Android il ne contient QUE `prompt_n` et
+   * `predicted_n` (`jni.cpp:986-997`) ; les champs de débit et de durée
+   * n'existent que côté iOS (`LlamaCpp.swift:406`). On lit donc les deux
+   * formes, sans présumer de la plateforme.
+   */
+  timings?: {
+    prompt_n?: number;
+    predicted_n?: number;
+    predicted_ms?: number;
+    predicted_per_second?: number;
+  };
+};
+
+/**
  * Ce qu'on attend du plugin, et rien de plus (donc simulable).
  *
  * PAS de `saveSession`/`loadSession` ici : dans la version installée (0.1.5),
@@ -214,7 +252,7 @@ export type PluginLlama = {
   completion: (
     params: Record<string, unknown>,
     callback?: (data: { token?: string }) => void,
-  ) => Promise<{ text?: string; timings?: { predicted_per_second?: number } }>;
+  ) => Promise<ReponseCompletion>;
   releaseAllLlama?: () => Promise<void>;
 };
 
@@ -252,6 +290,11 @@ export type OptionsNatif = {
    * pire c'est sans effet.
    */
   nThreads?: number;
+  /**
+   * Horloge en millisecondes. Injectée par les tests pour que la mesure du
+   * débit soit vérifiable sans temps réel ; en production, `Date.now`.
+   */
+  maintenant?: () => number;
 };
 
 function gabaritQwen(system: string, history: { role: string; content: string }[]): string {
@@ -265,10 +308,16 @@ function gabaritQwen(system: string, history: { role: string; content: string }[
 
 /**
  * Contrat complet d'un moteur natif : le `Moteur` commun, plus ce qui n'a de
- * sens qu'en natif (vitesse mesurée par llama.cpp, modèle réellement chargé).
+ * sens qu'en natif (débit réellement mesuré, modèle réellement chargé).
  */
 export type MoteurNatif = Moteur & {
-  /** Vitesse MESURÉE par llama.cpp sur le dernier appel (tok/s). */
+  /**
+   * Débit du dernier appel, en tok/s — `null` tant qu'aucune génération n'a
+   * livré de quoi le calculer. Sur Android la valeur est le COUNT de jetons du
+   * moteur divisé par la fenêtre de décodage mesurée ici (voir `debitMesure`) :
+   * ce n'est donc pas un chiffre sorti de llama.cpp, et l'interface ne doit pas
+   * le présenter comme tel.
+   */
   derniereVitesse: () => number | null;
   /** Chemin du modèle actuellement chargé. */
   modeleCharge: () => string | null;
@@ -285,6 +334,83 @@ export type MoteurNatif = Moteur & {
  */
 export function nettoyerPourAffichage(brut: string): string {
   return brut.replace(/<\|im_(end|start)\|>/g, "").trim();
+}
+
+/** Débit retenu pour une génération, avec de quoi l'afficher sans mentir. */
+export type MesureDebit = {
+  /** Débit retenu, en jetons par seconde. TOUJOURS strictement positif. */
+  tokParSeconde: number;
+  /** Compte de jetons RÉEL du moteur ; 0 quand il ne le fournit pas. */
+  jetons: number;
+  /** Durée du décodage retenue, en millisecondes (0 si inconnue). */
+  msDepuisPremier: number;
+};
+
+/** Un nombre exploitable strictement positif, ou `null`. Jamais 0, jamais NaN. */
+function nombrePositif(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/**
+ * LA MESURE DE DÉBIT — et ce que le natif Android donne VRAIMENT.
+ *
+ * FAIT ÉTABLI, lu dans le paquet installé (llama-cpp-capacitor 0.1.5) et pas
+ * supposé : sur ANDROID, la réponse de `completion` ne porte PAS
+ * `predicted_per_second`. `android/src/main/jni.cpp:986-997` construit l'objet
+ * `timings` avec deux clés, et deux seulement — `prompt_n` et `predicted_n` —
+ * sous un commentaire qui dit lui-même « Add timing information (basic) ».
+ * `predicted_per_second`, `predicted_ms` et `prompt_per_second` n'existent que
+ * dans l'implémentation iOS (`ios/Sources/LlamaCppPlugin/LlamaCpp.swift:406`) et
+ * dans `definitions.d.ts`, qui décrit l'union des deux plateformes. L'ancien
+ * code attendait donc un champ que la plateforme de PRODUCTION ne produit
+ * jamais : la vitesse restait indéfinie et l'écran affichait « 0.0 tok/s »
+ * alors que le moteur tournait.
+ *
+ * CE QUI EST DISPONIBLE, ET QUI SUFFIT : le NOMBRE DE JETONS GÉNÉRÉS, réel, en
+ * deux endroits (`tokens_predicted`, jni.cpp:948, et `timings.predicted_n`,
+ * jni.cpp:992) — présent sur Android comme sur iOS. On divise donc un COMPTE DE
+ * JETONS RÉEL par une FENÊTRE DE DÉCODAGE MESURÉE sur l'appareil. Rien n'est
+ * déduit d'une longueur de texte : plus de `flux.length / 4`.
+ *
+ * Ordre de priorité, et il est volontaire :
+ *  1. `timings.predicted_per_second` — le débit du moteur, pris TEL QUEL quand
+ *     il existe (iOS, ou une future version Android). C'est toujours lui qui
+ *     gagne.
+ *  2. jetons réels ÷ durée mesurée — le cas Android. La durée vient du moteur
+ *     (`predicted_ms`) si elle existe, sinon de la fenêtre relevée ici entre le
+ *     premier jeton et la fin de l'appel : après le premier jeton, le moteur ne
+ *     fait QUE décoder, le pré-remplissage est derrière. On sous-estime donc
+ *     plutôt que de surestimer (à défaut de premier jeton, on retombe sur la
+ *     durée totale de l'appel, qui inclut le pré-remplissage).
+ *  3. Sinon `null` : on n'invente RIEN. Un `null` se voit à l'écran (« — »),
+ *     un 0 fabriqué se fait passer pour une mesure.
+ */
+export function debitMesure(
+  reponse: ReponseCompletion | null | undefined,
+  fenetre: { msDepuisPremierJeton: number; msTotal: number },
+): MesureDebit | null {
+  const timings = reponse?.timings;
+  const jetons = nombrePositif(timings?.predicted_n) ?? nombrePositif(reponse?.tokens_predicted);
+  const dureeMs =
+    nombrePositif(timings?.predicted_ms) ??
+    nombrePositif(fenetre.msDepuisPremierJeton) ??
+    nombrePositif(fenetre.msTotal);
+
+  // 1) Le moteur a mesuré lui-même : sa valeur passe, sans retouche.
+  const donnee = nombrePositif(timings?.predicted_per_second);
+  if (donnee !== null) {
+    return {
+      tokParSeconde: donnee,
+      jetons: jetons ?? 0,
+      msDepuisPremier: dureeMs === null ? 0 : Math.round(dureeMs),
+    };
+  }
+
+  // 2) Compte de jetons réel ÷ fenêtre mesurée.
+  if (jetons === null || dureeMs === null) return null;
+  const taux = jetons / (dureeMs / 1000);
+  if (!Number.isFinite(taux) || taux <= 0) return null;
+  return { tokParSeconde: taux, jetons, msDepuisPremier: Math.round(dureeMs) };
 }
 
 /**
@@ -376,7 +502,14 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       if (!contexte) throw new Error("aucun modèle natif chargé");
       const plugin = await opts.chargerPlugin();
       const prompt = gabaritQwen(options.system, options.history);
+      const maintenant = opts.maintenant ?? (() => Date.now());
+      const debut = maintenant();
       let flux = "";
+      // Instant du PREMIER jeton. Avant lui le moteur PRÉ-REMPLIT le prompt ;
+      // après lui il ne fait plus que décoder. C'est donc à partir de là que la
+      // fenêtre de décodage est honnête, et c'est cette fenêtre qu'on divise par
+      // le nombre de jetons quand le moteur ne donne pas son propre débit.
+      let premierJetonMs = 0;
 
       const resultat = await plugin.completion(
         {
@@ -397,19 +530,25 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         },
         (data) => {
           if (typeof data?.token === "string") {
+            if (!premierJetonMs) premierJetonMs = maintenant();
             flux += data.token;
             options.onToken?.(data.token);
           }
         },
       );
 
-      // llama.cpp rend la vitesse qu'il a MESURÉE : on la remonte telle quelle,
-      // au lieu de l'estimer à partir d'une longueur de texte.
-      const mesure = resultat?.timings?.predicted_per_second;
-      if (typeof mesure === "number" && mesure > 0) {
-        dernierTokParSeconde = mesure;
-        const jetons = Math.round(flux.length / 4);
-        options.onVitesse?.(mesure, jetons, 0);
+      // LA MESURE. Le compte de jetons vient du moteur ; la fenêtre de décodage
+      // est relevée ici quand le moteur ne la fournit pas (cas d'Android). Voir
+      // `debitMesure` : aucun débit n'est déduit d'une longueur de texte, et
+      // `null` (donc « pas de mesure ») est préféré à un chiffre inventé.
+      const fin = maintenant();
+      const mesure = debitMesure(resultat, {
+        msDepuisPremierJeton: premierJetonMs ? fin - premierJetonMs : 0,
+        msTotal: fin - debut,
+      });
+      if (mesure) {
+        dernierTokParSeconde = mesure.tokParSeconde;
+        options.onVitesse?.(mesure.tokParSeconde, mesure.jetons, mesure.msDepuisPremier);
       }
 
       // LE TEXTE EST RENDU TEL QUEL — c'est la seule forme qui laisse le

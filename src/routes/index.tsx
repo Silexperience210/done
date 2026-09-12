@@ -7,7 +7,7 @@ function Home() {
   return (
     <main>
       <h1 className="sr-only">
-        Qwen2.5-Coder-1.5B qui tourne dans ta page, hors ligne
+        Studio local — un petit modèle de code exécuté sur ton appareil, hors ligne
       </h1>
       <div className="hidden min-h-dvh lg:block">
         <Stage />

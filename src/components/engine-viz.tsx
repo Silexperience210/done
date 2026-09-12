@@ -42,7 +42,6 @@ export function EnginePanel({
   const engine = useSession((s) => s.engine);
   const engineNote = useSession((s) => s.engineNote);
   const t = useNow(streaming);
-  const memPct = Math.min(100, (memoryGb / profile.peakGb) * 100);
 
   // Petite respiration visuelle quand le moteur travaille (aucune prétention
   // technique : c'est un témoin d'activité, pas une visualisation d'experts).
@@ -78,11 +77,19 @@ export function EnginePanel({
         <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
           <dt className="text-muted">Exécution</dt>
           <dd className="text-right font-mono text-stat">
-            {engine === "chargement" ? "chargement" : engine === "erreur" ? "indisponible" : engine === "pret" ? "sur l'appareil" : "au repos"}
+            {engine === "chargement"
+              ? "chargement"
+              : engine === "erreur"
+                ? "indisponible"
+                : engine === "pret"
+                  ? "sur l'appareil"
+                  : "au repos"}
           </dd>
           <dt className="text-muted">Appareil</dt>
+          {/* Pas de repli « llama.cpp (natif) » : quand rien n'est chargé, on ne
+              prétend pas connaître le backend — on écrit « — ». */}
           <dd className="text-right font-mono text-stat">
-            {engineNote ? engineNote.split(" · ")[0] : "llama.cpp (natif)"}
+            {engineNote ? engineNote.split(" · ")[0] : "—"}
           </dd>
           <dt className="text-muted">Débit mesuré</dt>
           <dd className="text-right font-mono tabular-nums text-stat">
@@ -90,26 +97,22 @@ export function EnginePanel({
           </dd>
           <dt className="text-muted">Paramètres</dt>
           <dd className="text-right font-mono text-stat">{profile.params}</dd>
-          <dt className="text-muted">Mémoire</dt>
-          <dd className="text-right font-mono tabular-nums text-stat">
-            {memoryGb.toFixed(2)} Go
-          </dd>
+          {/* Poids RÉEL du fichier (voir MODELS) — pas une mesure de la RAM
+              occupée, donc étiqueté « poids » et pas « mémoire ». */}
+          <dt className="text-muted">Poids du modèle</dt>
+          <dd className="text-right font-mono tabular-nums text-stat">{memoryGb.toFixed(2)} Go</dd>
           <dt className="text-muted">Réseau</dt>
-          <dd className="text-right font-mono text-stat">aucun</dd>
+          {/* « aucun » était FAUX : le premier lancement télécharge le GGUF. */}
+          <dd className="text-right font-mono text-stat">aucun (hors téléchargement)</dd>
         </dl>
 
-        <div className="mt-2.5 h-1 overflow-hidden rounded-full bg-fg/10">
-          <div
-            className="h-full rounded-full bg-ok transition-[width] duration-200"
-            style={{ width: `${memPct}%` }}
-          />
-        </div>
+        {/* Barre de mémoire SUPPRIMÉE : elle remplissait un ratio inventé
+            (poids réel / « pointe » fabriquée). Il n'y a pas de budget mesuré à
+            montrer, donc on n'en dessine aucun. */}
         {engineNote ? (
           <p className="mt-2 font-mono text-[11px] leading-snug text-muted">{engineNote}</p>
         ) : (
-          <p className="mt-2 font-mono text-[11px] leading-snug text-muted">
-            {profile.note}
-          </p>
+          <p className="mt-2 font-mono text-[11px] leading-snug text-muted">{profile.note}</p>
         )}
       </div>
     </aside>

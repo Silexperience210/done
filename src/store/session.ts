@@ -3,8 +3,6 @@ import {
   extractHtmlBlock,
   MODELS,
   newId,
-  SEED_PROMPT,
-  SEED_REPLY,
   systemPrompt,
   type ChatMessage,
   type ModelId,
@@ -12,7 +10,7 @@ import {
 } from "@/lib/edge0";
 import { estApplicationNative } from "@/ai/moteur";
 import type { CheminManuel } from "@/ai/modeleLocal";
-import type { GenerateOptions, LocalModelId, ProgresChargement } from "@/ai/types";
+import type { GenerateOptions, LocalModelId, PhaseChargement, ProgresChargement } from "@/ai/types";
 import { resolveLocalTurn } from "@/lib/local-apps";
 
 /**
@@ -33,7 +31,11 @@ type MoteurActif = {
   nom: "natif";
   charger: (id: LocalModelId, onProgres?: (p: ProgresChargement) => void) => Promise<void>;
   generer: (options: GenerateOptions) => Promise<string>;
-  /** Débit MESURÉ par le moteur, ou null tant qu'il n'a rien mesuré. */
+  /**
+   * Débit réel du dernier appel (tok/s), ou `null` tant qu'aucune génération n'a
+   * livré de quoi le calculer. `null` est un RÉSULTAT (« pas de mesure »), pas
+   * une erreur : l'interface doit l'afficher « — » et jamais « 0,0 tok/s ».
+   */
   tokPerSec: () => number | null;
   /** Backend réellement utilisé, pour l'afficher sans mentir. */
   device: () => string;
@@ -59,9 +61,8 @@ function chargerMoteur(): Promise<MoteurActif> {
       // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
       // donc le build web reste intact.
       const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-      const { chargerPuisTelecharger, cheminModele, telechargerModele } = await import(
-        "@/ai/modeleLocal"
-      );
+      const { chargerPuisTelecharger, cheminModele, telechargerModele } =
+        await import("@/ai/modeleLocal");
       // ORDRE : on CHARGE D'ABORD, on ne télécharge qu'en secours. Le plugin
       // natif cherche le GGUF par son nom de fichier dans huit emplacements —
       // dont /sdcard/Download/ (LlamaCpp.java:1095, `getModelSearchPaths`) — donc
@@ -153,7 +154,13 @@ type SessionState = {
   messages: ChatMessage[];
   streaming: boolean;
   error: string | null;
-  /** Mémoire réellement occupée par les poids du modèle chargé (Go). */
+  /**
+   * Poids du modèle chargé, en Go. C'est la taille RÉELLE du fichier GGUF
+   * (relevée sur le Hub, voir `MODELS`), pas une lecture de RAM en direct : on
+   * n'a pas de mesure de la mémoire vive de l'appareil, donc on n'en invente
+   * aucune. L'interface l'étiquette « poids » pour ne pas la faire passer pour
+   * une mesure de la RAM occupée.
+   */
   memoryGb: number;
   /** Tokens/s MESURÉS sur cet appareil ; 0 tant qu'aucune génération n'a eu lieu. */
   tokPerSec: number;
@@ -177,19 +184,14 @@ type SessionState = {
   openStudio: (tab?: StudioTab) => void;
   closeStudio: () => void;
   setStudioTab: (tab: StudioTab) => void;
-  tickIdle: (t: number) => void;
 };
 
-const seedMessages: ChatMessage[] = [
-  { id: "seed-u", role: "user", content: SEED_PROMPT },
-  { id: "seed-a", role: "assistant", content: SEED_REPLY },
-];
+// seedMessages SUPPRIMÉ : voir la note sur SEED_PROMPT/SEED_REPLY dans edge0.ts.
+// La conversation démarre VIDE — plus aucune réponse écrite en dur à l'écran.
 
-/** Mémoire réelle : les poids du modèle, plus le cache KV s'il travaille. */
-function restingMemory(model: ModelId, hasReply: boolean) {
-  const m = MODELS[model];
-  return hasReply ? m.idleGb + (m.peakGb - m.idleGb) * 0.42 : m.idleGb;
-}
+// restingMemory() SUPPRIMÉE : elle interpolait entre `idleGb` et `peakGb` avec
+// des coefficients inventés (0,42). La mémoire affichée est maintenant
+// directement le poids réel du modèle (`MODELS[…].idleGb`).
 
 export const useSession = create<SessionState>((set, get) => ({
   // MODÈLE PAR DÉFAUT : le 0,5B (398 Mo), PAS le 1,5B (986 Mo).
@@ -201,10 +203,12 @@ export const useSession = create<SessionState>((set, get) => ({
   // l'utilisateur monte en qualité quand la chaîne est prouvée. C'est un défaut,
   // pas une rétrogradation : rien n'est retiré.
   model: "coder05",
-  messages: seedMessages,
+  // Conversation VIDE au démarrage : aucune fausse conversation pré-affichée.
+  messages: [],
   streaming: false,
   error: null,
-  memoryGb: MODELS.coder05.peakGb,
+  // Poids réel du 0,5B (398 Mo) : pas une valeur de pointe inventée.
+  memoryGb: MODELS.coder05.idleGb,
   tokPerSec: 0,
   engine: "repos",
   engineNote: "",
@@ -215,12 +219,11 @@ export const useSession = create<SessionState>((set, get) => ({
 
   setModel: (id) => {
     if (get().streaming) return;
-    const hasReply = get().messages.some((m) => m.role === "assistant" && m.content);
     // Changer de modèle recharge le moteur : le débit mesuré ne vaut plus rien,
     // et l'indication manuelle de l'ancien fichier ne vaut plus rien non plus.
     set({
       model: id,
-      memoryGb: restingMemory(id, hasReply),
+      memoryGb: MODELS[id].idleGb,
       tokPerSec: 0,
       engine: "repos",
       engineNote: "",
@@ -248,14 +251,12 @@ export const useSession = create<SessionState>((set, get) => ({
   closeStudio: () => set({ studioOpen: false }),
   setStudioTab: (tab) => set({ studioTab: tab }),
 
-  tickIdle: (t) => {
-    if (get().streaming) return;
-    const hasReply = get().messages.some((m) => m.role === "assistant" && m.content);
-    const base = restingMemory(get().model, hasReply);
-    set({
-      memoryGb: base + Math.sin(t / 1400) * 0.02 + Math.sin(t / 410) * 0.01,
-    });
-  },
+  // tickIdle() SUPPRIMÉE.
+  // Elle faisait « respirer » la mémoire affichée avec deux sinusoïdes
+  // (Math.sin(t / 1400) * 0.02 + Math.sin(t / 410) * 0.01) : un chiffre animé,
+  // joli, mais entièrement fabriqué au-dessus d'une valeur déjà approximative.
+  // La mémoire n'est pas un indicateur d'activité ; elle est affichée telle
+  // qu'on la connaît (le poids du fichier), sans oscillation inventée.
 
   send: async (raw) => {
     const text = raw.trim();
@@ -275,11 +276,10 @@ export const useSession = create<SessionState>((set, get) => ({
       messages: [...history, assistant],
       streaming: true,
       error: null,
-      memoryGb: profile.peakGb,
+      // Poids réel du modèle, pas une « valeur de pointe » inventée.
+      memoryGb: profile.idleGb,
     });
 
-    const started = performance.now();
-    let tokens = 0;
     let content = "";
     let thinking = "";
     const tools: ToolEvent[] = [];
@@ -293,28 +293,30 @@ export const useSession = create<SessionState>((set, get) => ({
       }));
     };
 
-    /** Débit et mémoire RÉELS pendant la génération. */
-    const pulse = (busy: boolean) => {
-      const elapsed = Math.max(0.2, (performance.now() - started) / 1000);
-      const measured = moteur ? moteur.tokPerSec() : null;
-      if (busy && tokens > 0) {
-        const live = tokens / elapsed;
-        return {
-          tokPerSec: live > 0 ? Math.round(live * 10) / 10 : 0,
-          memoryGb: profile.idleGb + (profile.peakGb - profile.idleGb) * 0.6,
-        };
-      }
-      return {
-        tokPerSec: measured ?? 0,
-        memoryGb: busy ? profile.peakGb : profile.idleGb,
-      };
-    };
+    /**
+     * Débit et poids RÉELS pendant la génération.
+     *
+     * Le débit vient UNIQUEMENT du moteur (`moteur.tokPerSec()`) : une mesure
+     * réelle de llama.cpp. Il n'est PLUS estimé à partir des caractères reçus —
+     * l'ancien `tokens / elapsed`, avec `pending.length / 4`, comptait des
+     * caractères et les faisait passer pour des jetons ; le chiffre affiché
+     * dépendait donc du texte et était faux. Sans mesure, on laisse 0, et
+     * l'interface écrit « — » au lieu d'un « 0,0 tok/s » qui se lirait comme
+     * une mesure. La mémoire, elle, reste le poids réel du fichier.
+     */
+    const pulse = (_busy?: boolean) => ({
+      tokPerSec: moteur ? (moteur.tokPerSec() ?? 0) : 0,
+      memoryGb: profile.idleGb,
+    });
 
     try {
       // 1) Les mini-apps locales : elles ne dépendent PAS du modèle, elles
-      //    répondent instantanément et hors ligne. On les garde telles quelles.
+      //    répondent instantanément et hors ligne. C'est une fonctionnalité
+      //    LOCALE et DÉTERMINISTE (un vrai jeu, un vrai calcul), pas une
+      //    imitation du modèle : rien ici ne prétend venir du moteur. Quand
+      //    `resolveLocalTurn` renvoie `null`, on passe au modèle local.
       const turn = resolveLocalTurn(text);
-      if (turn.kind !== "chat") {
+      if (turn) {
         await sleep(160);
         thinking = turn.kind === "app" ? "App locale → studio" : "Calcul local → bac à sable";
         patchAssistant(pulse(true));
@@ -347,7 +349,7 @@ export const useSession = create<SessionState>((set, get) => ({
         patchAssistant({
           ...pulse(false),
           streaming: false,
-          memoryGb: restingMemory(get().model, true),
+          memoryGb: MODELS[get().model].idleGb,
           error: null,
           engine: get().engine === "repos" ? "repos" : get().engine,
         });
@@ -365,7 +367,9 @@ export const useSession = create<SessionState>((set, get) => ({
         raf = 0;
         if (!pending) return;
         content += pending;
-        tokens += Math.max(1, Math.round(pending.length / 4));
+        // Plus de `tokens += pending.length / 4` : on ne déduit plus un nombre de
+        // jetons de la longueur du texte (voir `pulse`). Le débit affiché est
+        // celui, mesuré, que rend le moteur natif.
         pending = "";
         patchAssistant(pulse(true));
       };
@@ -375,7 +379,12 @@ export const useSession = create<SessionState>((set, get) => ({
       // puis chargé en mémoire. On ne présume donc pas de la phase : la
       // progression qui suit (« telechargement » → « initialisation » → « pret »)
       // la nomme.
-      if (get().engine !== "pret") {
+      //
+      // `chargementReel` distingue « il y a quelque chose à charger » de « le
+      // moteur est déjà prêt ». C'est ce drapeau qui empêche d'ouvrir un libellé
+      // de phase — et donc de démarrer une horloge — sur un message suivant.
+      const chargementReel = get().engine !== "pret";
+      if (chargementReel) {
         thinking = `Chargement de ${profile.name}…`;
         set({ engine: "chargement", engineNote: "préparation du modèle local" });
         patchAssistant({ memoryGb: profile.idleGb });
@@ -389,26 +398,63 @@ export const useSession = create<SessionState>((set, get) => ({
       // raison que le reste des modules natifs : ne pas les faire résoudre par le
       // build web au chargement.
       const { tailleLisible } = await import("@/ai/modeleLocal");
-      let phase = "telechargement";
+      let phase: PhaseChargement = "telechargement";
       // Dernier état de téléchargement SANS les secondes : l'horloge ci-dessous
       // le réaffiche en rafraîchissant le temps, pour que l'écran bouge même si
       // le plugin cesse d'émettre des octets.
       let etatTelechargement = "";
-      const debutChargement = Date.now();
-      const horloge = setInterval(() => {
-        const sec = Math.round((Date.now() - debutChargement) / 1000);
-        if (phase === "initialisation") {
-          thinking = `Préparation du moteur… ${sec} s. La première fois, la compilation du modèle peut prendre plusieurs minutes sur un téléphone.`;
-        } else if (phase === "telechargement" && etatTelechargement) {
-          // On rappelle le dernier état connu et on remet les SECONDES à jour :
-          // un silence du plugin se voit tout de suite, et le délai de garde de
-          // `telechargerModele` (60 s sans octet nouveau) tranche ensuite.
-          thinking = `${etatTelechargement} — ${sec} s`;
-        } else {
-          return;
+      // FERMETURE DU LIBELLÉ. `phaseClose` est la garde qui empêche l'horloge de
+      // réécrire quoi que ce soit après une réussite ; `arretHorloge` la
+      // supprime pour de bon. Sans cette fermeture, le libellé restait ouvert :
+      // une horloge d'une seconde continuait d'écrire « Préparation du moteur…
+      // N s » alors que le moteur était chargé et que le modèle avait déjà
+      // répondu — jusqu'à afficher des centaines de secondes.
+      let phaseClose = false;
+      let horloge: ReturnType<typeof setInterval> | null = null;
+      const arretHorloge = () => {
+        if (horloge !== null) {
+          clearInterval(horloge);
+          horloge = null;
         }
-        patchAssistant(pulse(true));
-      }, 1000);
+      };
+      const debutChargement = Date.now();
+
+      /** Ferme le libellé de phase sur la durée RÉELLE, une fois pour toutes. */
+      const clorePhase = (ms: number) => {
+        if (phaseClose) return;
+        phaseClose = true;
+        arretHorloge();
+        etatTelechargement = "";
+        // Durée FIGÉE, mesurée : plus d'horloge, plus de secondes qui courent.
+        const label = `moteur prêt en ${dureeLisible(ms)}`;
+        thinking = label;
+        set({ engineNote: `${label} · ${moteurActif.device()}` });
+        patchAssistant({ memoryGb: profile.idleGb });
+      };
+
+      // L'horloge n'est créée QUE s'il y a réellement un chargement à suivre :
+      // sur un message suivant, il n'y a rien à minuter, et une horloge oubliée
+      // est exactement ce qui produisait le compteur infini.
+      if (chargementReel) {
+        horloge = setInterval(() => {
+          if (phaseClose) {
+            arretHorloge();
+            return;
+          }
+          const sec = Math.round((Date.now() - debutChargement) / 1000);
+          if (phase === "initialisation") {
+            thinking = `Préparation du moteur… ${sec} s. La première fois, la compilation du modèle peut prendre plusieurs minutes sur un téléphone.`;
+          } else if (phase === "telechargement" && etatTelechargement) {
+            // On rappelle le dernier état connu et on remet les SECONDES à jour :
+            // un silence du plugin se voit tout de suite, et le délai de garde de
+            // `telechargerModele` (60 s sans octet nouveau) tranche ensuite.
+            thinking = `${etatTelechargement} — ${sec} s`;
+          } else {
+            return;
+          }
+          patchAssistant(pulse(true));
+        }, 1000);
+      }
 
       try {
         await moteurActif.charger(get().model, (p) => {
@@ -429,13 +475,21 @@ export const useSession = create<SessionState>((set, get) => ({
             thinking = `Préparation du moteur… ${sec} s`;
             set({ engineNote: `préparation du moteur — ${sec} s` });
           } else {
-            etatTelechargement = "";
-            set({ engineNote: `prêt en ${sec} s` });
+            // « pret » : le chargement est RÉELLEMENT terminé. On ferme ICI, sur
+            // `p.ecouleMs` — le temps que le moteur lui-même a mesuré —, au lieu
+            // d'attendre la fin de la boucle d'agent et de laisser le libellé
+            // ouvert entre-temps.
+            clorePhase(p.ecouleMs);
           }
           patchAssistant({ memoryGb: profile.idleGb });
         });
+        // Réussite SILENCIEUSE : certains chemins n'émettent pas de phase
+        // « pret ». On ferme quand même, avec NOTRE mesure, plutôt que de
+        // laisser un libellé ouvert. Un moteur déjà chargé n'arrive pas ici : le
+        // libellé n'a jamais été ouvert pour lui.
+        if (chargementReel) clorePhase(Date.now() - debutChargement);
       } finally {
-        clearInterval(horloge);
+        arretHorloge();
       }
 
       // Boucle d'agent : le modèle décide d'appeler des outils, un pas à la
@@ -465,7 +519,6 @@ export const useSession = create<SessionState>((set, get) => ({
             jsonSchema: contraintes?.jsonSchema,
             grammar: contraintes?.grammar,
             onToken: (t) => {
-              tokens += 1;
               if (premier) {
                 premier = false;
                 thinking = "";
@@ -474,8 +527,23 @@ export const useSession = create<SessionState>((set, get) => ({
               patchAssistant(pulse(true));
             },
             onVitesse: (tokParSeconde, jetons, ms) => {
-              thinking = `${jetons} jetons · ${tokParSeconde.toFixed(1)} tok/s · ${Math.round(ms / 1000)} s — mesure réelle, sur ton appareil`;
+              // MESURE RÉELLE, écrite en clair dans le fil : le nombre de jetons
+              // vient du moteur, la durée de la fenêtre de décodage. On ne
+              // prétend pas que llama.cpp a sorti ce débit — sur Android il ne le
+              // calcule pas — on dit qu'il a été MESURÉ sur cet appareil.
+              const morceaux = [
+                jetons > 0 ? `${jetons} jetons` : null,
+                `${tokParSeconde.toFixed(1)} tok/s`,
+                ms > 0 ? `${dureeLisible(ms)} de décodage` : null,
+              ].filter((m): m is string => m !== null);
+              thinking = `${morceaux.join(" · ")} — mesuré sur cet appareil`;
               patchAssistant(pulse(true));
+              // APRÈS le rafraîchissement en direct : c'est la mesure qui reste
+              // affichée, pas l'estimation intermédiaire.
+              set({
+                tokPerSec: arrondiVitesse(tokParSeconde),
+                engineNote: `${moteurActif.device()} · ${tokParSeconde.toFixed(1)} tok/s mesurés`,
+              });
             },
           });
         },
@@ -506,7 +574,8 @@ export const useSession = create<SessionState>((set, get) => ({
             // VÉRIFICATION : on exécute le JavaScript de l'app écrite et on
             // renvoie l'éventuelle erreur au modèle, qui corrigera au pas suivant.
             const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/i)?.[1];
-            if (!script) return `application « ${titre} » écrite dans le studio (aucun script à vérifier)`;
+            if (!script)
+              return `application « ${titre} » écrite dans le studio (aucun script à vérifier)`;
             const verdict = await harnais.executerJs(script);
             return `application « ${titre} » écrite dans le studio. Vérification du script : ${verdict}`;
           }
@@ -551,19 +620,32 @@ export const useSession = create<SessionState>((set, get) => ({
             : msg,
         ),
         streaming: false,
-        memoryGb: restingMemory(s.model, true),
-        tokPerSec: vitesse ?? 0,
+        memoryGb: MODELS[s.model].idleGb,
+        // Le débit MESURÉ pendant la génération reste affiché. `null` veut dire
+        // « rien de mesurable » : on laisse 0, et l'interface écrit « — » au lieu
+        // de « 0,0 tok/s », qui se lirait comme une mesure.
+        tokPerSec: vitesse === null ? 0 : arrondiVitesse(vitesse),
         engine: "pret",
-        engineNote: `${moteurActif.device()}${vitesse ? ` · ${vitesse} tok/s mesurés` : ""}`,
+        engineNote:
+          vitesse === null
+            ? moteurActif.device()
+            : `${moteurActif.device()} · ${vitesse.toFixed(1)} tok/s mesurés`,
         // Le modèle est chargé : plus rien à télécharger à la main.
         modeleManuel: null,
       }));
     } catch (e) {
-      // Le moteur local a échoué : on le dit, et on retombe sur les apps locales
-      // plutôt que d'inventer une réponse. L'erreur est traduite en message
-      // ACTIONNABLE : l'utilisateur doit lire quoi FAIRE. L'erreur RÉELLE du
-      // téléchargement est CONSERVÉE dans ce message (c'est notre diagnostic), on
-      // ne la remplace donc plus par une phrase générique.
+      // Le moteur local a échoué : on le DIT, et on n'invente AUCUNE réponse.
+      //
+      // C'EST ICI QU'ÉTAIT LE MENSONGE. Ce bloc appelait auparavant
+      // `resolveLocalTurn(text, true)`, qui renvoyait une phrase pré-écrite
+      // (`localChat`) ou une app de gabarit (`fallbackApp`) et la posait comme
+      // réponse de l'assistant — l'utilisateur croyait que le modèle avait
+      // répondu alors qu'aucun modèle n'avait tourné. Ce repli est supprimé.
+      //
+      // Désormais l'erreur RÉELLE est affichée telle quelle, traduite en message
+      // ACTIONNABLE (« le modèle ne tourne que dans l'appli Android », « le
+      // téléchargement ne progresse plus depuis 60 s »…). La réponse de
+      // l'assistant porte l'échec, jamais un faux contenu.
       const { cheminManuel, messageErreurActionnable } = await import("@/ai/modeleLocal");
       const brut = e instanceof Error ? e.message : "moteur local indisponible";
       const msg = messageErreurActionnable(brut, get().model);
@@ -577,37 +659,12 @@ export const useSession = create<SessionState>((set, get) => ({
       const mentionneLeFichier =
         msg.includes(manuel.fichier) || msg.includes(manuel.url) || brut.includes(manuel.fichier);
       const introuvable = get().modeleManuel ?? (mentionneLeFichier ? manuel : null);
-      // On l'écrit aussi dans le fil de la conversation, en clair : un
-      // téléchargement qui ne progresse plus (« le téléchargement ne progresse
-      // plus depuis 60 s ») doit être LISIBLE, pas seulement dans un encart.
-      // L'utilisateur sait alors qu'il peut relancer — au lieu d'un écran mort.
+      // On l'écrit dans le fil de la conversation, en clair, comme message
+      // d'ERREUR : le texte dit explicitement que le modèle n'a pas répondu et
+      // pourquoi. Ce n'est pas le modèle qui parle, c'est l'appli qui rapporte
+      // l'échec réel.
       thinking = msg;
-      const fallback = resolveLocalTurn(text, true);
-      const note =
-        fallback.kind === "calc"
-          ? fallback.note
-          : fallback.kind === "chat"
-            ? fallback.content
-            : "Le moteur local n'a pas pu démarrer.";
-      if (fallback.kind === "app") {
-        set({
-          streaming: false,
-          error: null,
-          engine: "erreur",
-          engineNote: msg,
-          modeleManuel: introuvable,
-          studio: { title: fallback.app.title, html: fallback.app.html },
-          studioTab: "preview",
-          studioOpen: true,
-          memoryGb: restingMemory(get().model, true),
-          messages: get().messages.map((m) =>
-            m.id === assistant.id
-              ? { ...m, thinking, tools: [...tools], content: fallback.app.note }
-              : m,
-          ),
-        });
-        return;
-      }
+      const echec = `Le modèle n'a pas répondu : ${msg}`;
       set((s) => ({
         streaming: false,
         engine: "erreur",
@@ -615,9 +672,9 @@ export const useSession = create<SessionState>((set, get) => ({
         modeleManuel: introuvable,
         memoryGb: MODELS[s.model].idleGb,
         tokPerSec: 0,
-        error: `Moteur local : ${msg}`,
+        error: echec,
         messages: s.messages.map((m) =>
-          m.id === assistant.id ? { ...m, thinking, tools: [...tools], content: note } : m,
+          m.id === assistant.id ? { ...m, thinking, tools: [...tools], content: echec } : m,
         ),
       }));
     }
@@ -627,6 +684,28 @@ export const useSession = create<SessionState>((set, get) => ({
 function wrapHtml(html: string) {
   if (/<html/i.test(html)) return html;
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>html,body{margin:0;background:#09090b;color:#ececef;font:14px system-ui}</style></head><body>${html}</body></html>`;
+}
+
+/**
+ * Durée LISIBLE et FIGÉE — « 820 ms », « 4,3 s », « 42 s », « 3 min 12 s ».
+ *
+ * Sert au libellé de fin de chargement : l'écran doit afficher une durée RÉELLE
+ * et arrêtée, jamais une horloge qui court. Les décimales ne sont gardées que
+ * sous les dix secondes, là où elles apprennent quelque chose ; au-delà, « 42 s »
+ * se lit mieux que « 42,3 s ».
+ */
+export function dureeLisible(ms: number): string {
+  const valeur = Math.max(0, Math.round(Number.isFinite(ms) ? ms : 0));
+  if (valeur < 1000) return `${valeur} ms`;
+  if (valeur < 10_000) return `${(valeur / 1000).toFixed(1).replace(".", ",")} s`;
+  if (valeur < 60_000) return `${Math.round(valeur / 1000)} s`;
+  const minutes = Math.floor(valeur / 60_000);
+  return `${minutes} min ${Math.round((valeur % 60_000) / 1000)} s`;
+}
+
+/** Un débit affiché au dixième : évite les « 8.433333333333334 tok/s ». */
+function arrondiVitesse(tokParSeconde: number): number {
+  return Math.round(tokParSeconde * 10) / 10;
 }
 
 function sleep(ms: number) {

@@ -3,9 +3,14 @@
  *
  * Ce qui est protégé ici, parce que c'est ce qui a coûté cher en vrai :
  *  - le streaming remonte bien jeton par jeton (sinon pas d'effet de frappe) ;
- *  - la vitesse affichée est celle MESURÉE par llama.cpp (timings), jamais une
- *    estimation fabriquée à partir d'une longueur de texte ;
- *  - AUCUN paramètre de GPU n'est envoyé : le binaire du plugin ne contient
+ *  - LE DÉBIT AFFICHÉ EST RÉELLEMENT MESURABLE SUR ANDROID. C'était le défaut :
+ *    la mesure attendue (`timings.predicted_per_second`) n'existe PAS côté
+ *    Android — `jni.cpp:986-997` ne remplit `timings` qu'avec `prompt_n` et
+ *    `predicted_n` — donc l'écran restait à « 0.0 tok/s » alors que le moteur
+ *    tournait. Le simulacre ci-dessous reproduit donc la forme RÉELLE d'Android,
+ *    et le débit est un COMPTE DE JETONS RÉEL ÷ une fenêtre de décodage MESURÉE,
+ *    jamais une estimation tirée d'une longueur de texte ;
+ *  - AUCUN PARAMÈTRE DE GPU n'est envoyé : le binaire du plugin ne contient
  *    aucun backend GPU, donc `n_gpu_layers` ne déplace rien (llama-model.cpp
  *    met `act_gpu_layers = 0` quand la liste de devices est vide). L'envoyer
  *    promettait un gain qui n'existe pas ;
@@ -32,6 +37,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   creerMoteurNatif,
+  debitMesure,
   modeleGguf,
   MODELES_GGUF,
   nbThreadsCalcul,
@@ -39,7 +45,27 @@ import {
   type PluginLlama,
 } from "./moteurNatif.ts";
 
-function pluginFactice(journal: Record<string, unknown>[], reponse?: { text?: string; vitesses?: number }) {
+/**
+ * Plugin SIMULÉ, calqué sur ce que le natif ANDROID rend VRAIMENT — pas sur la
+ * forme rêvée des définitions TypeScript, qui décrivent l'union Android+iOS.
+ *
+ * Sur Android (`jni.cpp:986-997`), `timings` ne porte que `prompt_n` et
+ * `predicted_n` : il n'y a NI `predicted_per_second`, NI `predicted_ms`. Le
+ * compte de jetons, lui, est RÉEL (`tokens_predicted`, jni.cpp:948). Un
+ * simulacre qui offrait `predicted_per_second` faisait passer les tests au vert
+ * sur une forme que la plateforme de production ne produit jamais.
+ */
+function pluginFactice(
+  journal: Record<string, unknown>[],
+  reponse?: {
+    text?: string;
+    /** Compte de jetons RÉEL rendu par le moteur (défaut : 120). */
+    jetons?: number;
+    /** Débit fourni par le moteur — présent seulement sur iOS / future version. */
+    debitsMoteur?: number;
+  },
+) {
+  const jetons = reponse?.jetons ?? 120;
   const plugin: PluginLlama = {
     initLlama: async (p) => {
       journal.push(p);
@@ -48,13 +74,32 @@ function pluginFactice(journal: Record<string, unknown>[], reponse?: { text?: st
     completion: async (p, cb) => {
       journal.push(p);
       for (const t of ["Bon", "jour"]) cb?.({ token: t });
-      return { text: reponse?.text ?? "Bonjour", timings: { predicted_per_second: reponse?.vitesses ?? 17.5 } };
+      return {
+        text: reponse?.text ?? "Bonjour",
+        tokens_predicted: jetons,
+        timings: {
+          prompt_n: 42,
+          predicted_n: jetons,
+          ...(reponse?.debitsMoteur === undefined
+            ? {}
+            : { predicted_per_second: reponse.debitsMoteur }),
+        },
+      };
     },
     releaseAllLlama: async () => {
       journal.push({ libere: true });
     },
   };
   return async () => plugin;
+}
+
+/**
+ * Horloge injectée : rend les valeurs fournies, dans l'ordre, puis répète la
+ * dernière. Permet de VÉRIFIER la mesure du débit sans temps réel.
+ */
+function horlogeValeurs(valeurs: number[]): () => number {
+  let i = 0;
+  return () => valeurs[Math.min(i++, valeurs.length - 1)];
 }
 
 const base = {
@@ -198,23 +243,130 @@ test("chaque modèle sait d'où venir et quelle taille attendre", () => {
   }
 });
 
-test("les jetons arrivent un par un et la vitesse vient de llama.cpp", async () => {
-  const m = creerMoteurNatif({ ...base, chargerPlugin: pluginFactice([], { text: "Bonjour", vitesses: 21.3 }) });
+test("les jetons arrivent un par un et le débit est mesuré sur le COMPTE RÉEL de jetons", async () => {
+  // Forme RÉELLE d'Android : aucun `predicted_per_second`, seulement le compte
+  // de jetons. Le débit vaut donc jetons réels ÷ fenêtre de décodage mesurée :
+  // 120 jetons en 5000 ms ⇒ 24 tok/s. Avec l'ancien code, ce cas rendait `null`
+  // et l'écran affichait « 0.0 tok/s » pendant que le moteur tournait.
+  const m = creerMoteurNatif({
+    ...base,
+    // Horloge : début à 0, premier jeton à 1000 ms, fin à 6000 ms.
+    maintenant: horlogeValeurs([0, 1000, 6000]),
+    chargerPlugin: pluginFactice([], { text: "Bonjour", jetons: 120 }),
+  });
   await m.charger("coder15");
   const vus: string[] = [];
-  let vitesse: number | null = null;
+  const mesures: { v: number; j: number; ms: number }[] = [];
   const texte = await m.generer({
     system: "test",
     history: [{ role: "user", content: "salut" }],
     onToken: (t) => vus.push(t),
-    onVitesse: (v) => {
-      vitesse = v;
-    },
+    onVitesse: (v, j, ms) => mesures.push({ v, j, ms }),
   });
   assert.deepEqual(vus, ["Bon", "jour"], "streaming jeton par jeton");
   assert.equal(texte, "Bonjour");
-  assert.equal(vitesse, 21.3, "la vitesse affichée est la mesure, pas une estimation");
+  assert.equal(mesures.length, 1, "une seule mesure, à la fin de la génération");
+  assert.equal(mesures[0].j, 120, "compte de jetons RÉEL rendu par le moteur");
+  assert.equal(mesures[0].v, 24, "120 jetons / 5 s de décodage");
+  assert.equal(mesures[0].ms, 5000, "durée de la fenêtre de décodage");
+  assert.equal(m.derniereVitesse(), 24);
+});
+
+test("quand le moteur fournit son propre débit, il est pris TEL QUEL", async () => {
+  // Cas iOS (et future version Android) : `predicted_per_second` existe. La
+  // mesure du moteur prime sur tout calcul local — l'horloge injectée est
+  // volontairement absurde (999 s) : si le code s'en servait, le résultat ne
+  // serait pas 21,3.
+  const m = creerMoteurNatif({
+    ...base,
+    maintenant: horlogeValeurs([0, 1000, 999_000]),
+    chargerPlugin: pluginFactice([], { jetons: 120, debitsMoteur: 21.3 }),
+  });
+  await m.charger("coder15");
+  const mesures: number[] = [];
+  await m.generer({ system: "s", history: [], onVitesse: (v) => mesures.push(v) });
+  assert.deepEqual(mesures, [21.3], "le débit du moteur passe sans retouche");
   assert.equal(m.derniereVitesse(), 21.3);
+});
+
+test("le débit mesuré suit le modèle et la dernière génération, pour les trois modèles", async () => {
+  // L'affichage ne dépend d'AUCUN moteur en particulier : il ne connaît que
+  // « un compte de jetons et une durée ». On le vérifie sur les trois modèles
+  // du sélecteur, avec une valeur différente à chaque fois.
+  for (const id of ["coder05", "coder15", "coder3b"] as const) {
+    const m = creerMoteurNatif({
+      ...base,
+      maintenant: horlogeValeurs([0, 2000, 4000]),
+      chargerPlugin: pluginFactice([], { jetons: 60 }),
+    });
+    await m.charger(id);
+    assert.equal(m.derniereVitesse(), null, `${id} : rien de mesuré avant toute génération`);
+    await m.generer({ system: "s", history: [] });
+    assert.equal(m.derniereVitesse(), 30, `${id} : 60 jetons / 2 s = 30 tok/s`);
+  }
+});
+
+test("sans compte de jetons ni débit, aucun chiffre n'est fabriqué", async () => {
+  // Plugin muet sur les mesures : aucun `timings`, aucun `tokens_predicted`.
+  // On ne PEUT pas mesurer honnêtement, donc `derniereVitesse()` reste `null` et
+  // `onVitesse` n'est pas appelé — l'interface écrira « — ». C'est ce qui
+  // distingue « pas de mesure » d'un « 0,0 tok/s » qui se lit comme un résultat.
+  const plugin: PluginLlama = {
+    initLlama: async () => ({ id: "contexte" }),
+    completion: async (_p, cb) => {
+      for (const t of ["a", "b"]) cb?.({ token: t });
+      return { text: "ab" };
+    },
+  };
+  const m = creerMoteurNatif({ ...base, chargerPlugin: async () => plugin });
+  await m.charger("coder15");
+  const mesures: number[] = [];
+  await m.generer({ system: "s", history: [], onVitesse: (v) => mesures.push(v) });
+  assert.deepEqual(mesures, [], "aucune mesure inventée");
+  assert.equal(m.derniereVitesse(), null, "pas de mesure : null, jamais 0");
+});
+
+test("debitMesure : le compte de jetons et la fenêtre de décodage, rien d'autre", () => {
+  // 1) Cas ANDROID type : jetons réels, pas de durée fournie par le moteur.
+  assert.deepEqual(
+    debitMesure(
+      { tokens_predicted: 200, timings: { prompt_n: 30, predicted_n: 200 } },
+      { msDepuisPremierJeton: 5000, msTotal: 9000 },
+    ),
+    { tokParSeconde: 40, jetons: 200, msDepuisPremier: 5000 },
+    "200 jetons / 5 s : le pré-remplissage (9000 ms au total) n'est PAS compté",
+  );
+  // 2) La durée du moteur prime sur la nôtre quand elle existe.
+  assert.deepEqual(
+    debitMesure(
+      { timings: { predicted_n: 100, predicted_ms: 2000 } },
+      { msDepuisPremierJeton: 9000, msTotal: 12_000 },
+    ),
+    { tokParSeconde: 50, jetons: 100, msDepuisPremier: 2000 },
+  );
+  // 3) Aucun premier jeton observé : repli sur la durée totale de l'appel, qui
+  //    inclut le pré-remplissage — on sous-estime plutôt que de surestimer.
+  assert.deepEqual(
+    debitMesure({ tokens_predicted: 40 }, { msDepuisPremierJeton: 0, msTotal: 4000 }),
+    { tokParSeconde: 10, jetons: 40, msDepuisPremier: 4000 },
+  );
+  // 4) Le débit du moteur gagne, même sans compte de jetons.
+  assert.deepEqual(
+    debitMesure({ timings: { predicted_per_second: 12.5 } }, { msDepuisPremierJeton: 8000, msTotal: 8000 }),
+    { tokParSeconde: 12.5, jetons: 0, msDepuisPremier: 8000 },
+  );
+  // 5) Rien d'exploitable : `null`, et surtout pas 0.
+  assert.equal(debitMesure(undefined, { msDepuisPremierJeton: 0, msTotal: 0 }), null);
+  assert.equal(debitMesure({}, { msDepuisPremierJeton: 5000, msTotal: 5000 }), null, "des jetons, mais aucune durée");
+  assert.equal(debitMesure({ tokens_predicted: 10 }, { msDepuisPremierJeton: 0, msTotal: 0 }), null, "une durée nulle n'est pas une mesure");
+  // 6) Valeurs absurdes (0, NaN, négatives) : ignorées, jamais propagées.
+  assert.equal(
+    debitMesure(
+      { tokens_predicted: Number.NaN, timings: { predicted_n: 0, predicted_per_second: 0 } },
+      { msDepuisPremierJeton: -1, msTotal: 0 },
+    ),
+    null,
+  );
 });
 
 test("le texte rendu est celui du moteur, NON reformaté", async () => {
@@ -225,7 +377,7 @@ test("le texte rendu est celui du moteur, NON reformaté", async () => {
     initLlama: async () => ({ id: "contexte" }),
     completion: async (_p, cb) => {
       for (const t of ["  ", "Bonjour", "\n"]) cb?.({ token: t });
-      return { text: brut, timings: { predicted_per_second: 9 } };
+      return { text: brut, timings: { predicted_n: 3 } };
     },
   };
   const m = creerMoteurNatif({ ...base, chargerPlugin: async () => plugin });

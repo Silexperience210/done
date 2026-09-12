@@ -170,11 +170,19 @@ function restingMemory(model: ModelId, hasReply: boolean) {
 }
 
 export const useSession = create<SessionState>((set, get) => ({
-  model: "coder15",
+  // MODÈLE PAR DÉFAUT : le 0,5B (398 Mo), PAS le 1,5B (986 Mo).
+  // Le premier lancement impose un téléchargement ; sur le 1,5B il dure
+  // plusieurs minutes sans qu'on puisse vérifier quoi que ce soit d'autre entre
+  // temps. Le 0,5B divise ce temps par ~2,5, ce qui permet de tester la
+  // MÉCANIQUE (téléchargement → chargement natif → premier jeton) rapidement.
+  // Les deux autres modèles restent dans le sélecteur (`MODELS`, edge0.ts) :
+  // l'utilisateur monte en qualité quand la chaîne est prouvée. C'est un défaut,
+  // pas une rétrogradation : rien n'est retiré.
+  model: "coder05",
   messages: seedMessages,
   streaming: false,
   error: null,
-  memoryGb: MODELS.coder15.peakGb,
+  memoryGb: MODELS.coder05.peakGb,
   tokPerSec: 0,
   engine: "repos",
   engineNote: "",
@@ -348,14 +356,32 @@ export const useSession = create<SessionState>((set, get) => ({
         patchAssistant({ memoryGb: profile.idleGb });
       }
 
-      // Progression RÉELLE en deux phases. La barre atteignait 100 % puis plus
-      // rien : c'était la construction de la session ONNX et l'allocation GPU,
-      // longues et silencieuses. On les nomme, et on compte les secondes.
+      // Progression RÉELLE, en deux phases, avec les OCTETS et pas seulement un
+      // pourcentage : l'utilisateur doit pouvoir lire « téléchargement du modèle
+      // 42 % (430 Mo / 986 Mo) », pas un écran figé. Les tailles sont mises en
+      // forme par `tailleLisible`, la MÊME fonction que les messages d'erreur.
+      // `tailleLisible` est importé ici (et non en tête de fichier) pour la même
+      // raison que le reste des modules natifs : ne pas les faire résoudre par le
+      // build web au chargement.
+      const { tailleLisible } = await import("@/ai/modeleLocal");
       let phase = "telechargement";
+      // Dernier état de téléchargement SANS les secondes : l'horloge ci-dessous
+      // le réaffiche en rafraîchissant le temps, pour que l'écran bouge même si
+      // le plugin cesse d'émettre des octets.
+      let etatTelechargement = "";
       const debutChargement = Date.now();
       const horloge = setInterval(() => {
-        if (phase !== "initialisation") return;
-        thinking = `Préparation du moteur… ${Math.round((Date.now() - debutChargement) / 1000)} s. La première fois, la compilation du modèle peut prendre plusieurs minutes sur un téléphone.`;
+        const sec = Math.round((Date.now() - debutChargement) / 1000);
+        if (phase === "initialisation") {
+          thinking = `Préparation du moteur… ${sec} s. La première fois, la compilation du modèle peut prendre plusieurs minutes sur un téléphone.`;
+        } else if (phase === "telechargement" && etatTelechargement) {
+          // On rappelle le dernier état connu et on remet les SECONDES à jour :
+          // un silence du plugin se voit tout de suite, et le délai de garde de
+          // `telechargerModele` (60 s sans octet nouveau) tranche ensuite.
+          thinking = `${etatTelechargement} — ${sec} s`;
+        } else {
+          return;
+        }
         patchAssistant(pulse(true));
       }, 1000);
 
@@ -364,12 +390,21 @@ export const useSession = create<SessionState>((set, get) => ({
           phase = p.phase;
           const sec = Math.round(p.ecouleMs / 1000);
           if (p.phase === "telechargement") {
-            thinking = `Téléchargement de ${profile.name}… ${p.pct} %${p.fichier ? ` (${p.fichier.split("/").pop()})` : ""}`;
-            set({ engineNote: `téléchargement ${p.pct} % — ${sec} s` });
+            // Octets réels quand le plugin les donne, repli sur la taille connue
+            // du GGUF sinon — jamais un « / 0 Mo » ni un pourcentage inventé.
+            const recus = typeof p.octetsRecus === "number" ? p.octetsRecus : 0;
+            const total =
+              typeof p.octetsTotal === "number" && p.octetsTotal > 0
+                ? p.octetsTotal
+                : profile.diskGb * 1e9;
+            etatTelechargement = `téléchargement du modèle ${p.pct} % (${tailleLisible(recus)} / ${tailleLisible(total)})`;
+            thinking = `${etatTelechargement} — ${sec} s`;
+            set({ engineNote: `${etatTelechargement} — ${sec} s` });
           } else if (p.phase === "initialisation") {
             thinking = `Préparation du moteur… ${sec} s`;
             set({ engineNote: `préparation du moteur — ${sec} s` });
           } else {
+            etatTelechargement = "";
             set({ engineNote: `prêt en ${sec} s` });
           }
           patchAssistant({ memoryGb: profile.idleGb });
@@ -504,6 +539,11 @@ export const useSession = create<SessionState>((set, get) => ({
       const { messageErreurActionnable } = await import("@/ai/modeleLocal");
       const brut = e instanceof Error ? e.message : "moteur local indisponible";
       const msg = messageErreurActionnable(brut, get().model);
+      // On l'écrit aussi dans le fil de la conversation, en clair : un
+      // téléchargement qui ne progresse plus (« le téléchargement ne progresse
+      // plus depuis 60 s ») doit être LISIBLE, pas seulement dans un encart.
+      // L'utilisateur sait alors qu'il peut relancer — au lieu d'un écran mort.
+      thinking = msg;
       const fallback = resolveLocalTurn(text, true);
       const note =
         fallback.kind === "calc"

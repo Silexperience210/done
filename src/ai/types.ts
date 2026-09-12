@@ -24,6 +24,21 @@ export type ProgresChargement = {
   fichier: string;
   /** Millisecondes écoulées : c'est CE chiffre qui prouve que ça travaille. */
   ecouleMs: number;
+  /**
+   * Octets déjà reçus, en phase « telechargement ». Vient du champ `bytes` de
+   * l'évènement `progress` du plugin Filesystem (`ProgressStatus` : `{ url,
+   * bytes, contentLength }` — vérifié dans le paquet installé 8.1.3, il n'y a
+   * AUCUN pourcentage dedans, on le calcule). Quand l'évènement reste muet,
+   * c'est la surveillance périodique du fichier qui le remplit : l'interface a
+   * toujours de quoi afficher « 430 Mo / 986 Mo » au lieu d'un écran figé.
+   */
+  octetsRecus?: number;
+  /**
+   * Taille totale annoncée, en octets (« contentLength » du même évènement).
+   * Absente si le serveur ne l'annonce pas : on retombe alors sur la taille
+   * connue du GGUF.
+   */
+  octetsTotal?: number;
 };
 
 export type GenerateOptions = {

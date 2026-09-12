@@ -18,7 +18,12 @@ import assert from "node:assert/strict";
 import {
   cheminModele,
   cheminRelatif,
+  DELAI_GARDE_MS,
+  gardeDepassee,
+  messageEchec,
   messageErreurActionnable,
+  messageGarde,
+  tailleLisible,
   taillePlausible,
   telechargerModele,
   type PluginFichiers,
@@ -32,10 +37,15 @@ const TAILLE_05 = modeleGguf("coder05").octets; // 397 808 288
 /**
  * Simulacre du plugin Filesystem. `tailles` est consommé dans l'ordre par
  * `stat` (le dernier est répété) : `null` signifie « fichier absent ».
+ *
+ * `telechargementBloque` : `downloadFile` ne rend JAMAIS la main — c'est le
+ * téléchargement qui cale (Wi-Fi tombé), le cas que le délai de garde doit
+ * transformer en message clair au lieu d'un écran mort.
  */
 function pluginFactice(o: {
   tailles: (number | null)[];
   echecTelechargement?: string;
+  telechargementBloque?: boolean;
   journal?: Record<string, unknown>[];
 }): { plugin: PluginFichiers; journal: Record<string, unknown>[] } {
   const journal = o.journal ?? [];
@@ -55,9 +65,16 @@ function pluginFactice(o: {
       if (t === null || t === undefined) throw new Error("fichier absent");
       return { size: t };
     },
+    deleteFile: async (x) => {
+      journal.push({ deleteFile: x });
+    },
     downloadFile: async (x) => {
       journal.push({ downloadFile: x });
       if (o.echecTelechargement) throw new Error(o.echecTelechargement);
+      if (o.telechargementBloque) {
+        // Ne rend jamais la main : le « fichier » cesse de grossir.
+        await new Promise<void>(() => {});
+      }
       if (x.progress && ecouteur) {
         // Un évènement d'un AUTRE fichier ne doit pas compter…
         ecouteur({ url: "https://exemple/autre.gguf", bytes: 10, contentLength: 1000 });
@@ -79,6 +96,46 @@ function pluginFactice(o: {
     },
   };
   return { plugin, journal };
+}
+
+/**
+ * Horloge pilotée par le test : `avance(ms)` fait s'écouler le temps SANS
+ * attendre, pour vérifier le délai de garde en quelques microsecondes.
+ */
+function horlogeFactice(depart = 0) {
+  let t = depart;
+  return {
+    maintenant: () => t,
+    avance: (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
+/**
+ * Minuterie pilotée par le test : `planifier` capture la fonction de
+ * surveillance, `battement()` la déclenche puis laisse la surveillance async
+ * se terminer (une macrotâche suffit : `stat` est le seul `await`).
+ */
+function minuteurFactice() {
+  let cb: (() => void) | null = null;
+  let arrete = false;
+  return {
+    planifier: (f: () => void) => {
+      cb = f;
+      return () => {
+        arrete = true;
+        cb = null;
+      };
+    },
+    battement: async () => {
+      cb?.();
+      await new Promise((r) => setTimeout(r, 0));
+    },
+    get arrete() {
+      return arrete;
+    },
+  };
 }
 
 test("cheminModele renvoie le NOM DE FICHIER SEUL, et cheminRelatif le situe sous Documents", () => {
@@ -251,5 +308,197 @@ test("changer de modèle ne réutilise pas le fichier d'un autre", async () => {
     String(dl.path).endsWith("Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf"),
     "c'est bien le 30B qui est livré",
   );
+});
+
+/* ===================================================================== */
+/* PROGRESSION VISIBLE — le défaut signalé : un écran figé, sans chiffre. */
+/* ===================================================================== */
+
+test("la progression remonte les OCTETS reçus et le TOTAL, pas seulement un pourcentage", async () => {
+  // Sans ça, l'interface n'a rien à afficher : le plugin donne `bytes` et
+  // `contentLength` (ProgressStatus), jamais le pourcentage, et il faut bien
+  // que les OCTETS remontent jusqu'à l'écran (« 430 Mo / 986 Mo »).
+  const modele = modeleGguf("coder05");
+  const { plugin } = pluginFactice({ tailles: [null, modele.octets] });
+  const phases: ProgresChargement[] = [];
+  await telechargerModele("coder05", (p) => phases.push(p), plugin);
+
+  const enCours = phases.filter((p) => p.phase === "telechargement");
+  assert.ok(enCours.length >= 2, "au moins le départ et la progression");
+  assert.equal(enCours[0].octetsRecus, 0, "on part de zéro, sans mentir");
+  assert.equal(enCours[0].octetsTotal, modele.octets, "total connu dès le départ");
+  const dernier = enCours.at(-1)!;
+  assert.equal(dernier.octetsRecus, 100, "les octets réels de l'évènement");
+  assert.equal(dernier.octetsTotal, 100, "la taille annoncée par l'évènement");
+
+  const pret = phases.at(-1)!;
+  assert.equal(pret.phase, "pret");
+  assert.equal(pret.octetsRecus, modele.octets);
+  assert.equal(pret.octetsTotal, modele.octets);
+});
+
+test("les tailles s'écrivent comme l'interface les affiche (« 430 Mo / 986 Mo »)", () => {
+  assert.equal(tailleLisible(430 * 1e6), "430 Mo");
+  assert.equal(tailleLisible(986_048_800), "986 Mo");
+  assert.equal(tailleLisible(modeleGguf("coder05").octets), "398 Mo");
+  assert.equal(tailleLisible(8_005_213_344), "8,01 Go");
+});
+
+test("le dossier parent est créé AVANT le téléchargement, jamais après", async () => {
+  // `getFileObject` du plugin ne crée pas les dossiers parents et `downloadFile`
+  // ignore `recursive` : ouvrir le fichier avant le mkdir, c'est
+  // « No such file or directory » après avoir peut-être déjà consommé du réseau.
+  const modele = modeleGguf("coder05");
+  const { plugin, journal } = pluginFactice({ tailles: [null, modele.octets] });
+  const phases: ProgresChargement[] = [];
+  await telechargerModele("coder05", (p) => phases.push(p), plugin);
+  const iMkdir = journal.findIndex((j) => "mkdir" in j);
+  const iDl = journal.findIndex((j) => "downloadFile" in j);
+  assert.ok(iMkdir >= 0, "le mkdir a bien eu lieu");
+  assert.ok(iDl >= 0, "le téléchargement a bien eu lieu");
+  assert.ok(iMkdir < iDl, "mkdir(« Documents ») précède downloadFile");
+  assert.equal(phases.at(-1)?.phase, "pret");
+});
+
+/* ===================================================================== */
+/* DÉLAI DE GARDE — 60 s sans octet nouveau : on le DIT, jamais un écran  */
+/* mort. C'est le même défaut qui avait été corrigé côté navigateur.      */
+/* ===================================================================== */
+
+test("le garde est PUR : il se déclenche sur l'absence d'octet NOUVEAU, à 60 s", () => {
+  assert.equal(DELAI_GARDE_MS, 60_000, "60 s : le délai annoncé à l'utilisateur");
+  assert.equal(gardeDepassee(0, 59_999, DELAI_GARDE_MS), false, "59,999 s : on attend encore");
+  assert.equal(gardeDepassee(0, 60_000, DELAI_GARDE_MS), true, "60 s : on le dit");
+  assert.equal(gardeDepassee(0, 61_000, DELAI_GARDE_MS), true);
+});
+
+test("le message du garde est noir sur blanc, chiffré, et dit comment reprendre", () => {
+  const m = messageGarde(60, modeleGguf("coder05"), 100_000_000);
+  assert.match(m, /ne progresse plus depuis 60 s/);
+  assert.match(m, /100 Mo/, "les octets reçus, pour situer");
+  assert.match(m, /398 Mo/, "ce qui était attendu");
+  assert.match(m, /Wi-Fi|connexion/i, "quoi vérifier");
+  assert.match(m, /relance|reprendre/i, "comment reprendre");
+});
+
+test("un téléchargement qui cale est abandonné à 60 s, avec le message exact", async () => {
+  const { plugin, journal } = pluginFactice({ tailles: [null], telechargementBloque: true });
+  const clk = horlogeFactice();
+  const minuteur = minuteurFactice();
+  const phases: ProgresChargement[] = [];
+
+  const livraison = telechargerModele("coder05", (p) => phases.push(p), plugin, {
+    maintenant: clk.maintenant,
+    planifier: minuteur.planifier,
+  });
+  // Laisse la livraison atteindre la mise sous surveillance (les `await` du
+  // mkdir et de addListener) avant de faire avancer l'horloge.
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(phases.length > 0, "l'interface a déjà de quoi afficher (0 %, 0 Mo)");
+
+  // 59 s sans octet : on ne dit RIEN encore (une connexion lente est permise).
+  clk.avance(59_000);
+  await minuteur.battement();
+  const etat = await Promise.race([
+    livraison.then(() => "finie").catch(() => "erreur"),
+    new Promise((r) => setTimeout(() => r("en attente"), 5)),
+  ]);
+  assert.equal(etat, "en attente", "59 s : le téléchargement n'est pas encore coupé");
+
+  // La 60e seconde : là, on le dit.
+  clk.avance(1_000);
+  await minuteur.battement();
+
+  await assert.rejects(livraison, (e: unknown) => {
+    const m = e instanceof Error ? e.message : String(e);
+    assert.match(m, /le téléchargement ne progresse plus depuis 60 s/, "la phrase exacte");
+    assert.match(m, /Wi-Fi|connexion/i, "quoi vérifier");
+    assert.match(m, /relance/i, "la reprise est proposée");
+    return true;
+  });
+
+  // Le partiel est effacé : la reprise ne repart pas d'un fichier douteux.
+  const del = journal.find((j) => "deleteFile" in j)?.deleteFile as Record<string, unknown>;
+  assert.equal(del.path, "Documents/" + modeleGguf("coder05").fichier);
+  assert.equal(del.directory, "DATA");
+  assert.ok(journal.some((j) => j.remove === true), "l'écouteur est retiré même en échec");
+  assert.equal(minuteur.arrete, true, "la surveillance est arrêtée : plus de minuterie qui fuit");
+});
+
+test("une progression LENTE mais réelle ne déclenche PAS le garde, et s'affiche sans évènement", async () => {
+  // Deux choses d'un coup :
+  //  - le fichier grossit SANS qu'aucun évènement « progress » ne soit émis
+  //    (downloadFile ne rend pas la main) : la surveillance du disque remonte
+  //    quand même les octets — c'est ce qui rend la progression visible ;
+  //  - 250 s s'écoulent, mais des octets nouveaux toutes les 50 s : le garde ne
+  //    coupe pas un vrai téléchargement (il juge sur les octets, pas la durée).
+  const { plugin } = pluginFactice({
+    tailles: [null, 10_000_000, 20_000_000, 30_000_000, 40_000_000],
+    telechargementBloque: true,
+  });
+  const clk = horlogeFactice();
+  const minuteur = minuteurFactice();
+  const phases: ProgresChargement[] = [];
+
+  void telechargerModele("coder05", (p) => phases.push(p), plugin, {
+    maintenant: clk.maintenant,
+    planifier: minuteur.planifier,
+  }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 0));
+
+  for (let i = 0; i < 5; i += 1) {
+    clk.avance(50_000);
+    await minuteur.battement();
+  }
+
+  assert.equal(minuteur.arrete, false, "le garde n'a pas coupé un vrai téléchargement");
+  assert.ok(
+    phases.some((p) => p.octetsRecus === 40_000_000),
+    "l'octet courant est remonté même sans évènement du plugin",
+  );
+});
+
+/* ===================================================================== */
+/* ÉCHECS : deux causes, deux messages — jamais un code brut.            */
+/* ===================================================================== */
+
+test("échec réseau et échec de stockage mènent à deux conseils DIFFÉRENTS", async () => {
+  const reseau = pluginFactice({
+    tailles: [null, null],
+    echecTelechargement: 'Unable to resolve host "huggingface.co": No address associated',
+  });
+  await assert.rejects(
+    () => telechargerModele("coder05", undefined, reseau.plugin),
+    (e: unknown) => {
+      const m = e instanceof Error ? e.message : String(e);
+      assert.match(m, /connexion|Wi-Fi/i);
+      assert.ok(!/espace libre|stockage/i.test(m), "on ne parle pas de place pour un souci réseau");
+      return true;
+    },
+  );
+
+  const espace = pluginFactice({
+    tailles: [null, null],
+    echecTelechargement: "ENOSPC: No space left on device",
+  });
+  await assert.rejects(
+    () => telechargerModele("coder05", undefined, espace.plugin),
+    (e: unknown) => {
+      const m = e instanceof Error ? e.message : String(e);
+      assert.match(m, /espace libre|place/i, "on nomme le vrai problème : la place");
+      assert.ok(!/Wi-Fi/i.test(m), "on n'accuse pas le réseau à tort");
+      return true;
+    },
+  );
+});
+
+test("messageEchec nomme la cause, et couvre une erreur inattendue", () => {
+  const modele = modeleGguf("coder05");
+  assert.match(messageEchec(modele, "ENOSPC"), /espace libre/i);
+  assert.match(messageEchec(modele, "ConnectException: failed to connect"), /connexion/i);
+  const inconnu = messageEchec(modele, "HTTP 404");
+  assert.match(inconnu, /Internet/i);
+  assert.match(inconnu, /398 Mo/, "la taille nécessaire est dite");
+  assert.match(inconnu, /relance/i);
 });
 

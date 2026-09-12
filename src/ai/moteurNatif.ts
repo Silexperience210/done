@@ -227,7 +227,10 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
 
     derniereVitesse: () => dernierTokParSeconde,
 
-    modeleCharge: () => (contexte === null ? null : opts.cheminModele(modeleGguf(charge ?? "coder15"))),
+    // Défaut aligné sur celui du store (`session.ts`) : le 0,5B. Ce repli n'est
+    // atteint que si un contexte existe — auquel cas `charge` est toujours
+    // défini ; il n'écrase donc jamais un choix réel de l'utilisateur.
+    modeleCharge: () => (contexte === null ? null : opts.cheminModele(modeleGguf(charge ?? "coder05"))),
 
     async charger(id: LocalModelId, onProgres?: (p: ProgresChargement) => void): Promise<void> {
       const debut = Date.now();

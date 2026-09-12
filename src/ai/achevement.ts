@@ -43,6 +43,16 @@ export type Critere =
       attendu: string;
     }
   | {
+      /**
+       * Exécuter ce script PYTHON doit AFFICHER exactement `attendu` — c'est la
+       * vérification qui répond à « montre-le en fonctionnement » : la preuve est
+       * la sortie du script, pas la déclaration du modèle.
+       */
+      type: "run_python";
+      code: string;
+      attendu: string;
+    }
+  | {
       /** L'app écrite se charge dans l'aperçu réel sans aucune erreur console. */
       type: "app_sans_erreur";
     }
@@ -128,8 +138,9 @@ export const MAX_CRITERES = 4;
  */
 export const GRAMMAIRE_CONTRAT = String.raw`
 root ::= "[" espace critere (espace "," espace critere)? (espace "," espace critere)? (espace "," espace critere)? espace "]"
-critere ::= "{" espace "\"type\"" espace ":" espace (c-run | c-app | c-contient) espace "}"
+critere ::= "{" espace "\"type\"" espace ":" espace (c-run | c-python | c-app | c-contient) espace "}"
 c-run ::= "\"run_js\"" espace "," espace "\"code\"" espace ":" espace chaine espace "," espace "\"attendu\"" espace ":" espace chaine
+c-python ::= "\"run_python\"" espace "," espace "\"code\"" espace ":" espace chaine espace "," espace "\"attendu\"" espace ":" espace chaine
 c-app ::= "\"app_sans_erreur\""
 c-contient ::= "\"contient\"" espace "," espace "\"texte\"" espace ":" espace chaine
 chaine ::= "\"" caractere* "\""
@@ -142,6 +153,8 @@ export function libelleCritere(c: Critere): string {
   switch (c.type) {
     case "run_js":
       return `run_js « ${resume(c.code, 60)} » → attendu « ${resume(c.attendu, 30)} »`;
+    case "run_python":
+      return `run_python « ${resume(c.code, 60)} » → affiche « ${resume(c.attendu, 30)} »`;
     case "app_sans_erreur":
       return "l'app s'affiche sans erreur console";
     case "contient":
@@ -183,6 +196,27 @@ export function validerCritere(brut: unknown): { critere: Critere } | { refus: C
     }
     return { critere: { type: "run_js", code, attendu } };
   }
+  if (type === "run_python") {
+    // Même exigence que pour run_js : un code ET une valeur attendue. « Ça
+    // marche » n'est pas vérifiable, et une sortie vide ne prouve rien.
+    const code = typeof o.code === "string" ? o.code.trim() : "";
+    const attendu =
+      typeof o.attendu === "string"
+        ? o.attendu.trim()
+        : typeof o.attendu === "number" || typeof o.attendu === "boolean"
+          ? String(o.attendu)
+          : "";
+    if (!code) return { refus: { brut, raison: "run_python sans code : rien à exécuter" } };
+    if (!attendu) {
+      return {
+        refus: {
+          brut,
+          raison: "run_python sans valeur attendue : donne ce que le script doit AFFICHER, exactement",
+        },
+      };
+    }
+    return { critere: { type: "run_python", code, attendu } };
+  }
   if (type === "app_sans_erreur") return { critere: { type: "app_sans_erreur" } };
   if (type === "contient") {
     const texte = typeof o.texte === "string" ? o.texte : "";
@@ -194,7 +228,7 @@ export function validerCritere(brut: unknown): { critere: Critere } | { refus: C
       brut,
       raison:
         `type « ${type || "?"} » non vérifiable par exécution : ` +
-        "utilise run_js (code + attendu), app_sans_erreur, ou contient (texte)",
+        "utilise run_js ou run_python (code + attendu), app_sans_erreur, ou contient (texte)",
     },
   };
 }
@@ -399,6 +433,11 @@ export function preuveRunJs(
  */
 export function creerVerificateur(executeurs: {
   executerJs: (code: string) => Promise<ResultatExecution>;
+  /**
+   * Exécuteur PYTHON (le lanceur embarqué, `pythonRunner.ts`). Absent : les
+   * critères `run_python` sont déclarés NON VÉRIFIÉS — jamais « réussis ».
+   */
+  executerPython?: (code: string) => Promise<ResultatExecution>;
   executerDansApercu?: (code: string) => Promise<ResultatExecution | null>;
   verdictApercu?: () => Promise<{ charge: boolean; erreurs: string[] } | null>;
   maintenant?: () => number;
@@ -409,6 +448,24 @@ export function creerVerificateur(executeurs: {
     const duree = () => Math.max(0, maintenant() - debut);
     try {
       if (critere.type === "contient") return verifierContient(critere, artefacts, duree());
+      if (critere.type === "run_python") {
+        if (!executeurs.executerPython) {
+          return {
+            ok: false,
+            observe: "non vérifié : aucun lanceur Python disponible dans cette installation",
+            erreur: null,
+            ms: duree(),
+            nonVerifie: true,
+          };
+        }
+        // Même comparaison que run_js : la SORTIE observée contre l'attendu. La
+        // preuve affichée est donc ce que le script a réellement affiché.
+        return preuveRunJs(
+          { type: "run_js", code: critere.code, attendu: critere.attendu },
+          await executeurs.executerPython(critere.code),
+          duree(),
+        );
+      }
       if (critere.type === "run_js") {
         if (artefacts.html !== null) {
           const dansApercu = executeurs.executerDansApercu

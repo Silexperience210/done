@@ -7,10 +7,10 @@
     "nf3": "0.3.17"
   },
   "scripts": {
-    "postinstall": "patch-package",
+    "postinstall": "patch-package && node scripts/copier-pyodide.mjs",
     "dev": "node scripts/with-app-env.mjs vite dev --host 0.0.0.0 --port 8080",
     "build": "node scripts/with-app-env.mjs vite build && npm run db:migrate",
-    "build:spa": "BUILD_SPA=1 node scripts/with-app-env.mjs vite build",
+    "build:spa": "node scripts/copier-pyodide.mjs && BUILD_SPA=1 node scripts/with-app-env.mjs vite build",
     "db:migrate": "node scripts/migrate.mjs",
     "build:dev": "node scripts/with-app-env.mjs vite build --mode development",
     "preview": "node scripts/with-app-env.mjs vite preview",
@@ -20,7 +20,8 @@
     "check:auth": "node scripts/check-auth-invariant.mjs",
     "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "pyodide:copier": "node scripts/copier-pyodide.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.2",
@@ -66,6 +67,7 @@
     "llama-cpp-capacitor": "^0.1.5",
     "lucide-react": "^0.510.0",
     "pg": "^8.16.3",
+    "pyodide": "0.29.4",
     "react": "^19.2.0",
     "react-day-picker": "^9.14.0",
     "react-dom": "^19.2.0",

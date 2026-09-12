@@ -104,7 +104,9 @@ export type Etape = {
 export const BUDGETS = {
   contrat: 160,
   decision: 48,
-  production: { write_app: 1500, run_js: 400, done: 200 } as Record<string, number>,
+  // Un script Python utile fait 20 à 60 lignes : 800 jetons, pas 400. Le budget
+  // est PAR OUTIL, c'est ce qui évite de couper un script en plein milieu.
+  production: { write_app: 1500, run_js: 400, run_python: 800, done: 200 } as Record<string, number>,
 } as const;
 export type Budgets = { contrat: number; decision: number; production: Record<string, number> };
 
@@ -114,6 +116,14 @@ export const OUTILS = [
     nom: "run_js",
     description:
       "Exécute du JavaScript dans un bac à sable et renvoie le résultat. Appelle-le SANS argument : le code te sera demandé juste après.",
+    parametres: { type: "object", properties: {}, required: [] },
+  },
+  {
+    nom: "run_python",
+    description:
+      "Exécute un script PYTHON dans l'appli et renvoie sa sortie RÉELLE (ce qu'il affiche) ou son erreur exacte, avec le numéro de ligne. " +
+      "Bibliothèque standard seulement (pas de numpy). Appelle-le SANS argument : le code te sera demandé juste après. " +
+      "Les boucles doivent être bornées.",
     parametres: { type: "object", properties: {}, required: [] },
   },
   {
@@ -164,8 +174,9 @@ const OUTILS_CONNUS = new Set<string>(NOMS_OUTILS);
  */
 export const GRAMMAIRE_DECISION = String.raw`
 root ::= "<tool_call>" espace "{" espace "\"name\"" espace ":" espace appel espace "}" espace "</tool_call>"
-appel ::= a-run | a-app | a-memo | a-done
+appel ::= a-run | a-python | a-app | a-memo | a-done
 a-run ::= "\"run_js\"" espace "," espace "\"arguments\"" espace ":" espace "{" espace "}"
+a-python ::= "\"run_python\"" espace "," espace "\"arguments\"" espace ":" espace "{" espace "}"
 a-app ::= "\"write_app\"" espace "," espace "\"arguments\"" espace ":" espace "{" espace "\"title\"" espace ":" espace chaine espace "}"
 a-memo ::= "\"remember\"" espace "," espace "\"arguments\"" espace ":" espace "{" espace "\"note\"" espace ":" espace chaine espace "}"
 a-done ::= "\"done\"" espace "," espace "\"arguments\"" espace ":" espace "{" espace "\"criteres_ok\"" espace ":" espace "[" espace (entier (espace "," espace entier)*)? espace "]" espace "}"
@@ -337,7 +348,7 @@ export function ressembleAAppel(texte: string): boolean {
     /"nom"\s*:/.test(texte) ||
     /"name"\s*:/.test(texte) ||
     /"arguments"\s*:/.test(texte) ||
-    /\bname\s*:\s*["']?(run_js|write_app|remember|done)/i.test(texte)
+    /\bname\s*:\s*["']?(run_js|run_python|write_app|remember|done)/i.test(texte)
   );
 }
 
@@ -634,7 +645,7 @@ export function promptSystemeHarnais(system: string, memoire: string[]): string 
     "</tool_call>",
     "",
     "RÈGLES : un seul appel d'outil par message, rien d'autre. " +
-      "run_js et write_app : le code te sera demandé juste après, n'en mets pas dans les arguments. " +
+      "run_js, run_python et write_app : le code te sera demandé juste après, n'en mets pas dans les arguments. " +
       "Si un outil renvoie une erreur, corrige au lieu d'inventer un résultat. " +
       "Tu es hors ligne : aucune URL externe. " +
       "done n'est accepté que si chaque critère du contrat a été VU réussir.",
@@ -646,8 +657,9 @@ export function promptSystemeHarnais(system: string, memoire: string[]): string 
 export function consigneContrat(): string {
   return [
     "Avant d'agir, énonce le CONTRAT : ce qui doit être VRAI à la fin, vérifiable par exécution.",
-    "Réponds UNIQUEMENT par un tableau JSON de 1 à 4 critères, parmi ces trois formes :",
-    '  {"type":"run_js","code":"2+2","attendu":"4"}   (exécuter code doit rendre exactement attendu)',
+    "Réponds UNIQUEMENT par un tableau JSON de 1 à 4 critères, parmi ces quatre formes :",
+    '  {"type":"run_js","code":"2+2","attendu":"4"}   (exécuter ce JavaScript doit rendre exactement attendu)',
+    '  {"type":"run_python","code":"print(6*7)","attendu":"42"}   (exécuter ce Python doit AFFICHER exactement attendu)',
     '  {"type":"app_sans_erreur"}                      (l\'app s\'affiche sans erreur console)',
     '  {"type":"contient","texte":"requestAnimationFrame"}   (l\'app ou la réponse contient ce texte)',
     "Un critère invérifiable (« ça marche », « le code est propre ») est refusé.",
@@ -668,6 +680,14 @@ export function consigneProduction(outil: string, args: Record<string, unknown>)
     return (
       "Écris maintenant UNIQUEMENT le code JavaScript à exécuter (une expression ou un court programme " +
       "dont la dernière expression est le résultat), sans explication ni bloc markdown."
+    );
+  }
+  if (outil === "run_python") {
+    return (
+      "Écris maintenant UNIQUEMENT le script PYTHON à exécuter : le code, sans explication ni bloc markdown. " +
+      "Ce que le script AFFICHE (print) est ce que l'utilisateur verra : affiche le résultat. " +
+      "Bibliothèque standard seulement, aucune URL, et des boucles BORNÉES (un script qui boucle à l'infini " +
+      "ne peut pas être interrompu)."
     );
   }
   return "Rédige maintenant ta réponse finale pour l'utilisateur, en clair et brièvement, dans sa langue.";

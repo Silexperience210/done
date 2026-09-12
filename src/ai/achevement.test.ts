@@ -23,9 +23,18 @@ import {
   verifierTout,
   type Critere,
   type EtatAchevement,
+  GRAMMAIRE_CONTRAT,
   type Preuve,
 } from "./achevement.ts";
-import { boucleAgent, type DemandeGeneration, type PasAgent, type SortieMoteur } from "./agent.ts";
+import {
+  BUDGETS,
+  GRAMMAIRE_DECISION,
+  OUTILS,
+  boucleAgent,
+  type DemandeGeneration,
+  type PasAgent,
+  type SortieMoteur,
+} from "./agent.ts";
 
 const CONTRAT_RUN = '[{"type":"run_js","code":"f(2)","attendu":"4"}]';
 const CONTRAT_APP = '[{"type":"app_sans_erreur"},{"type":"run_js","code":"typeof score","attendu":"function"}]';
@@ -390,4 +399,98 @@ test("P6 · recouperDone nomme les mensonges et refuse aussi un critère échou�
   assert.equal(discret.accepte, false, "un critère en échec bloque, déclaré ou pas");
   assert.match(discret.motif, /critère 1 en échec/);
   assert.match(recouperDone({ criteres_ok: [7] }, etats).motif, /critère\(s\) 7 : n'existe/);
+});
+
+/* ============================================================================
+ * PYTHON — « il doit savoir le faire agir et me le montrer en fonctionnement »
+ *
+ * Ce que ces tests protègent : le jour où l'utilisateur demande un script
+ * python, la preuve affichée doit être la SORTIE DU SCRIPT — pas la déclaration
+ * du modèle. Et si aucun lanceur Python n'est disponible, le critère est
+ * « non vérifié », jamais « réussi ».
+ * ==========================================================================*/
+
+test("Python · le critère « le script affiche 42 » est vérifié en LANÇANT le script", async () => {
+  const lancements: string[] = [];
+  const verifier = creerVerificateur({
+    executerJs: async () => ({ ok: true, valeur: "4" }),
+    executerPython: async (code: string) => {
+      lancements.push(code);
+      return { ok: true, valeur: "42" };
+    },
+  });
+
+  const critere = validerCritere({ type: "run_python", code: "print(6*7)", attendu: "42" });
+  assert.ok("critere" in critere, "un critère python avec code ET attendu est accepté");
+
+  const preuve = await verifier(
+    (critere as { critere: Critere }).critere,
+    { html: null, reponse: null },
+  );
+  assert.equal(preuve.ok, true);
+  assert.match(preuve.observe, /42/, "la preuve cite la SORTIE observée");
+  assert.deepEqual(lancements, ["print(6*7)"], "le script a réellement été exécuté");
+});
+
+test("Python · une sortie différente de l'attendu est un ÉCHEC, chiffres à l'appui", async () => {
+  const verifier = creerVerificateur({
+    executerJs: async () => ({ ok: true, valeur: "4" }),
+    executerPython: async () => ({ ok: true, valeur: "43" }),
+  });
+  const preuve = await verifier(
+    { type: "run_python", code: "print(6*7+1)", attendu: "42" },
+    { html: null, reponse: null },
+  );
+  assert.equal(preuve.ok, false, "43 n'est pas 42 : le critère n'est pas satisfait");
+  assert.match(preuve.observe, /attendu « 42 »/, "l'attendu est cité");
+  assert.match(preuve.observe, /43/, "l'observé est cité");
+});
+
+test("Python · un script qui plante rend l'erreur EXACTE, pas un « non »", async () => {
+  const verifier = creerVerificateur({
+    executerJs: async () => ({ ok: true, valeur: "4" }),
+    executerPython: async () => ({
+      ok: false,
+      erreur: 'File "<exec>", line 2, in <module>\nNameError: name \'ctx\' is not defined',
+    }),
+  });
+  const preuve = await verifier(
+    { type: "run_python", code: "print(ctx)", attendu: "42" },
+    { html: null, reponse: null },
+  );
+  assert.equal(preuve.ok, false);
+  assert.match(preuve.erreur ?? "", /line 2/, "la ligne fautive remonte jusqu'à la preuve");
+  assert.match(preuve.erreur ?? "", /NameError/, "la cause est conservée telle quelle");
+});
+
+test("Python · sans lanceur disponible, le critère est NON VÉRIFIÉ — jamais réussi", async () => {
+  const verifier = creerVerificateur({ executerJs: async () => ({ ok: true, valeur: "4" }) });
+  const preuve = await verifier(
+    { type: "run_python", code: "print(42)", attendu: "42" },
+    { html: null, reponse: null },
+  );
+  assert.equal(preuve.ok, false, "on ne déclare pas réussi ce qu'on n'a pas exécuté");
+  assert.equal(preuve.nonVerifie, true);
+  assert.match(preuve.observe, /aucun lanceur Python/, "on dit ce qui manque");
+});
+
+test("Python · un critère sans valeur attendue est REFUSÉ (une sortie non spécifiée ne prouve rien)", () => {
+  const sansAttendu = validerCritere({ type: "run_python", code: "print(42)" });
+  assert.ok("refus" in sansAttendu, "refusé");
+  assert.match((sansAttendu as { refus: { raison: string } }).refus.raison, /AFFICHER/);
+
+  const sansCode = validerCritere({ type: "run_python", attendu: "42" });
+  assert.ok("refus" in sansCode, "refusé aussi");
+});
+
+test("Python · l'outil est déclaré, budgété et contraint par les grammaires", () => {
+  assert.ok(
+    OUTILS.some((o) => o.nom === "run_python"),
+    "run_python est proposé au modèle",
+  );
+  assert.equal(BUDGETS.production.run_python, 800, "un script de 20 à 60 lignes ne doit pas être coupé à 400");
+  assert.match(GRAMMAIRE_DECISION, /run_python/, "la décision contrainte connaît l'outil");
+  assert.match(GRAMMAIRE_CONTRAT, /c-python/, "le contrat contraint accepte un critère python");
+  // Le format d'appel reste UNIQUE : c'est lui que le modèle connaît.
+  assert.match(GRAMMAIRE_DECISION, /<tool_call>/);
 });

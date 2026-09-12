@@ -13,3 +13,6 @@ node_modules/
 .output/
 dist/
 public/tournee.html
+# Pyodide (CPython/WebAssembly, ~12 Mo) : copié depuis node_modules/pyodide par
+# scripts/copier-pyodide.mjs à l'installation et avant chaque build — pas versionné.
+public/pyodide/

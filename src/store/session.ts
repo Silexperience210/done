@@ -13,6 +13,7 @@ import type { CheminManuel } from "@/ai/modeleLocal";
 import { creerVerificateur, resumeAchevement, type EtatAchevement } from "@/ai/achevement";
 import type { PasAgent } from "@/ai/agent";
 import { injecterPont, type EntreeConsole } from "@/ai/pontApercu";
+import type { EtatPython, ExecuteurPython } from "@/ai/pythonRunner";
 import { criteresLisibles, enregistrerApp, listerApps, type AppEnregistree } from "@/ai/historique";
 import {
   apercuDisponible,
@@ -68,6 +69,23 @@ type MoteurActif = {
 
 let moteur: MoteurActif | null = null;
 let moteurEnCours: Promise<MoteurActif> | null = null;
+
+/**
+ * LE LANCEUR PYTHON, construit une seule fois et seulement s'il sert.
+ *
+ * `chargerPyodideEmbarque` va chercher Pyodide dans les ASSETS de l'APK
+ * (`/pyodide/`, copié à la construction) : aucune requête sortante, et rien n'est
+ * chargé tant qu'aucun script Python n'est demandé. Le module n'est importé
+ * dynamiquement que pour ça : le build web reste intact.
+ */
+let executeurPython: (ExecuteurPython & { etat: () => EtatPython }) | null = null;
+async function chargerExecuteurPython(): Promise<ExecuteurPython & { etat: () => EtatPython }> {
+  if (!executeurPython) {
+    const mod = await import("@/ai/pythonRunner");
+    executeurPython = mod.creerExecuteurPython({ charger: mod.chargerPyodideEmbarque });
+  }
+  return executeurPython;
+}
 
 /**
  * Construit (ou rend) le moteur partagé de la session.
@@ -848,6 +866,12 @@ export const useSession = create<SessionState>((set, get) => {
         // fabriquée par un environnement où le code ne tourne pas.
         verifier: creerVerificateur({
           executerJs: harnais.executerJsStructure,
+          // Un critère « le script affiche 4 » est vérifié en LANÇANT le script :
+          // la preuve est sa sortie réelle, jamais la déclaration du modèle.
+          executerPython: async (code) => {
+            const r = await (await chargerExecuteurPython())(code);
+            return r.ok ? { ok: true, valeur: r.sortie } : { ok: false, erreur: r.erreur ?? "erreur python" };
+          },
           executerDansApercu: (code) => (apercuDisponible() ? evaluerDansApercu(code) : Promise.resolve(null)),
           verdictApercu: () => {
             const version = get().studio?.version ?? 0;
@@ -857,6 +881,57 @@ export const useSession = create<SessionState>((set, get) => {
         executer: async (outil) => {
           if (outil.nom === "run_js") {
             return harnais.executerJs(String(outil.args.code ?? ""));
+          }
+          if (outil.nom === "run_python") {
+            const code = String(outil.args.code ?? "");
+            if (!code.trim()) return "erreur : script python vide, rien n'a été exécuté";
+            const executerPy = await chargerExecuteurPython();
+            const r = await executerPy(code);
+            // MONTRER LE FONCTIONNEMENT : ce que le script a réellement affiché
+            // (et son erreur exacte) va dans la CONSOLE du studio, à côté des
+            // erreurs de l'app — la version courante de l'aperçu lui est donnée
+            // pour qu'elle s'affiche au bon endroit.
+            const version = get().studio?.version ?? 0;
+            const ts = Date.now();
+            const lignes: EntreeConsole[] = [
+              ...(r.sortie.trim() ? r.sortie.split("\n") : []).map((message) => ({
+                niveau: "log" as const,
+                message,
+                ligne: null,
+                colonne: null,
+                ts,
+                version,
+              })),
+              ...(!r.ok && r.erreur ? r.erreur.split("\n") : []).map((message) => ({
+                niveau: "error" as const,
+                message,
+                ligne: null,
+                colonne: null,
+                ts,
+                version,
+              })),
+            ];
+            if (lignes.length > 0) set((st) => ({ console: [...st.console, ...lignes].slice(-500) }));
+            void import("@/ai/journal")
+              .then(({ noter }) =>
+                noter(
+                  `python : ${r.ok ? "sortie" : "ERREUR"} en ${r.ms} ms, ` +
+                    `${r.sortie.split("\n").filter(Boolean).length} ligne(s) affichée(s)` +
+                    `${r.premierAppel ? " (chargement de Python compris)" : ""}`,
+                ),
+              )
+              .catch(() => {
+                /* le journal n'est pas indispensable ici */
+              });
+            // Ce que le MODÈLE reçoit : la sortie réelle, ou l'erreur exacte avec
+            // sa ligne — c'est ce qui lui permet de corriger au pas suivant.
+            if (!r.ok) {
+              return (
+                `erreur python : ${r.erreur}` +
+                (r.sortie.trim() ? `\n(sortie avant l'erreur :\n${r.sortie})` : "")
+              );
+            }
+            return r.sortie.trim() ? r.sortie : "(le script s'est exécuté sans rien afficher)";
           }
           if (outil.nom === "write_app") {
             const titre = String(outil.args.title ?? "App");

@@ -21,7 +21,12 @@
 
 import { useRef, useState } from "react";
 import { importerModeleDepuisFichier, tailleAcceptable, type ProgresImport } from "@/ai/importerModele";
-import { MODELES_GGUF } from "@/ai/moteurNatif";
+import {
+  telechargerModeleParFetch,
+  type ProgresTelechargement,
+} from "@/ai/telechargementModele";
+import { MODELES_GGUF, modeleGguf } from "@/ai/moteurNatif";
+import { useSession } from "@/store/session";
 
 function tailleLisible(octets: number): string {
   if (octets >= 1e9) return `${(octets / 1e9).toFixed(2)} Go`;
@@ -35,6 +40,26 @@ export function ImporterModele() {
   const [etat, setEtat] = useState<Etat>("repos");
   const [progres, setProgres] = useState<ProgresImport | null>(null);
   const [message, setMessage] = useState("");
+  const [progresDl, setProgresDl] = useState<ProgresTelechargement | null>(null);
+  // Le modèle choisi par l'utilisateur : c'est celui que le moteur cherchera.
+  const modeleChoisi = useSession((s) => s.model);
+
+  const telecharger = async () => {
+    setEtat("ecriture");
+    setProgresDl(null);
+    setMessage("téléchargement dans la mémoire de l'appli (aucun autre outil)…");
+    try {
+      const resultat = await telechargerModeleParFetch(modeleChoisi, setProgresDl);
+      setEtat("ok");
+      setMessage(
+        `modèle « ${modeleGguf(modeleChoisi).court} » en place (${tailleLisible(resultat.octets)}). ` +
+          "Renvoie ta demande : le moteur le chargera.",
+      );
+    } catch (e) {
+      setEtat("erreur");
+      setMessage(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const traiter = async (fichier: File) => {
     setEtat("ecriture");
@@ -91,8 +116,29 @@ export function ImporterModele() {
         >
           {etat === "ecriture" ? "écriture…" : "importer le fichier du modèle"}
         </button>
-        <span className="text-[10px] text-white/60">0,40 Go attendu pour le 0,5B</span>
+        <span className="text-[10px] text-white/60">{tailleLisible(modeleGguf(modeleChoisi).octets)} attendus</span>
       </div>
+
+      <div className="mt-1 flex items-center gap-2">
+        <button
+          type="button"
+          disabled={etat === "ecriture"}
+          onClick={() => void telecharger()}
+          className="rounded border border-white/25 bg-white/10 px-2 py-1 text-[11px] text-white/90 disabled:opacity-50"
+        >
+          télécharger ici ({tailleLisible(modeleGguf(modeleChoisi).octets)})
+        </button>
+        <span className="text-[10px] text-white/60">
+          sans Chrome, sans le téléchargeur cassé — la WebView télécharge et écrit dans l&apos;appli
+        </span>
+      </div>
+
+      {progresDl && (
+        <p className="mt-1 font-mono text-[10px] text-white/70">
+          {tailleLisible(progresDl.octetsRecus)} / {tailleLisible(progresDl.octetsTotal)} —{" "}
+          {Math.round((progresDl.octetsRecus / progresDl.octetsTotal) * 100)} %
+        </p>
+      )}
 
       {progres && (
         <p className="mt-1 font-mono text-[10px] text-white/70">

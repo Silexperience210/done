@@ -20,17 +20,18 @@ export function Stage() {
       <div className="relative mx-auto grid min-h-dvh max-w-7xl grid-cols-1 items-center gap-6 px-5 py-6 lg:grid-cols-[minmax(15rem,0.85fr)_auto_minmax(22rem,1.15fr)] lg:gap-8 lg:px-8">
         <div className="hidden lg:block">
           <p className="font-mono text-xs tracking-widest text-muted uppercase">
-            Studio local · dans ton navigateur
+            Studio local · sur ton appareil
           </p>
           <p className="mt-3 text-2xl font-medium tracking-tight text-balance xl:text-3xl">
-            Un modèle {profile.short} qui tourne dans ta page.
+            Un modèle {profile.short} qui tourne sur ton téléphone.
             <span className="mt-2 block text-muted">
               {profile.peakGb.toFixed(1)} Go en mémoire. Aucune requête sortante.
             </span>
           </p>
           <p className="mt-4 max-w-sm text-sm leading-relaxed text-muted text-pretty">
-            Les poids sont téléchargés une fois ({profile.diskGb.toFixed(1)} Go) puis mis en cache
-            par le navigateur : ensuite, tout se calcule sur l'appareil, même hors ligne.
+            Le GGUF est téléchargé une fois ({profile.diskGb.toFixed(1)} Go) dans le stockage de
+            l'appli, puis exécuté par llama.cpp en natif : ensuite, tout se calcule sur l'appareil,
+            même hors ligne.
           </p>
           <div className="mt-6">
             <EnginePanel

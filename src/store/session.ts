@@ -10,55 +10,26 @@ import {
   type ModelId,
   type ToolEvent,
 } from "@/lib/edge0";
-import { capacitesReelles, choisirMoteur } from "@/ai/moteur";
-import type { GenerateOptions, LocalModelId, ProgresChargement } from "@/ai/localModel";
+import { estApplicationNative } from "@/ai/moteur";
+import type { GenerateOptions, LocalModelId, ProgresChargement } from "@/ai/types";
 import { resolveLocalTurn } from "@/lib/local-apps";
 
 /**
- * Deux moteurs possibles derrière une SEULE interface.
+ * UN SEUL moteur : llama.cpp en natif, dans l'APK.
  *
- * Navigateur : transformers.js (WebGPU/WASM), chargé paresseusement par import
- * dynamique — statiquement, ses 1,14 Mo et les 21,5 Mo de WebAssembly
- * d'onnxruntime partaient dans le bundle de page ET dans celui de la fonction
- * serveur, alors qu'il n'existe aucun chemin serveur pour ce code.
+ * L'inférence passe par le plugin llama-cpp-capacitor, importé dynamiquement au
+ * moment du chargement — il ne doit JAMAIS être résolu par le build web, sinon
+ * celui-ci casse (le plugin n'existe pas hors Android).
  *
- * Natif : llama.cpp via le plugin Capacitor, uniquement dans l'APK. Le plugin
- * est importé dynamiquement au moment du choix — il ne doit JAMAIS être résolu
- * par le build navigateur, sinon celui-ci casse.
+ * Hors application native (navigateur de développement), il n'y a PAS de repli :
+ * on ne fait pas semblant de faire tourner un modèle. `chargerMoteur` lève une
+ * erreur explicite, que `send` traduit en message actionnable (« le modèle ne
+ * tourne que dans l'appli Android ») au lieu d'échouer en silence.
  *
- * Le choix se fait une fois, avec `capacitesReelles()` : natif dans l'appli
- * empaquetée, WebGPU sinon. Tout le reste de `send` ne connaît que `MoteurActif`
- * et ignore lequel des deux tourne.
- */
-type ModuleWebgpu = typeof import("@/ai/localModel");
-let webgpu: ModuleWebgpu | null = null;
-let webgpuEnCours: Promise<ModuleWebgpu> | null = null;
-
-function chargerMoteurWebgpu(): Promise<ModuleWebgpu> {
-  if (webgpu) return Promise.resolve(webgpu);
-  if (!webgpuEnCours) {
-    webgpuEnCours = import("@/ai/localModel")
-      .then((m) => {
-        webgpu = m;
-        return m;
-      })
-      .catch((e) => {
-        webgpuEnCours = null; // on autorise une nouvelle tentative
-        throw e;
-      });
-  }
-  return webgpuEnCours;
-}
-
-/**
- * Interface COMMUNE aux deux moteurs. Le navigateur expose
- * `loadModel`/`generate`/`metrics` ; le natif expose `charger`/`generer`/
- * `derniereVitesse`. On les ramène ici à la même forme, pour que la boucle
- * d'agent, le streaming jeton par jeton et les pastilles d'outils ne changent
- * pas d'un moteur à l'autre.
+ * Tout le reste de `send` ne connaît que `MoteurActif` et ignore llama.cpp.
  */
 type MoteurActif = {
-  nom: "webgpu" | "natif";
+  nom: "natif";
   charger: (id: LocalModelId, onProgres?: (p: ProgresChargement) => void) => Promise<void>;
   generer: (options: GenerateOptions) => Promise<string>;
   /** Débit MESURÉ par le moteur, ou null tant qu'il n'a rien mesuré. */
@@ -74,64 +45,49 @@ function chargerMoteur(): Promise<MoteurActif> {
   if (moteur) return Promise.resolve(moteur);
   if (!moteurEnCours) {
     moteurEnCours = (async (): Promise<MoteurActif> => {
-      if (choisirMoteur(capacitesReelles()) === "natif") {
-        // Import dynamique : le plugin Capacitor/llama.cpp n'existe pas dans un
-        // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
-        // donc le build web reste intact.
-        const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-        const { cheminModele, telechargerModele, cheminCachePrompt } = await import("@/ai/modeleLocal");
-        // Le GGUF n'est PLUS embarqué dans l'APK : on le télécharge dans
-        // getFilesDir()/Documents/<fichier> (le seul dossier que le plugin natif
-        // visite vraiment), puis on passe au moteur le NOM DE FICHIER SEUL.
-        // `telechargerModele` est un no-op si le fichier est déjà là et de la
-        // bonne taille. On n'envoie plus `is_model_asset` : le natif Android
-        // l'ignore.
-        // `moteurNatifParDefaut` attend une fonction `ModeleGguf → chemin` ;
-        // `cheminModele` prend un identifiant. On les relie par le `.id`.
-        //
-        // CACHE D'ÉTAT DU PROMPT, désormais ACTIVÉ. Dans la boucle d'agent le
-        // prompt système est identique à chaque pas ; sans cache llama.cpp le
-        // reprojette entièrement. `cheminCachePrompt()` demande à
-        // @capacitor/filesystem un chemin inscriptible dans le dossier de
-        // l'appli (`getUri` sur Directory.Data → getFilesDir()) et le ramène à
-        // un chemin de fichier NATIF, seule forme que `saveSession` accepte.
-        // Si le chemin est indisponible (plugin absent, appel en erreur),
-        // `cheminCachePrompt` rend `undefined` et le cache reste SANS EFFET —
-        // une génération ne doit jamais échouer pour un cache facultatif.
-        //
-        // HONNÊTETE SUR LA VERSION INSTALLÉE : dans llama-cpp-capacitor 0.1.5,
-        // `LlamaCpp.java` `saveSession`/`loadSession` ne font RIEN (corps en
-        // commentaire « This would typically … from file », aucune E/S, aucun
-        // appel JNI). Le cache est donc aujourd'hui INERTE dans l'APK : câbler
-        // le chemin est sans effet observable, et sans danger (les méthodes
-        // rendent un succès vide), en attendant une version du plugin qui
-        // implémente réellement l'état du prompt. Le moteur reste prêt pour ce
-        // jour-là, et le chemin est déjà le bon.
-        const cheminCache = await cheminCachePrompt();
-        const natif = await moteurNatifParDefaut((m) => cheminModele(m.id), cheminCache);
-        return {
-          nom: "natif",
-          charger: async (id, onProgres) => {
-            // 1) livrer le modèle sur le disque, puis 2) initialiser llama.cpp.
-            // La progression de téléchargement est remontée telle quelle.
-            await telechargerModele(id, onProgres);
-            await natif.charger(id, onProgres);
-          },
-          generer: (options) => natif.generer(options),
-          tokPerSec: () => natif.derniereVitesse(),
-          device: () => (natif.modeleCharge() ? "llama.cpp (natif)" : "moteur natif"),
-        };
+      if (!estApplicationNative()) {
+        // AUCUN repli navigateur : le projet n'a plus de moteur pour le web. On
+        // échoue FORT et clairement, plutôt que de laisser croire qu'un modèle
+        // tourne dans la page.
+        throw new Error(
+          "le modèle ne tourne QUE dans l'application Android (llama.cpp natif). " +
+            "Cette page web n'exécute aucun modèle : installe et ouvre l'appli sur le téléphone.",
+        );
       }
-      // Navigateur : EXACTEMENT le moteur d'avant, simplement uniformisé.
-      const web = await chargerMoteurWebgpu();
+      // Import dynamique : le plugin Capacitor/llama.cpp n'existe pas dans un
+      // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
+      // donc le build web reste intact.
+      const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
+      const { cheminModele, telechargerModele } = await import("@/ai/modeleLocal");
+      // Le GGUF n'est PAS embarqué dans l'APK : on le télécharge dans
+      // getFilesDir()/Documents/<fichier> (le seul dossier que le plugin natif
+      // visite vraiment), puis on passe au moteur le NOM DE FICHIER SEUL.
+      // `telechargerModele` est un no-op si le fichier est déjà là et de la
+      // bonne taille. On n'envoie pas `is_model_asset` : le natif Android
+      // l'ignore.
+      // `moteurNatifParDefaut` attend une fonction `ModeleGguf → chemin` ;
+      // `cheminModele` prend un identifiant. On les relie par le `.id`.
+      //
+      // PAS DE CACHE D'ÉTAT DU PROMPT, et c'est volontaire : dans
+      // llama-cpp-capacitor 0.1.5, `LlamaCpp.java:801-823` implémente
+      // `saveSession`/`loadSession` en ne faisant RIEN (aucune E/S, aucun appel
+      // JNI) tout en répondant un succès. Les câbler donnait un cache
+      // mensonger — un « sauvé » puis un rechargement à chaque pas, pour rien.
+      // La réutilisation du préfixe de prompt, elle, existe déjà et
+      // automatiquement, côté natif (`cap-completion.cpp:178`), à condition que
+      // le texte réinjecté soit identique : voir `nettoyerPourAffichage`.
+      const natif = await moteurNatifParDefaut((m) => cheminModele(m.id));
       return {
-        nom: "webgpu",
+        nom: "natif",
         charger: async (id, onProgres) => {
-          await web.loadModel(id, onProgres);
+          // 1) livrer le modèle sur le disque, puis 2) initialiser llama.cpp.
+          // La progression de téléchargement est remontée telle quelle.
+          await telechargerModele(id, onProgres);
+          await natif.charger(id, onProgres);
         },
-        generer: (options) => web.generate(options),
-        tokPerSec: () => web.metrics().tokPerSec,
-        device: () => web.metrics().device,
+        generer: (options) => natif.generer(options),
+        tokPerSec: () => natif.derniereVitesse(),
+        device: () => (natif.modeleCharge() ? "llama.cpp (natif)" : "moteur natif"),
       };
     })()
       .then((m) => {
@@ -366,8 +322,8 @@ export const useSession = create<SessionState>((set, get) => ({
       }
 
       // 2) Le harnais D'AGENT, en local. Aucune requête sortante.
-      //    Le moteur (navigateur ou natif) n'est résolu qu'ici, au premier
-      //    message ; `chargerMoteur` choisit une fois pour toute la session.
+      //    Le moteur natif n'est résolu qu'ici, au premier message ;
+      //    `chargerMoteur` choisit une fois pour toute la session.
       const moteurActif = await chargerMoteur();
       const harnais = await chargerHarnais();
       let pending = "";
@@ -381,11 +337,11 @@ export const useSession = create<SessionState>((set, get) => ({
         patchAssistant(pulse(true));
       };
 
-      // Le premier appel charge le modèle : on le dit à l'écran. En natif comme
-      // dans le navigateur, le modèle est désormais TÉLÉCHARGÉ au premier
-      // lancement (le GGUF n'est plus embarqué dans l'APK), puis chargé en
-      // mémoire. On ne présume donc pas de la phase : la progression qui suit
-      // (« telechargement » → « initialisation » → « pret ») la nomme.
+      // Le premier appel charge le modèle : on le dit à l'écran. Le modèle est
+      // TÉLÉCHARGÉ au premier lancement (le GGUF n'est pas embarqué dans l'APK),
+      // puis chargé en mémoire. On ne présume donc pas de la phase : la
+      // progression qui suit (« telechargement » → « initialisation » → « pret »)
+      // la nomme.
       if (get().engine !== "pret") {
         thinking = `Chargement de ${profile.name}…`;
         set({ engine: "chargement", engineNote: "préparation du modèle local" });
@@ -445,7 +401,7 @@ export const useSession = create<SessionState>((set, get) => ({
             maxNewTokens: 160,
             // Contrainte de sortie structurée : le schéma JSON (converti en
             // grammaire par llama.cpp) empêche un petit modèle de déverser du
-            // texte à la place d'un appel. Le moteur navigateur l'ignore.
+            // texte à la place d'un appel.
             jsonSchema: contraintes?.jsonSchema,
             grammar: contraintes?.grammar,
             onToken: (t) => {
@@ -504,7 +460,12 @@ export const useSession = create<SessionState>((set, get) => ({
 
       if (raf) cancelAnimationFrame(raf);
       if (pending) flushTokens();
-      content = content || resultat.reponse;
+      // Le moteur rend le texte BRUT (c'est ce qui garde le préfixe du cache KV
+      // réutilisable, cap-completion.cpp:178). On ne nettoie donc QUE pour
+      // l'affichage, et seulement au moment où le texte part à l'écran : les
+      // jetons déjà diffusés le sont tels quels.
+      const { nettoyerPourAffichage } = await import("@/ai/moteurNatif");
+      content = content || nettoyerPourAffichage(resultat.reponse);
 
       const fence = extractHtmlBlock(content);
       if (fence) {

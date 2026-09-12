@@ -1,6 +1,5 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Plugin } from "vite";
 import { defineConfig } from "vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
@@ -164,35 +163,11 @@ export default defineConfig(({ command, isPreview }) => ({
   },
   resolve: {
     tsconfigPaths: true,
-    // BUILD_SPA=1 → build STATIQUE pour l'APK. Dans l'appli empaquetée, le
-    // moteur navigateur (WebGPU / transformers.js) est du code MORT :
-    // `capacitesReelles()` voit Capacitor, donc `choisirMoteur` renvoie
-    // TOUJOURS « natif ». On alias `@/ai/localModel` vers une doublure vide afin
-    // que `@huggingface/transformers` et `onnxruntime` ne soient PAS embarqués —
-    // ~21 Mo de WASM (ort-wasm-simd-threaded.asyncify-*.wasm) et 4 alertes de
-    // sécurité graves (adm-zip, sharp/libvips) en moins.
-    //
-    // Le seul import RUNTIME de `localModel.ts` est le `import()` dynamique du
-    // store (`chargerMoteurWebgpu`, jamais atteint en natif) : aliaser le module
-    // sort toute la chaîne du graphe. Sans BUILD_SPA, la clé `alias` n'existe
-    // MÊME PAS : le build navigateur garde un `resolve` STRICTEMENT identique.
-    ...(process.env.BUILD_SPA === "1"
-      ? {
-          alias: [
-            {
-              find: /^@\/ai\/localModel$/,
-              replacement: fileURLToPath(new URL("./src/ai/localModel.absent.ts", import.meta.url)),
-            },
-          ],
-        }
-      : {}),
   },
   plugins: [
     // SSL DÉSACTIVÉ : le plugin @vitejs/plugin-basic-ssl casse le middleware SSR
     // de TanStack Start (toutes les routes renvoient « Cannot GET / », même
     // /login — la pile passe en HTTP/2 et le SSR n'est plus atteint).
-    // Pour WebGPU sur le téléphone, on utilise l'exception d'origine de Chrome
-    // (chrome://flags/#unsafely-treat-insecure-origin-as-secure) sur l'URL HTTP.
     // ...(command === "serve" ? [basicSsl()] : []),
     pgliteBootstrapPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.

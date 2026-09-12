@@ -35,7 +35,7 @@
  * dynamique à l'appel, ou INJECTÉ par les tests.
  */
 import { modeleGguf, type ModeleGguf } from "./moteurNatif.ts";
-import type { LocalModelId, ProgresChargement } from "./localModel.ts";
+import type { LocalModelId, ProgresChargement } from "./types.ts";
 
 /**
  * `Directory.Data` de @capacitor/filesystem vaut la chaîne « DATA » ; sur Android
@@ -72,12 +72,6 @@ export type PluginFichiers = {
     event: "progress",
     cb: (p: ProgresFichier) => void,
   ) => Promise<{ remove: () => Promise<void> }>;
-  /**
-   * Rend l'URI complète (« full File URI ») d'un chemin sous un dossier.
-   * OPTIONNEL : une version du plugin qui ne l'a pas laisse simplement le cache
-   * d'état du prompt DÉSACTIVÉ, plutôt que de faire échouer le moteur.
-   */
-  getUri?: (o: { path: string; directory: string }) => Promise<{ uri: string }>;
 };
 
 /**
@@ -106,76 +100,6 @@ export function cheminModele(id: LocalModelId): string {
  */
 export function cheminRelatif(id: LocalModelId): string {
   return `${SOUS_DOSSIER}/${modeleGguf(id).fichier}`;
-}
-
-/**
- * Nom du fichier de cache d'état du prompt, posé à la RACINE de `Directory.Data`
- * (getFilesDir()). Il est UNIQUE par appli, pas par modèle : le moteur natif
- * remet son drapeau `cacheSauve` à faux à chaque chargement de modèle et
- * n'essaie de recharger qu'APRÈS avoir resauvé, donc un fichier laissé par un
- * ancien modèle est écrasé avant d'être relu. Un seul chemin suffit.
- */
-const FICHIER_CACHE = "studio-prompt-cache.kv";
-
-/**
- * Convertit l'URI que rend `Filesystem.getUri` en chemin de fichier NATIF — le
- * seul que le plugin llama.cpp accepte (vérifié dans ses sources installées,
- * version 0.1.5) :
- *
- *  - `LlamaContext.saveSession(filepath)` NE retire PAS le préfixe `file://`
- *    (`dist/esm/index.js` : il passe `filepath` tel quel à `LlamaCpp.saveSession`)
- *    alors que `loadSession` le retire, lui (`if (path.startsWith('file://'))
- *    path = path.slice(7)`). Cette ASYMÉTRIE impose de retirer le préfixe NOUS-
- *    MÊMES : une URI `file://` passerait pour le chargement mais produirait un
- *    chemin bidon (« file://… ») côté sauvegarde.
- *  - `getUri` rend une URI DÉCODÉE par Android (`Uri.parse(...).toString()`), on
- *    la décode donc une seconde fois par prudence pour un nom de dossier qui
- *    contiendrait des caractères échappés.
- *
- * Renvoie `null` si le résultat n'est pas exploitable : l'appelant DÉSACTIVE
- * alors le cache (jamais un chemin hasardeux).
- */
-export function cheminNatifDepuisUri(uri: string | null | undefined): string | null {
-  if (typeof uri !== "string") return null;
-  let chemin = uri.trim();
-  if (!chemin) return null;
-  if (chemin.startsWith("file://")) {
-    chemin = chemin.slice(7);
-    try {
-      chemin = decodeURIComponent(chemin);
-    } catch {
-      /* séquence d'échappement invalide : on garde la chaîne brute, elle reste
-         un chemin exploitable si elle n'en contenait pas */
-    }
-  }
-  // « file:///data/... » donne « /data/... » ; on évite un double séparateur
-  // avant d'y coller le nom du fichier de cache.
-  chemin = chemin.replace(/\/+$/, "");
-  return chemin.length > 0 ? chemin : null;
-}
-
-/**
- * Chemin où mettre en cache l'état du prompt, DANS le dossier de l'appli.
- *
- * On interroge `Filesystem.getUri` sur `Directory.Data` — que le code Android du
- * plugin résout en `getFilesDir()` (`LegacyFilesystemImplementation.getDirectory` :
- * `"DATA", "LIBRARY" -> c.filesDir`) — puis on le ramène à un chemin natif.
- *
- * Cache SANS EFFET si le chemin est indisponible : plugin absent, méthode
- * manquante, appel en erreur ou URI inexploitable renvoient tous `undefined`, et
- * `moteurNatif.ts` laisse alors le cache désactivé. On ne fait jamais échouer
- * une livraison de modèle pour un cache facultatif.
- */
-export async function cheminCachePrompt(plugin?: PluginFichiers): Promise<string | undefined> {
-  try {
-    const dep = plugin ?? (await pluginFichiersParDefaut());
-    if (typeof dep.getUri !== "function") return undefined;
-    const { uri } = await dep.getUri({ path: "", directory: DOSSIER_DATA });
-    const base = cheminNatifDepuisUri(uri);
-    return base ? `${base}/${FICHIER_CACHE}` : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Une taille est plausible si elle colle à la taille réelle du fichier (±2 %). */

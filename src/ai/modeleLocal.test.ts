@@ -16,9 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  cheminCachePrompt,
   cheminModele,
-  cheminNatifDepuisUri,
   cheminRelatif,
   messageErreurActionnable,
   taillePlausible,
@@ -26,8 +24,8 @@ import {
   type PluginFichiers,
   type ProgresFichier,
 } from "./modeleLocal.ts";
-import { modeleGguf } from "./moteurNatif.ts";
-import type { ProgresChargement } from "./localModel.ts";
+import { MODELES_GGUF, modeleGguf } from "./moteurNatif.ts";
+import type { ProgresChargement } from "./types.ts";
 
 const TAILLE_05 = modeleGguf("coder05").octets; // 397 808 288
 
@@ -184,66 +182,74 @@ test("l'erreur brute du moteur natif devient un message actionnable", () => {
 });
 
 /**
- * CACHE D'ÉTAT DU PROMPT — le chemin vient de @capacitor/filesystem.
+ * LE QUANT DU 30B — 8,005 Go au lieu de 8,914 Go.
  *
- * Protégé ici, parce que c'est un chemin qui part vers le natif :
- *  - l'URI `file://` que rend `getUri` est ramenée à un chemin de fichier NATIF
- *    (le plugin llama.cpp n'accepte QUE ça pour `saveSession`, qui ne retire pas
- *    le préfixe lui-même — vérifié dans dist/esm/index.js) ;
- *  - si le chemin est indisponible, le cache reste SANS EFFET (`undefined`), il
- *    ne fait jamais échouer une livraison de modèle.
+ * Protégé ici parce que c'est la LIVRAISON qui décide de ce qui est chargé : le
+ * téléphone garde le fichier d'un lancement à l'autre, et un ancien quant de
+ * 8,914 Go ne doit pas passer pour le nouveau (il déborde des 12 Go une fois
+ * comptés la KV, les buffers et l'OS). La tolérance de `taillePlausible` (±2 %)
+ * est ce qui fait la différence : 0,9 Go d'écart, c'est un autre fichier.
  */
-test("cheminNatifDepuisUri ramène une URI file:// à un chemin natif", () => {
+test("le 30B-A3B livré est bien le UD-TQ1_0 du Hub (8 005 213 344 octets)", () => {
+  const modele = modeleGguf("coder3b");
+  assert.equal(modele.fichier, "Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf");
+  assert.equal(modele.octets, 8_005_213_344);
+  assert.equal(modele.tailleGo, 8.005);
+  assert.ok(modele.url.endsWith(modele.fichier));
+  assert.ok(!modele.fichier.includes("IQ1_S"), "le quant trop gros pour la RAM est retiré");
   assert.equal(
-    cheminNatifDepuisUri("file:///data/user/0/org.silexperience.studiolocal/files"),
-    "/data/user/0/org.silexperience.studiolocal/files",
+    cheminRelatif("coder3b"),
+    "Documents/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf",
+    "le fichier va dans le dossier que le plugin natif visite",
   );
-  // Slash final retiré : pas de « // » avant le nom du fichier de cache.
-  assert.equal(cheminNatifDepuisUri("file:///data/app/files/"), "/data/app/files");
-  // URI encodée : décodée APRÈS retrait du préfixe (getUri rend la forme encodée).
-  assert.equal(cheminNatifDepuisUri("file:///data/app/Mes%20documents"), "/data/app/Mes documents");
-  // Chemin déjà natif : transmis tel quel, jamais « décodé » (un % y est littéral).
-  assert.equal(cheminNatifDepuisUri("/data/app/Mes%20documents"), "/data/app/Mes%20documents");
 });
 
-test("cheminNatifDepuisUri refuse tout ce qui n'est pas exploitable", () => {
-  assert.equal(cheminNatifDepuisUri(""), null);
-  assert.equal(cheminNatifDepuisUri("   "), null);
-  assert.equal(cheminNatifDepuisUri(undefined), null);
-  assert.equal(cheminNatifDepuisUri(null), null);
-  assert.equal(cheminNatifDepuisUri(42 as unknown as string), null);
+test("l'ancien quant de 8,914 Go n'est PAS pris pour le nouveau : il est re-téléchargé", async () => {
+  const modele = modeleGguf("coder3b");
+  const ancien = 8_914_328_736; // UD-IQ1_S, l'ancien choix
+  assert.equal(
+    taillePlausible(ancien, modele.octets),
+    false,
+    "0,9 Go d'écart : c'est un autre fichier, pas le même",
+  );
+
+  // Fichier de l'ancien quant déjà sur l'appareil, puis le bon après
+  // téléchargement : la livraison doit télécharger, et finir sur le bon fichier.
+  const { plugin, journal } = pluginFactice({ tailles: [ancien, modele.octets] });
+  const res = await telechargerModele("coder3b", undefined, plugin);
+  assert.equal(res, modele.fichier);
+  const dl = journal.find((j) => "downloadFile" in j)?.downloadFile as Record<string, unknown>;
+  assert.equal(dl.path, "Documents/" + modele.fichier, "le bon fichier est téléchargé");
+  assert.equal(dl.url, modele.url);
 });
 
-test("cheminCachePrompt situe le cache à la racine de Directory.Data (getFilesDir)", async () => {
-  const appels: Record<string, unknown>[] = [];
-  const plugin = {
-    getUri: async (o: { path: string; directory: string }) => {
-      appels.push(o);
-      return { uri: "file:///data/user/0/org.silexperience.studiolocal/files/" };
-    },
-  } as unknown as PluginFichiers;
-
-  const chemin = await cheminCachePrompt(plugin);
-  assert.equal(chemin, "/data/user/0/org.silexperience.studiolocal/files/studio-prompt-cache.kv");
-  assert.deepEqual(appels, [{ path: "", directory: "DATA" }], "Directory.Data → getFilesDir()");
+test("un 30B tronqué (téléchargement interrompu) est refusé, pas chargé", async () => {
+  const modele = modeleGguf("coder3b");
+  // 8 Go sur une connexion mobile, ça s'interrompt : un fichier de 4 Go ne doit
+  // pas passer pour un modèle prêt (symptôme réel : « Failed to initialize
+  // native context »).
+  const { plugin } = pluginFactice({ tailles: [null, 4_000_000_000] });
+  await assert.rejects(
+    () => telechargerModele("coder3b", undefined, plugin),
+    /incomplet|corrompu/i,
+    `un fichier de 4 Go ne vaut pas ${modele.octets} octets`,
+  );
 });
 
-test("cheminCachePrompt DÉSACTIVE le cache si le chemin est indisponible", async () => {
-  // Méthode absente (version de plugin sans getUri) : pas de cache, pas d'échec.
-  const sansGetUri = {} as unknown as PluginFichiers;
-  assert.equal(await cheminCachePrompt(sansGetUri), undefined);
-
-  // Appel en erreur : avalé, cache désactivé.
-  const enErreur = {
-    getUri: async () => {
-      throw new Error("permission refusée");
-    },
-  } as unknown as PluginFichiers;
-  assert.equal(await cheminCachePrompt(enErreur), undefined);
-
-  // URI vide / inexploitable : même verdict.
-  const uriVide = {
-    getUri: async () => ({ uri: "" }),
-  } as unknown as PluginFichiers;
-  assert.equal(await cheminCachePrompt(uriVide), undefined);
+test("changer de modèle ne réutilise pas le fichier d'un autre", async () => {
+  // Trois fichiers, trois tailles : un 0,5B présent sur l'appareil ne doit pas
+  // faire croire que le 30B est là. C'est le même garde-fou que pour le quant,
+  // appliqué au choix de modèle.
+  const fichiers = MODELES_GGUF.map((m) => m.fichier);
+  assert.equal(new Set(fichiers).size, fichiers.length, "un fichier distinct par modèle");
+  const { plugin, journal } = pluginFactice({
+    tailles: [modeleGguf("coder05").octets, modeleGguf("coder3b").octets],
+  });
+  await telechargerModele("coder3b", undefined, plugin);
+  const dl = journal.find((j) => "downloadFile" in j)?.downloadFile as Record<string, unknown>;
+  assert.ok(
+    String(dl.path).endsWith("Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf"),
+    "c'est bien le 30B qui est livré",
+  );
 });
+

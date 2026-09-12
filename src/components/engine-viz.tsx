@@ -78,11 +78,11 @@ export function EnginePanel({
         <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
           <dt className="text-muted">Exécution</dt>
           <dd className="text-right font-mono text-stat">
-            {engine === "chargement" ? "chargement" : engine === "erreur" ? "indisponible" : engine === "pret" ? "dans la page" : "au repos"}
+            {engine === "chargement" ? "chargement" : engine === "erreur" ? "indisponible" : engine === "pret" ? "sur l'appareil" : "au repos"}
           </dd>
           <dt className="text-muted">Appareil</dt>
           <dd className="text-right font-mono text-stat">
-            {engineNote ? engineNote.split(" · ")[0] : "webgpu / wasm"}
+            {engineNote ? engineNote.split(" · ")[0] : "llama.cpp (natif)"}
           </dd>
           <dt className="text-muted">Débit mesuré</dt>
           <dd className="text-right font-mono tabular-nums text-stat">

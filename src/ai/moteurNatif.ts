@@ -1,28 +1,61 @@
 /**
- * Moteur NATIF — llama.cpp dans l'APK, au lieu de WebGPU bridé dans la WebView.
+ * Moteur NATIF — llama.cpp dans l'APK. C'est le SEUL moteur d'inférence du
+ * projet depuis le retrait du moteur navigateur (WebGPU / transformers.js).
  *
- * Pourquoi c'est LA correction de vitesse : une WebView Android n'expose pas
- * WebGPU. L'appli retombait donc sur du WebAssembly mono-thread, mesuré à
- * **1,4 tok/s** sur le téléphone, contre 5 dans Chrome. Le moteur natif, lui,
- * utilise la RAM réelle de l'appareil (12 Go ici) et le déport GPU
- * (`n_gpu_layers`), donc il autorise à la fois un modèle utilisable et des
- * vitesses d'un autre ordre.
+ * Pourquoi le natif s'impose : une WebView Android n'expose pas WebGPU, donc
+ * l'appli retombait sur du WebAssembly mono-thread — mesuré à **1,4 tok/s** sur
+ * le téléphone, contre 5 dans Chrome. Le moteur natif utilise la RAM réelle de
+ * l'appareil (12 Go ici).
+ *
+ * CE QU'IL N'APPORTE PAS — trois croyances corrigées, chacune adossée à une
+ * preuve lue dans le plugin installé (llama-cpp-capacitor 0.1.5) :
+ *
+ *  1. AUCUN déport GPU. Le `.so` livré ne contient ni backend OpenCL ni backend
+ *     Vulkan, et `llama-model.cpp:1965-1971` force `act_gpu_layers = 0` quand la
+ *     liste de devices est vide. `n_gpu_layers` est donc SANS EFFET : il n'est
+ *     plus transmis. Le commentaire qui le présentait comme « le seul réglage
+ *     qui change vraiment l'ordre de grandeur » était faux. La vraie
+ *     accélération est celle des noyaux ARM (dotprod / i8mm), qui étaient dans
+ *     l'arbre mais pas compilés — corrigé par le patch CMake (dossier
+ *     `patches/`, appliqué par `npm install`).
+ *
+ *  2. AUCUN cache d'état du prompt par fichier. `saveSession`/`loadSession` de
+ *     `LlamaCpp.java:801-823` ne font RIEN (corps en commentaire, aucune E/S,
+ *     aucun appel JNI) et répondent pourtant un succès. Les appeler donnait un
+ *     `cacheSauve = true` mensonger et un `loadSession` à chaque pas pour rien.
+ *     Ce module ne les appelle plus et ne les expose plus.
+ *
+ *  3. AUCUN réglage du nombre de threads depuis ici. `jni.cpp:322-406` ne lit
+ *     que `n_ctx`, `n_batch`, `n_gpu_layers`, `use_mmap`, `use_mlock` et
+ *     `embedding` ; tout le reste (`n_threads`, `n_ubatch`, `flash_attn`,
+ *     `cache_type_k/v`, `n_cpu_moe`, `swa_full`, `draft_model`) est ignoré. Le
+ *     moteur tourne à `LM_GGML_DEFAULT_N_THREADS = 4` (`ggml.h:228`). Calculer
+ *     `nbCoeurs - 1` était donc décoratif : ce calcul est supprimé.
+ *
+ * CE QUI RESTE, ET QU'IL FAUT PROTÉGER : la réutilisation du préfixe de prompt,
+ * elle, est réelle et AUTOMATIQUE. À chaque appel, `cap-completion.cpp:178`
+ * (`n_past = common_part(embd, text_tokens)`) compare les jetons du prompt
+ * précédemment évalué à ceux du nouveau prompt et ne réévalue que la queue. Cela
+ * ne fonctionne que si le texte réinjecté est IDENTIQUE, jeton pour jeton, à ce
+ * qui a déjà été évalué : c'est pourquoi `generer` rend le texte du moteur
+ * **brut** (aucun `.trim()`, aucun `.replace()`), et pourquoi le nettoyage
+ * d'affichage vit à part, dans `nettoyerPourAffichage`.
  *
  * Les modèles sont des GGUF, en quantifications agressives. Point clé, appris en
  * lisant les chiffres : en génération le coût dépend des octets LUS PAR JETON,
  * pas du nombre de paramètres. Un dense 8B en Q4 lit ~5 Go par jeton ; un modèle
- * à experts (MoE) de 30B n'en lit que ~1,2 Go parce qu'il n'active que 3B à la
+ * à experts (MoE) de 30B n'en lit que ~1,3 Go parce qu'il n'active que 3B à la
  * fois. D'où la présence du 30B-A3B quantifié à l'extrême dans la liste : quatre
  * fois plus gros, plus rapide.
  *
  * Le module n'importe PAS le plugin : on le lui passe. C'est ce qui permet de le
  * tester sans Android, avec un simulacre.
  */
-import type { GenerateOptions, LocalModelId, ProgresChargement } from "./localModel.ts";
+import type { GenerateOptions, LocalModelId, ProgresChargement } from "./types.ts";
 import type { Moteur } from "./moteur.ts";
 
 export type ModeleGguf = {
-  /** Identifiant local, aligné sur les étages du navigateur. */
+  /** Identifiant local, aligné sur `MODELS` (lib/edge0.ts). */
   id: LocalModelId;
   nom: string;
   court: string;
@@ -50,8 +83,8 @@ export type ModeleGguf = {
 
 /**
  * Tailles MESURÉES sur le Hub (pas estimées). Les deux premiers sont des denses,
- * les deux derniers la réponse au problème de vitesse : à experts, gros mais peu
- * lus à chaque jeton.
+ * le dernier est la réponse au problème de vitesse : à experts, gros mais peu lu
+ * à chaque jeton.
  */
 export const MODELES_GGUF: readonly ModeleGguf[] = [
   {
@@ -78,18 +111,24 @@ export const MODELES_GGUF: readonly ModeleGguf[] = [
   },
   {
     id: "coder3b",
-    nom: "Qwen3-Coder-30B-A3B-Instruct (UD-IQ1_S, 1 bit)",
+    nom: "Qwen3-Coder-30B-A3B-Instruct (UD-TQ1_0, 1 bit)",
     court: "30B-A3B 1 bit",
     // Nom EXACT du fichier dans le dépôt unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
-    // (vérifié sur l'API du Hub). UD-IQ1_S remplace UD-TQ1_0 : à taille voisine
-    // (8,9 Go contre 8,0), il est calibré par matrice d'importance, donc
-    // sensiblement plus juste à budget de bits comparable.
-    fichier: "Qwen3-Coder-30B-A3B-Instruct-UD-IQ1_S.gguf",
-    tailleGo: 8.9,
-    octets: 8_914_328_736,
-    url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-UD-IQ1_S.gguf",
+    // (vérifié sur l'API du Hub). RETOUR à UD-TQ1_0 après un essai UD-IQ1_S :
+    // 8,005 Go contre 8,914 Go, et ces 0,9 Go comptent — la KV (4096 jetons), les
+    // buffers de calcul et l'OS ne tiennent pas dans les 12 Go de l'appareil avec
+    // IQ1_S (débordement = tué par le système, pas « juste plus lent »).
+    // AUTRE PISTE, mesurée sur le Hub : ERNIE-4.5-21B-A3B-PT-UD-IQ2_M
+    // (unsloth/ERNIE-4.5-21B-A3B-PT-GGUF, 8 025 599 776 octets = 8,026 Go,
+    // 2 bits au lieu de 1) — architecture « ernie4_5-moe », bien présente dans
+    // la table de chargement (llama-arch.cpp:87), donc chargeable par ce binaire.
+    // Même budget mémoire, quantification plus fine : à essayer avant IQ1_S.
+    fichier: "Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf",
+    tailleGo: 8.005,
+    octets: 8_005_213_344,
+    url: "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf",
     lectureGoParJeton: 1.3,
-    note: "Le pari : 30B de connaissances, 3B activés, donc peu d'octets lus par jeton — plus rapide qu'un dense 8B malgré quatre fois plus de poids. 8,9 Go sur douze, limite haute. La fiabilité des appels d'outils à 1 bit reste à prouver.",
+    note: "Le pari : 30B de connaissances, 3B activés, donc peu d'octets lus par jeton — plus rapide qu'un dense 8B malgré quatre fois plus de poids. 8,0 Go sur douze : il reste de quoi tenir la KV et les buffers. La fiabilité des appels d'outils à 1 bit reste à prouver.",
   },
 ];
 
@@ -97,7 +136,15 @@ export function modeleGguf(id: LocalModelId): ModeleGguf {
   return MODELES_GGUF.find((m) => m.id === id) ?? MODELES_GGUF[1];
 }
 
-/** Ce qu'on attend du plugin, et rien de plus (donc simulable). */
+/**
+ * Ce qu'on attend du plugin, et rien de plus (donc simulable).
+ *
+ * PAS de `saveSession`/`loadSession` ici : dans la version installée (0.1.5),
+ * `LlamaCpp.java:801-823` les implémente en... ne faisant rien, tout en
+ * répondant un succès. Les inclure au contrat laissait croire à un cache d'état
+ * du prompt qui n'existe pas. Le jour où un plugin les implémentera vraiment,
+ * elles reviendront — avec un vrai test de bout en bout.
+ */
 export type PluginLlama = {
   initLlama: (params: Record<string, unknown>) => Promise<unknown>;
   completion: (
@@ -105,15 +152,6 @@ export type PluginLlama = {
     callback?: (data: { token?: string }) => void,
   ) => Promise<{ text?: string; timings?: { predicted_per_second?: number } }>;
   releaseAllLlama?: () => Promise<void>;
-  /**
-   * Sauve l'état du prompt/du cache KV dans un fichier. C'est la méthode du
-   * contexte llama.cpp (`contexte.saveSession(filepath, {tokenSize})`) — vérifiée
-   * dans dist/esm/index.js. Optionnelle : une version du plugin qui ne l'a pas
-   * laisse le moteur fonctionner sans cache.
-   */
-  saveSession?: (filepath: string) => Promise<unknown>;
-  /** Recharge l'état précédemment sauvé (`contexte.loadSession(filepath)`). */
-  loadSession?: (filepath: string) => Promise<unknown>;
 };
 
 export type OptionsNatif = {
@@ -121,33 +159,23 @@ export type OptionsNatif = {
   cheminModele: (m: ModeleGguf) => string;
   /** Charge le plugin (import dynamique en vrai, simulacre dans les tests). */
   chargerPlugin: () => Promise<PluginLlama>;
-  nbCoeurs?: () => number;
-  /** Couches déportées sur le GPU. Élevé par défaut : c'est le gain de vitesse. */
-  couchesGpu?: number;
   /**
    * Taille du contexte en jetons. 4096 par défaut : un agent reçoit des
    * résultats d'outils (code, erreurs, HTML) en plus du prompt système, et 2048
    * débordait. Configurable pour un appareil à court de RAM.
+   * RÉELLEMENT lu par le natif (`jni.cpp`, clé « n_ctx »).
    */
   nCtx?: number;
   /**
-   * Jetons traités par lot de pré-remplissage. Plus grand = GPU mieux rempli au
-   * pré-remplissage (le « prompt processing », le vrai coût du premier pas).
-   * Monté à 512 contre 256 avant ; c'est un compromis mémoire/rapidité.
+   * Jetons traités par lot de pré-remplissage (« prompt processing »).
+   * RÉELLEMENT lu par le natif (clé « n_batch »). 512 par défaut.
+   *
+   * `n_ubatch` n'a PLUS d'entrée ici : elle est absente du lecteur JNI de la
+   * version 0.1.5, donc l'envoyer ne servait à rien — et le commentaire qui
+   * prétendait qu'elle « remplissait mieux le GPU » était doublement faux
+   * (aucun GPU, et paramètre ignoré).
    */
   nBatch?: number;
-  /**
-   * Micro-lot logique à l'intérieur d'un lot (doit rester ≤ nBatch côté
-   * llama.cpp). Aligné sur nBatch pour un seul micro-lot : le GPU travaille en
-   * une passe plutôt que découpé.
-   */
-  nUbatch?: number;
-  /**
-   * Chemin d'un fichier où mettre en cache l'état du prompt (« cached prompt &
-   * completion state »). ABSENT PAR DÉFAUT : le cache n'est activé que si
-   * l'appelant fournit un chemin réellement inscriptible sur l'appareil.
-   */
-  cheminCache?: string;
 };
 
 function gabaritQwen(system: string, history: { role: string; content: string }[]): string {
@@ -168,12 +196,20 @@ export type MoteurNatif = Moteur & {
   derniereVitesse: () => number | null;
   /** Chemin du modèle actuellement chargé. */
   modeleCharge: () => string | null;
-  /**
-   * Vrai si le cache d'état du prompt est ACTIF et a déjà été sauvé au moins
-   * une fois. Faux tant qu'aucun `cheminCache` n'est fourni.
-   */
-  cacheSauve: () => boolean;
 };
+
+/**
+ * Nettoyage d'AFFICHAGE — balises de conversation retirées, bords rognés.
+ *
+ * À N'APPLIQUER QU'À ce qui part à l'écran (ou à un `history` humain) : ce que
+ * `generer` rend reste BRUT, parce que la réutilisation du cache KV
+ * (`cap-completion.cpp:178`) compare le prompt précédent au nouveau JETON PAR
+ * JETON. Rogner ici ce qu'on réinjecte là-bas suffit à faire diverger le
+ * préfixe, donc à recalculer ce qui était déjà évalué.
+ */
+export function nettoyerPourAffichage(brut: string): string {
+  return brut.replace(/<\|im_(end|start)\|>/g, "").trim();
+}
 
 /**
  * Construit le moteur natif. Tout ce qui touche au matériel est injecté, donc la
@@ -183,12 +219,6 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
   let contexte: unknown = null;
   let charge: LocalModelId | null = null;
   let dernierTokParSeconde: number | null = null;
-  // État du cache de prompt : remis à faux à chaque chargement de modèle (le
-  // fichier de session ne vaut que pour le contexte qui l'a produit).
-  let cacheSauve = false;
-  // Passe à vrai si le cache a échoué une fois (méthode absente, fichier non
-  // inscriptible…) : on n'essaie plus, plutôt que de retenter à chaque pas.
-  let cacheIndisponible = false;
 
   return {
     nom: "natif",
@@ -196,8 +226,6 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
     pret: () => contexte !== null,
 
     derniereVitesse: () => dernierTokParSeconde,
-
-    cacheSauve: () => cacheSauve,
 
     modeleCharge: () => (contexte === null ? null : opts.cheminModele(modeleGguf(charge ?? "coder15"))),
 
@@ -208,7 +236,6 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       const plugin = await opts.chargerPlugin();
       const modele = modeleGguf(id);
       const chemin = opts.cheminModele(modele);
-      const coeurs = Math.max(2, (opts.nbCoeurs?.() ?? 8) - 1);
 
       onProgres?.({
         phase: "initialisation",
@@ -236,21 +263,28 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         // mémoire ET les résultats d'outils (code, erreurs, HTML). À 2048, le
         // contexte débordait au milieu d'une tâche. Configurable par l'appelant.
         n_ctx: opts.nCtx ?? 4096,
-        // Lots de pré-remplissage : n_batch = jetons traités par passe,
-        // n_ubatch = micro-lot logique (≤ n_batch). 512/512 garde le GPU
-        // correctement rempli pendant le « prompt processing » sans découper en
-        // petits lots — c'est ce qui accélère le premier pas sur GPU.
+        // Lots de pré-remplissage : jetons traités par passe. C'est le SEUL
+        // levier de vitesse de chargement réellement lu par le natif, et il
+        // compte davantage maintenant que les noyaux dotprod/i8mm sont compilés.
         n_batch: opts.nBatch ?? 512,
-        n_ubatch: opts.nUbatch ?? 512,
-        n_threads: coeurs,
-        // Tout déporter sur le GPU est le seul réglage qui change vraiment
-        // l'ordre de grandeur de la vitesse.
-        n_gpu_layers: opts.couchesGpu ?? 99,
+        // PAS de `n_gpu_layers` : le binaire du plugin ne contient aucun backend
+        // GPU (ni OpenCL ni Vulkan) et llama-model.cpp:1965-1971 met
+        // `act_gpu_layers = 0` quand la liste de devices est vide. L'envoyer ne
+        // déplaçait pas une seule couche — c'était un réglage décoratif.
+        //
+        // PAS de `n_threads` non plus : absent du lecteur JNI de 0.1.5 (le
+        // moteur reste à 4 threads, ggml.h:228).
+        //
+        // use_mmap: false — sur téléphone, le coût de la projection mémoire et
+        // des défauts de page pendant le pré-remplissage pèse plus lourd que le
+        // gain de RAM : le chargement va plus vite jusqu'au premier jeton. C'est
+        // ce que mesurent les retours de terrain sur ce plugin ; c'est aussi ce
+        // qui ramène le modèle entièrement en RAM, cohérent avec le choix de
+        // quant à 8,0 Go.
+        use_mmap: false,
         use_mlock: false,
       });
       charge = id;
-      // Nouveau contexte : le cache de prompt de l'ancien modèle ne vaut plus.
-      cacheSauve = false;
       onProgres?.({ phase: "pret", pct: 100, fichier: "", ecouleMs: Date.now() - debut });
     },
 
@@ -259,26 +293,6 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
       const plugin = await opts.chargerPlugin();
       const prompt = gabaritQwen(options.system, options.history);
       let flux = "";
-
-      // MISE EN CACHE DE L'ÉTAT DU PROMPT.
-      // Le prompt système est identique à chaque pas de l'agent ; sans cache,
-      // llama.cpp le reprojette entièrement à chaque appel. On sauve donc l'état
-      // du contexte UNE FOIS (après la première génération, quand le prompt
-      // système est établi et présent dans le cache KV), puis on le recharge
-      // avant les pas suivants : llama.cpp réutilise le préfixe commun au lieu
-      // de le recalculer. Entièrement optionnel — sans `cheminCache`, ou si le
-      // plugin n'expose pas ces méthodes, rien ne change. Un échec de cache est
-      // avalé : il ne doit jamais faire échouer une génération.
-      const cachePossible = typeof opts.cheminCache === "string" && opts.cheminCache.length > 0;
-      if (cachePossible && !cacheIndisponible && cacheSauve && typeof plugin.loadSession === "function") {
-        try {
-          await plugin.loadSession(opts.cheminCache as string);
-        } catch {
-          /* fichier absent ou illisible : on régénère depuis zéro, et on
-             n'insiste plus — pas de cache plutôt qu'un échec à chaque pas */
-          cacheIndisponible = true;
-        }
-      }
 
       const resultat = await plugin.completion(
         {
@@ -305,18 +319,6 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         },
       );
 
-      // Le prompt est maintenant dans le cache KV : on sauve l'état pour que le
-      // prochain pas puisse le recharger. Une seule fois par contexte chargé.
-      if (cachePossible && !cacheIndisponible && !cacheSauve && typeof plugin.saveSession === "function") {
-        try {
-          await plugin.saveSession(opts.cheminCache as string);
-          cacheSauve = true;
-        } catch {
-          /* pas de cache : on continue sans, la correction reste intacte */
-          cacheIndisponible = true;
-        }
-      }
-
       // llama.cpp rend la vitesse qu'il a MESURÉE : on la remonte telle quelle,
       // au lieu de l'estimer à partir d'une longueur de texte.
       const mesure = resultat?.timings?.predicted_per_second;
@@ -326,8 +328,12 @@ export function creerMoteurNatif(opts: OptionsNatif): MoteurNatif {
         options.onVitesse?.(mesure, jetons, 0);
       }
 
-      const texte = (flux || resultat?.text || "").replace(/<\|im_(end|start)\|>/g, "");
-      return texte.trim();
+      // LE TEXTE EST RENDU TEL QUEL — c'est la seule forme qui laisse le
+      // préfixe réutilisable. Un simple `.trim()` ici suffit à casser
+      // `common_part` au pas suivant : les jetons du préfixe ne correspondent
+      // plus, et tout ce qui suit est réévalué. Le nettoyage d'affichage
+      // (`nettoyerPourAffichage`) est l'affaire de l'appelant, PAS d'ici.
+      return flux || resultat?.text || "";
     },
   };
 }
@@ -343,12 +349,9 @@ type PluginLlamaBrut = {
   releaseAllLlama?: () => Promise<void>;
 };
 
-/** Le contexte rendu par `initLlama` : c'est LUI qui porte `completion`,
- * ainsi que `saveSession`/`loadSession` (état du prompt). */
+/** Le contexte rendu par `initLlama` : c'est LUI qui porte `completion`. */
 type ContextePlugin = {
   completion?: PluginLlama["completion"];
-  saveSession?: (filepath: string, options?: { tokenSize: number }) => Promise<unknown>;
-  loadSession?: (filepath: string) => Promise<unknown>;
 };
 
 /**
@@ -373,13 +376,6 @@ export async function moteurNatifParDefaut(
    * téléchargé.
    */
   cheminModele: (m: ModeleGguf) => string,
-  /**
-   * Chemin du fichier de cache de l'état du prompt. Laissé indéfini, le cache
-   * est DÉSACTIVÉ : c'est le défaut, tant qu'aucun chemin réellement
-   * inscriptible n'est fourni par l'appelant (l'appli n'a pas, à ce niveau, de
-   * moyen d'obtenir un tel chemin sans le plugin Filesystem).
-   */
-  cheminCache?: string,
 ): Promise<MoteurNatif> {
   // Import dynamique : jamais résolu tant que cette branche n'est pas exécutée.
   // C'est précisément ce qui garde le build navigateur intact.
@@ -402,26 +398,9 @@ export async function moteurNatifParDefaut(
       }
       return c.completion(params, cb);
     },
-    // Méthodes de session : elles vivent aussi sur le contexte (vérifié dans
-    // dist/esm/index.js). On ne les expose que si le contexte les a, sinon
-    // `creerMoteurNatif` se contente de fonctionner sans cache.
-    saveSession: async (filepath) => {
-      const c = contexte;
-      if (!c || typeof c.saveSession !== "function") {
-        throw new Error("le contexte llama.cpp n'expose pas saveSession");
-      }
-      return c.saveSession(filepath);
-    },
-    loadSession: async (filepath) => {
-      const c = contexte;
-      if (!c || typeof c.loadSession !== "function") {
-        throw new Error("le contexte llama.cpp n'expose pas loadSession");
-      }
-      return c.loadSession(filepath);
-    },
   };
   const libere = mod.releaseAllLlama?.bind(mod);
   if (libere) adaptateur.releaseAllLlama = () => libere();
 
-  return creerMoteurNatif({ cheminModele, cheminCache, chargerPlugin: async () => adaptateur });
+  return creerMoteurNatif({ cheminModele, chargerPlugin: async () => adaptateur });
 }

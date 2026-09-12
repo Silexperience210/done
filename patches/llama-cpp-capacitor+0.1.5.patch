@@ -1,0 +1,93 @@
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt b/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt
+index f849d84..98bb035 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt
++++ b/node_modules/llama-cpp-capacitor/android/src/main/CMakeLists.txt
+@@ -24,6 +24,33 @@ set(
+     ${LLAMACPP_LIB_DIR}/ggml-cpu/quants.c
+     ${LLAMACPP_LIB_DIR}/ggml-cpu/traits.cpp
+     ${LLAMACPP_LIB_DIR}/ggml-cpu/repack.cpp
++    # ---------------------------------------------------------------------
++    # SOURCES ARM OPTIMISÉES — elles sont dans l'arbre mais n'étaient PAS
++    # compilées : la cible ne compilait que le chemin scalaire générique.
++    # Conséquence mesurée sur le .so livré : lm_ggml_cpu_has_dotprod() == 0 et
++    # 0 instruction SDOT/I8MM dans les 3,4 Mo de .text.
++    #
++    # À quoi elles servent exactement (vérifié dans ggml-cpu/arch-fallback.h) :
++    # sur aarch64, arch-fallback.h ne renomme QUE 7 symboles `*_generic` de
++    # ggml-cpu/repack.cpp en symboles réels (les gemv/gemm 8x8 q4_K/q2_K/iq4_nl
++    # et quantize_mat_q8_K_4x8). Les 35 autres — 3 quantize_row_q8_* + 22
++    # lm_ggml_vec_dot_* (arch/arm/quants.c) + 10 lm_ggml_{gemv,gemm}_*
++    # (arch/arm/repack.cpp) — DOIVENT venir de ces fichiers, sinon échec de
++    # l'édition de liens.
++    # Leurs corps retombent d'eux-mêmes sur les `*_generic` de ggml-cpu/ quand
++    # le compilateur ne définit pas __ARM_FEATURE_DOTPROD ni
++    # __ARM_FEATURE_MATMUL_INT8 : rien n'est perdu si les options ci-dessous
++    # changent.
++    # ---------------------------------------------------------------------
++    ${LLAMACPP_LIB_DIR}/ggml-cpu/arch/arm/quants.c
++    ${LLAMACPP_LIB_DIR}/ggml-cpu/arch/arm/repack.cpp
++    # arch/arm/cpu-feats.cpp n'est PAS listé, volontairement : il ne sert qu'à
++    # calculer un score de variante CPU pour le chargement DYNAMIQUE de
++    # backends, et LM_GGML_BACKEND_DL_SCORE_IMPL s'expand en RIEN quand
++    # LM_GGML_BACKEND_DL n'est pas défini (ggml-backend-impl.h:248-251). Ici un
++    # seul binaire : la détection de capacités est faite à la COMPILATION par
++    # ggml-cpu.c (lm_ggml_cpu_has_dotprod, ligne 3484). L'amont compile d'ailleurs
++    # ce fichier dans une cible séparée avec GGML_BACKEND_DL.
+     ${LLAMACPP_LIB_DIR}/ggml-cpu/unary-ops.cpp
+     ${LLAMACPP_LIB_DIR}/ggml-cpu/binary-ops.cpp
+     ${LLAMACPP_LIB_DIR}/ggml-cpu/vec.cpp
+@@ -95,14 +122,44 @@ function(build_library_arm64 target_name)
+         ${SOURCE_FILES}
+     )
+ 
+-    # ARM64 specific compile options for real devices
++    # ARM64 specific compile options for real devices.
++    #
++    # CE QUI A CHANGÉ, ET POURQUOI (chaque point est vérifiable par lecture) :
++    #
++    # 1. -march=armv8-a -> armv8.6-a+dotprod+i8mm. Avec armv8-a, le compilateur
++    #    ne définissait NI __ARM_FEATURE_DOTPROD NI __ARM_FEATURE_MATMUL_INT8 :
++    #    tous les noyaux NEON/SDOT/I8MM d'arch/arm étaient compilés OUT, et
++    #    ggml-cpu.c (lm_ggml_cpu_has_dotprod, ligne 3484) répondait 0 — d'où
++    #    0 SDOT/I8MM dans le .text livré.
++    #    dotprod et i8mm sont OPTIONNELS depuis armv8.2-a mais ne sont BASELINE
++    #    qu'à partir d'armv8.6-a : écrire « armv8.2-a+i8mm » n'est pas garanti
++    #    accepté par l'outillage. C'est le même contournement que llama.cpp en
++    #    amont, qui remonte à armv8.6-a dès que i8mm est retenu
++    #    (ggml-cpu/CMakeLists.txt amont : ARM_MCPU = armv8.6-a si
++    #    GGML_INTERNAL_MATMUL_INT8). Les deux extensions restent explicitées
++    #    pour ne pas dépendre du baseline implicite.
++    #    ATTENTION : ces instructions deviennent OBLIGATOIRES à l'exécution (un
++    #    seul binaire, aucun dispatch multi-variantes). Un arm64 plus ancien que
++    #    dotprod/i8mm lèverait SIGILL. Compromis assumé pour l'accélération.
++    #
++    # 2. -DLM_GGML_CPU_GENERIC SUPPRIMÉ. Cette macro faisait renommer par
++    #    arch-fallback.h les implémentations scalaires `*_generic` en symboles
++    #    réels, c'est-à-dire qu'elle DÉSACTIVAIT les noyaux vectorisés. Sans
++    #    elle, sur aarch64, arch-fallback.h ne renomme plus que 7 symboles de
++    #    repack.cpp, et les 35 autres viennent des sources arch/arm listées dans
++    #    SOURCE_FILES (sinon : symboles non définis à l'édition de liens).
++    #
++    # 3. -DLM_GGML_USE_CPU_REPACK AJOUTÉ. ggml-cpu/repack.cpp était BEL ET BIEN
++    #    compilé, mais cette macro — testée en ggml-cpu.cpp:54 et :600 — n'était
++    #    définie nulle part : le buffer_type REPACK n'était donc jamais
++    #    enregistré, et tout le repack (gemm/gemv interleavés) restait mort.
+     target_compile_options(${target_name} PRIVATE
+-        -march=armv8-a
++        -march=armv8.6-a+dotprod+i8mm
+         -mtune=cortex-a76
+         -O3
+         -DNDEBUG
+         -DLM_GGML_USE_CPU
+-        -DLM_GGML_CPU_GENERIC
++        -DLM_GGML_USE_CPU_REPACK
+         -fno-finite-math-only
+         -funroll-loops
+     )
+@@ -127,5 +184,5 @@ build_library_arm64(llama-cpp-arm64)
+ message(STATUS "Building llama-cpp for Android ARM64 (real devices)")
+ message(STATUS "Source directory: ${LLAMACPP_LIB_DIR}")
+ message(STATUS "Architecture: ARM64 (arm64-v8a)")
+-message(STATUS "Optimizations: ARMv8-A, Cortex-A76 tuning")
++message(STATUS "Optimizations: ARMv8.6-A +dotprod +i8mm, Cortex-A76 tuning, CPU_REPACK (arch/arm sources compiled)")
+ message(STATUS "Output directory: ${CMAKE_CURRENT_SOURCE_DIR}/jniLibs/arm64-v8a")

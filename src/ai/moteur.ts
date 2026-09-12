@@ -1,21 +1,22 @@
 /**
- * Point d'entrée UNIQUE de l'inférence — deux moteurs possibles.
+ * Contrat du moteur d'inférence — UN SEUL moteur : llama.cpp en natif.
  *
- * Pourquoi cette abstraction : dans le navigateur, le moteur est WebGPU et il est
- * plafonné en mémoire (le Coder 1.5B, 1,3 Go, ne démarre pas sur le téléphone ;
- * le 0,5B tourne à 5 tok/s mesurés). Dans l'APK, l'inférence passe par llama.cpp
- * en natif, avec déport GPU — c'est le seul moyen d'utiliser la RAM réelle du
- * téléphone et de monter d'étage de modèle.
+ * L'inférence tourne exclusivement sur l'appareil, via le plugin Capacitor
+ * `llama-cpp-capacitor` (voir `moteurNatif.ts`). L'ancien moteur NAVIGATEUR
+ * (transformers.js / WebGPU / onnxruntime) a été retiré : une WebView Android
+ * n'expose pas WebGPU, l'appli retombait sur du WebAssembly mono-thread, et les
+ * poids ONNX n'avaient aucune raison d'exister à côté du GGUF natif.
  *
- * Le reste de l'application (la boucle d'agent, les outils, la mémoire) ne doit
- * RIEN savoir de ce choix : il ne connaît que `Moteur`.
+ * Le reste de l'application (la boucle d'agent, les outils, la mémoire) ne
+ * connaît que `Moteur` : il ignore tout de llama.cpp et du plugin.
  *
- * Ce fichier n'importe que des TYPES depuis `localModel.ts` : aucun code lourd
- * n'est chargé, et il reste testable sans navigateur.
+ * Ce fichier n'importe que des TYPES (`./types.ts`) : aucun code lourd, et il
+ * reste testable sans navigateur ni téléphone.
  */
-import type { GenerateOptions, LocalModelId, ProgresChargement } from "./localModel.ts";
+import type { GenerateOptions, LocalModelId, ProgresChargement } from "./types.ts";
 
-export type NomMoteur = "webgpu" | "natif";
+/** Un seul moteur possible désormais : le natif. */
+export type NomMoteur = "natif";
 
 export type Moteur = {
   nom: NomMoteur;
@@ -24,42 +25,32 @@ export type Moteur = {
   pret: () => boolean;
 };
 
-export type Capacites = {
-  /** On tourne dans l'appli empaquetée (Capacitor), donc llama.cpp est disponible. */
-  applicationNative: boolean;
-  /** Le navigateur expose un GPU utilisable. Nécessaire seulement hors APK. */
-  webgpu: boolean;
+/** Ce qu'on lit de la globale `Capacitor` — réduit au strict nécessaire. */
+type SourceCapacitor = {
+  Capacitor?: { isNativePlatform?: () => boolean };
 };
 
-/** Analyse injectable : on lui passe un objet, jamais la planète entière. */
-export function detecterCapacites(source: {
-  capacitor?: unknown;
-  gpu?: unknown;
-}): Capacites {
-  return {
-    applicationNative: Boolean(source.capacitor),
-    webgpu: Boolean(source.gpu),
-  };
-}
-
 /**
- * Le natif gagne dès qu'il est là : c'est llama.cpp sur le matériel du téléphone,
- * sans le plafond mémoire de WebGPU. WebGPU n'est que le repli du navigateur.
+ * Analyse PURE et injectable : on lui passe un objet, jamais la planète entière.
+ *
+ * On exige que `isNativePlatform()` réponde STRICTEMENT `true` : la seule
+ * présence de l'objet `Capacitor` ne suffit PAS. Dans un navigateur, le shim
+ * Capacitor peut exister et répondre `false` ; se fier à sa véracité évite de
+ * tenter le moteur natif — et donc de faire import() le plugin llama.cpp — dans
+ * une page web où il est absent.
  */
-export function choisirMoteur(c: Capacites): NomMoteur {
-  return c.applicationNative ? "natif" : "webgpu";
+export function detecterNative(source: SourceCapacitor): boolean {
+  return (
+    typeof source.Capacitor?.isNativePlatform === "function" &&
+    source.Capacitor.isNativePlatform() === true
+  );
 }
 
 /**
  * Détection réelle dans l'environnement courant. On lit les globales plutôt que
- * d'importer `@capacitor/core` : le même code tourne dans le navigateur, dans
- * l'APK, et dans les tests Node.
+ * d'importer `@capacitor/core` : le même code tourne dans l'APK et dans les
+ * tests Node, sans charger Capacitor.
  */
-export function capacitesReelles(): Capacites {
-  const g = globalThis as unknown as {
-    Capacitor?: { isNativePlatform?: () => boolean };
-    navigator?: { gpu?: unknown };
-  };
-  const natif = typeof g.Capacitor?.isNativePlatform === "function" && g.Capacitor.isNativePlatform() === true;
-  return detecterCapacites({ capacitor: natif, gpu: g.navigator?.gpu });
+export function estApplicationNative(): boolean {
+  return detecterNative(globalThis as SourceCapacitor);
 }

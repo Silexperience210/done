@@ -136,8 +136,8 @@ export type ModeContrainte = "schema" | "grammaire" | "aucune";
 
 /**
  * Construit la contrainte à transmettre au moteur pour ce mode.
- * `aucune` renvoie `undefined` : le moteur garde son comportement d'origine
- * (utile pour un moteur navigateur qui ignore ces paramètres).
+ * `aucune` renvoie `undefined` : le moteur garde son comportement d'origine,
+ * sans contrainte de sortie structurée.
  */
 export function contraintesHarnais(mode: ModeContrainte = "schema"): Contraintes | undefined {
   if (mode === "aucune") return undefined;

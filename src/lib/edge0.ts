@@ -8,9 +8,10 @@
  * CUDA est annoncé, pas écrit) et ne tourne donc sur aucun téléphone, aucun PC
  * Linux. L'application affichait une promesse intenable.
  *
- * Désormais : un modèle réellement exécutable dans la page, nommé, avec ses
- * chiffres réels. Les performances affichées sont MESURÉES sur l'appareil
- * (voir `src/ai/localModel.ts`), jamais écrites en dur.
+ * Désormais : un modèle réellement exécutable, nommé, avec ses chiffres réels.
+ * L'inférence tourne sur l'appareil via llama.cpp en natif (voir
+ * `src/ai/moteurNatif.ts`) ; les performances affichées sont MESURÉES sur
+ * l'appareil, jamais écrites en dur.
  */
 export type ModelId = "coder3b" | "coder15" | "coder05";
 
@@ -36,8 +37,7 @@ export type ChatMessage = {
 
 /**
  * Chiffres RÉELS :
- * - `diskGb`  : taille du téléchargement (depuis le Hub Hugging Face, mis en
- *               cache par le navigateur — aucune requête ensuite).
+ * - `diskGb`  : taille du téléchargement du GGUF (depuis le Hugging Face Hub).
  * - `idleGb`  : poids du modèle résidents une fois chargé.
  * - `peakGb`  : majoré du cache KV pendant la génération.
  * Les débits (tok/s) ne sont PAS ici : ils dépendent de l'appareil et sont
@@ -62,36 +62,36 @@ export const MODELS: Record<
     id: "coder3b",
     name: "Qwen2.5-Coder-3B-Instruct",
     short: "Coder 3B",
-    subtitle: "4 bits · WebGPU · dans le navigateur",
+    subtitle: "GGUF · llama.cpp · sur l'appareil",
     params: "3 Md",
-    diskGb: 2.0,
-    idleGb: 1.9,
-    peakGb: 2.3,
-    repo: "onnx-community/Qwen2.5-Coder-3B-Instruct",
+    diskGb: 8.9,
+    idleGb: 8.9,
+    peakGb: 9.3,
+    repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
     note: "Le plus capable des trois, pour un téléphone avec 8-12 Go de RAM ou du swap.",
   },
   coder15: {
     id: "coder15",
     name: "Qwen2.5-Coder-1.5B-Instruct",
     short: "Coder 1.5B",
-    subtitle: "4 bits · WebGPU · dans le navigateur",
+    subtitle: "GGUF · llama.cpp · sur l'appareil",
     params: "1,5 Md",
     diskGb: 1.0,
-    idleGb: 0.9,
-    peakGb: 1.1,
-    repo: "onnx-community/Qwen2.5-Coder-1.5B-Instruct",
+    idleGb: 1.0,
+    peakGb: 1.4,
+    repo: "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF",
     note: "Le meilleur modèle de code embarquable : HTML/CSS/JS, et il écrit un français correct.",
   },
   coder05: {
     id: "coder05",
     name: "Qwen2.5-Coder-0.5B-Instruct",
     short: "Coder 0.5B",
-    subtitle: "4 bits · WebGPU · dans le navigateur",
+    subtitle: "GGUF · llama.cpp · sur l'appareil",
     params: "0,5 Md",
     diskGb: 0.4,
-    idleGb: 0.35,
-    peakGb: 0.5,
-    repo: "onnx-community/Qwen2.5-Coder-0.5B-Instruct",
+    idleGb: 0.4,
+    peakGb: 0.7,
+    repo: "bartowski/Qwen2.5-Coder-0.5B-Instruct-GGUF",
     note: "Le léger, pour les téléphones anciens : il démarre partout, plus approximatif.",
   },
 };

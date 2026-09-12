@@ -1,0 +1,52 @@
+diff --git a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+index e3cb644..1287612 100644
+--- a/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
++++ b/node_modules/llama-cpp-capacitor/android/src/main/jni.cpp
+@@ -24,6 +24,7 @@
+ #include <cstdio>
+ #include <ctime>
+ #include <chrono>
++#include <cstdint> // std::uintmax_t, pour la taille du modèle
+ 
+ // Add missing symbol
+ // namespace rnllama {
+@@ -663,7 +664,38 @@ Java_ai_annadata_plugin_capacitor_LlamaCpp_initContextNative(
+             ultra_minimal_params.n_ctx = 256;  // Very small context
+             ultra_minimal_params.n_batch = 128; // Very small batch
+             ultra_minimal_params.n_gpu_layers = 0;
+-            ultra_minimal_params.use_mmap = false; // Disable mmap to avoid memory issues
++            // MAPPING MÉMOIRE : NE PAS LE DÉSACTIVER POUR UN GROS MODÈLE.
++            //
++            // Le repli faisait `use_mmap = false` « pour éviter les problèmes de
++            // mémoire » — vrai pour un petit modèle, FAUX pour un gros : sans
++            // mmap, llama.cpp LIT TOUT le fichier en mémoire vive avant de créer
++            // le contexte. Sur le 30B-A3B de 8 Go visé par cette appli, sur un
++            // téléphone de 12 Go, c'est une lecture de 8 Go en RAM qui ne peut pas
++            // tenir : le système tue l'appli, ou échange pendant des minutes — et
++            // l'échec ressemble à « ce modèle ne marche pas » alors que c'est le
++            // repli qui l'a tué.
++            //
++            // On garde donc le mmap dès que le fichier est trop gros pour être lu
++            // entièrement (seuil 2 Go : très au-dessus des 0,4/1,0 Go des petits
++            // modèles, très en dessous des 8 Go du 30B). `file_size` peut lever
++            // (fichier disparu, permission) : on retombe alors sur le
++            // comportement prudent d'origine.
++            std::uintmax_t taille_modele = 0;
++            try {
++                taille_modele = std::filesystem::file_size(full_model_path);
++            } catch (const std::exception & e) {
++                LOGE("file_size(%s) impossible : %s", full_model_path.c_str(), e.what());
++                diag("taille du modèle illisible (%s) : repli prudent", e.what());
++            }
++            const bool trop_gros_pour_lecture_complete =
++                taille_modele > static_cast<std::uintmax_t>(2) * 1024 * 1024 * 1024;
++            ultra_minimal_params.use_mmap = trop_gros_pour_lecture_complete;
++            LOGI("fallback: mmap %s (modèle de %llu octets)",
++                 trop_gros_pour_lecture_complete ? "CONSERVÉ" : "désactivé",
++                 (unsigned long long) taille_modele);
++            diag("repli : mmap %s (modèle de %llu octets)",
++                 trop_gros_pour_lecture_complete ? "conservé" : "désactivé",
++                 (unsigned long long) taille_modele);
+             ultra_minimal_params.use_mlock = false;
+             ultra_minimal_params.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
+             ultra_minimal_params.ctx_shift = false;

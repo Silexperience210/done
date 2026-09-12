@@ -16,7 +16,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  cheminCachePrompt,
   cheminModele,
+  cheminNatifDepuisUri,
   cheminRelatif,
   messageErreurActionnable,
   taillePlausible,
@@ -179,4 +181,69 @@ test("l'erreur brute du moteur natif devient un message actionnable", () => {
   assert.ok(!/Failed to initialize/i.test(traduit), "aucun code brut ne reste visible");
   // Une erreur déjà actionnable passe inchangée (pas de double emballage).
   assert.equal(messageErreurActionnable("le fichier est introuvable"), "le fichier est introuvable");
+});
+
+/**
+ * CACHE D'ÉTAT DU PROMPT — le chemin vient de @capacitor/filesystem.
+ *
+ * Protégé ici, parce que c'est un chemin qui part vers le natif :
+ *  - l'URI `file://` que rend `getUri` est ramenée à un chemin de fichier NATIF
+ *    (le plugin llama.cpp n'accepte QUE ça pour `saveSession`, qui ne retire pas
+ *    le préfixe lui-même — vérifié dans dist/esm/index.js) ;
+ *  - si le chemin est indisponible, le cache reste SANS EFFET (`undefined`), il
+ *    ne fait jamais échouer une livraison de modèle.
+ */
+test("cheminNatifDepuisUri ramène une URI file:// à un chemin natif", () => {
+  assert.equal(
+    cheminNatifDepuisUri("file:///data/user/0/org.silexperience.studiolocal/files"),
+    "/data/user/0/org.silexperience.studiolocal/files",
+  );
+  // Slash final retiré : pas de « // » avant le nom du fichier de cache.
+  assert.equal(cheminNatifDepuisUri("file:///data/app/files/"), "/data/app/files");
+  // URI encodée : décodée APRÈS retrait du préfixe (getUri rend la forme encodée).
+  assert.equal(cheminNatifDepuisUri("file:///data/app/Mes%20documents"), "/data/app/Mes documents");
+  // Chemin déjà natif : transmis tel quel, jamais « décodé » (un % y est littéral).
+  assert.equal(cheminNatifDepuisUri("/data/app/Mes%20documents"), "/data/app/Mes%20documents");
+});
+
+test("cheminNatifDepuisUri refuse tout ce qui n'est pas exploitable", () => {
+  assert.equal(cheminNatifDepuisUri(""), null);
+  assert.equal(cheminNatifDepuisUri("   "), null);
+  assert.equal(cheminNatifDepuisUri(undefined), null);
+  assert.equal(cheminNatifDepuisUri(null), null);
+  assert.equal(cheminNatifDepuisUri(42 as unknown as string), null);
+});
+
+test("cheminCachePrompt situe le cache à la racine de Directory.Data (getFilesDir)", async () => {
+  const appels: Record<string, unknown>[] = [];
+  const plugin = {
+    getUri: async (o: { path: string; directory: string }) => {
+      appels.push(o);
+      return { uri: "file:///data/user/0/org.silexperience.studiolocal/files/" };
+    },
+  } as unknown as PluginFichiers;
+
+  const chemin = await cheminCachePrompt(plugin);
+  assert.equal(chemin, "/data/user/0/org.silexperience.studiolocal/files/studio-prompt-cache.kv");
+  assert.deepEqual(appels, [{ path: "", directory: "DATA" }], "Directory.Data → getFilesDir()");
+});
+
+test("cheminCachePrompt DÉSACTIVE le cache si le chemin est indisponible", async () => {
+  // Méthode absente (version de plugin sans getUri) : pas de cache, pas d'échec.
+  const sansGetUri = {} as unknown as PluginFichiers;
+  assert.equal(await cheminCachePrompt(sansGetUri), undefined);
+
+  // Appel en erreur : avalé, cache désactivé.
+  const enErreur = {
+    getUri: async () => {
+      throw new Error("permission refusée");
+    },
+  } as unknown as PluginFichiers;
+  assert.equal(await cheminCachePrompt(enErreur), undefined);
+
+  // URI vide / inexploitable : même verdict.
+  const uriVide = {
+    getUri: async () => ({ uri: "" }),
+  } as unknown as PluginFichiers;
+  assert.equal(await cheminCachePrompt(uriVide), undefined);
 });

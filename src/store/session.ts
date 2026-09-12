@@ -79,7 +79,7 @@ function chargerMoteur(): Promise<MoteurActif> {
         // navigateur. On ne le résout que lorsqu'on tourne VRAIMENT en natif,
         // donc le build web reste intact.
         const { moteurNatifParDefaut } = await import("@/ai/moteurNatif");
-        const { cheminModele, telechargerModele } = await import("@/ai/modeleLocal");
+        const { cheminModele, telechargerModele, cheminCachePrompt } = await import("@/ai/modeleLocal");
         // Le GGUF n'est PLUS embarqué dans l'APK : on le télécharge dans
         // getFilesDir()/Documents/<fichier> (le seul dossier que le plugin natif
         // visite vraiment), puis on passe au moteur le NOM DE FICHIER SEUL.
@@ -88,7 +88,27 @@ function chargerMoteur(): Promise<MoteurActif> {
         // l'ignore.
         // `moteurNatifParDefaut` attend une fonction `ModeleGguf → chemin` ;
         // `cheminModele` prend un identifiant. On les relie par le `.id`.
-        const natif = await moteurNatifParDefaut((m) => cheminModele(m.id));
+        //
+        // CACHE D'ÉTAT DU PROMPT, désormais ACTIVÉ. Dans la boucle d'agent le
+        // prompt système est identique à chaque pas ; sans cache llama.cpp le
+        // reprojette entièrement. `cheminCachePrompt()` demande à
+        // @capacitor/filesystem un chemin inscriptible dans le dossier de
+        // l'appli (`getUri` sur Directory.Data → getFilesDir()) et le ramène à
+        // un chemin de fichier NATIF, seule forme que `saveSession` accepte.
+        // Si le chemin est indisponible (plugin absent, appel en erreur),
+        // `cheminCachePrompt` rend `undefined` et le cache reste SANS EFFET —
+        // une génération ne doit jamais échouer pour un cache facultatif.
+        //
+        // HONNÊTETE SUR LA VERSION INSTALLÉE : dans llama-cpp-capacitor 0.1.5,
+        // `LlamaCpp.java` `saveSession`/`loadSession` ne font RIEN (corps en
+        // commentaire « This would typically … from file », aucune E/S, aucun
+        // appel JNI). Le cache est donc aujourd'hui INERTE dans l'APK : câbler
+        // le chemin est sans effet observable, et sans danger (les méthodes
+        // rendent un succès vide), en attendant une version du plugin qui
+        // implémente réellement l'état du prompt. Le moteur reste prêt pour ce
+        // jour-là, et le chemin est déjà le bon.
+        const cheminCache = await cheminCachePrompt();
+        const natif = await moteurNatifParDefaut((m) => cheminModele(m.id), cheminCache);
         return {
           nom: "natif",
           charger: async (id, onProgres) => {

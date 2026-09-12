@@ -60,8 +60,10 @@ export type MessageApercu =
  *
  * La position d'un `console.*` est lue dans la pile d'une `Error` créée sur
  * place : sur Chrome/WebView, les cadres ressemblent à `at f (about:srcdoc:12:5)`.
- * Le premier cadre est le pont lui-même ; le suivant est l'appelant. Sans pile
- * exploitable, la position reste `null` — jamais un « 0:0 » inventé.
+ * Les deux premiers cadres sont le pont lui-même (`pos`, puis l'enveloppe de
+ * `console.*`) ; le suivant est l'appelant — vérifié dans Chromium : un
+ * `console.log` en ligne 4 du document remonte « 4 ». Sans pile exploitable, la
+ * position reste `null` — jamais un « 0:0 » inventé.
  */
 export function scriptPont(version: number): string {
   const v = Math.max(0, Math.floor(version));
@@ -69,7 +71,8 @@ export function scriptPont(version: number): string {
     "<script>(function(){" +
     `var V=${v},S=${JSON.stringify(SOURCE_PONT)};` +
     "function env(m){try{m.source=S;m.version=V;parent.postMessage(m,'*')}catch(e){}}" +
-    "function pos(){try{var l=String(new Error().stack||'').split('\\n');for(var i=2;i<l.length;i++){var m=/:(\\d+):(\\d+)\\)?\\s*$/.exec(l[i]);if(m)return[+m[1],+m[2]]}}catch(e){}return[null,null]}" +
+    // Pile : [0] « Error », [1] pos(), [2] l'enveloppe console.* du pont, [3] l'APPELANT.
+    "function pos(){try{var l=String(new Error().stack||'').split('\\n');for(var i=3;i<l.length;i++){var m=/:(\\d+):(\\d+)\\)?\\s*$/.exec(l[i]);if(m)return[+m[1],+m[2]]}}catch(e){}return[null,null]}" +
     "function txt(a){var o=[];for(var i=0;i<a.length;i++){var x=a[i];try{o.push(x instanceof Error?(x.name+': '+x.message):typeof x==='object'?JSON.stringify(x):String(x))}catch(e){o.push(String(x))}}return o.join(' ')}" +
     "function con(n,m,l,c){env({type:'console',niveau:n,message:m,ligne:l,colonne:c,ts:Date.now()})}" +
     "window.addEventListener('error',function(e){con('error',String(e.message||e.error||'erreur'),typeof e.lineno==='number'&&e.lineno>0?e.lineno:null,typeof e.colno==='number'&&e.colno>0?e.colno:null)});" +
